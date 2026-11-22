@@ -9,6 +9,7 @@ pub mod layout;
 pub mod mem_box;
 pub mod net_box;
 pub mod proc_box;
+pub mod proc_detail;
 pub mod proc_tree;
 pub mod theme;
 pub mod widgets;
@@ -29,6 +30,9 @@ pub use layout::{
 pub use mem_box::{format_mem_bytes, stacked_physical_segments};
 pub use net_box::{AUTO_SCALE_FLOOR_BPS, NetViewState, compute_net_scale_ceilings, format_bitrate};
 pub use proc_box::{ProcSort, ProcViewState};
+pub use proc_detail::{
+    detail_overlay_height, format_detail_field, format_elapsed_uptime, format_parent_label,
+};
 pub use proc_tree::{
     CompiledFilter, DisplayProcRow, build_visible_rows, compile_proc_filter, expandable_parents,
     matches_proc_filter,
@@ -38,7 +42,7 @@ use crate::mem_box::ratio_percent;
 use crate::theme::ThemePalette;
 
 const DEFAULT_HISTORY_CAPACITY: usize = 512;
-const PROC_SPARKLINE_CAPACITY: usize = 16;
+const PROC_HISTORY_CAPACITY: usize = 128;
 
 /// Pure UI interaction state passed into [`render_frame`].
 #[derive(Debug, Clone, PartialEq)]
@@ -146,6 +150,7 @@ pub struct UiHistory {
     disks: BTreeMap<String, DiskIoSeries>,
     net: BTreeMap<u64, NetIoSeries>,
     proc_cpu: BTreeMap<ProcessIdentity, VecDeque<f32>>,
+    proc_mem: BTreeMap<ProcessIdentity, VecDeque<u64>>,
 }
 
 impl Default for UiHistory {
@@ -168,6 +173,7 @@ impl UiHistory {
             disks: BTreeMap::new(),
             net: BTreeMap::new(),
             proc_cpu: BTreeMap::new(),
+            proc_mem: BTreeMap::new(),
         }
     }
 
@@ -265,14 +271,21 @@ impl UiHistory {
             let mut live_ids = BTreeSet::new();
             for proc_entry in procs {
                 live_ids.insert(proc_entry.identity);
-                let series = self.proc_cpu.entry(proc_entry.identity).or_default();
+                let cpu_series = self.proc_cpu.entry(proc_entry.identity).or_default();
                 push_bounded(
-                    series,
+                    cpu_series,
                     proc_entry.cpu_pct.clamp(0.0, 100.0),
-                    PROC_SPARKLINE_CAPACITY,
+                    PROC_HISTORY_CAPACITY,
+                );
+                let mem_series = self.proc_mem.entry(proc_entry.identity).or_default();
+                push_bounded_u64(
+                    mem_series,
+                    proc_entry.working_set_private_bytes,
+                    PROC_HISTORY_CAPACITY,
                 );
             }
             self.proc_cpu.retain(|id, _| live_ids.contains(id));
+            self.proc_mem.retain(|id, _| live_ids.contains(id));
         }
     }
 
@@ -319,9 +332,21 @@ impl UiHistory {
         self.proc_cpu.get(&id).map_or(&[], |buf| buf.as_slices().0)
     }
 
-    /// Clones per-process CPU sparkline buffers for pausing the process panel cleanly.
+    pub fn proc_mem_slice(&self, id: ProcessIdentity) -> &[u64] {
+        self.proc_mem.get(&id).map_or(&[], |buf| buf.as_slices().0)
+    }
+
+    /// Clones per-process CPU history buffers for pausing the process panel cleanly.
     pub fn snapshot_proc_cpu_map(&self) -> BTreeMap<ProcessIdentity, Vec<f32>> {
         self.proc_cpu
+            .iter()
+            .map(|(&id, buf)| (id, buf.iter().copied().collect()))
+            .collect()
+    }
+
+    /// Clones per-process private working-set history buffers for pausing the detail overlay cleanly.
+    pub fn snapshot_proc_mem_map(&self) -> BTreeMap<ProcessIdentity, Vec<u64>> {
+        self.proc_mem
             .iter()
             .map(|(&id, buf)| (id, buf.iter().copied().collect()))
             .collect()
@@ -351,7 +376,9 @@ pub fn visible_proc_rows(size: Size, state: &UiState) -> usize {
         .ok()
         .and_then(|layout| layout.proc())
         .map_or(0, |r| {
-            usize::from(r.height.saturating_sub(3)).saturating_sub(extra)
+            let inner_h = r.height.saturating_sub(2);
+            let detail_h = detail_overlay_height(inner_h, state.proc.detailed.is_some());
+            usize::from(inner_h.saturating_sub(detail_h).saturating_sub(1)).saturating_sub(extra)
         })
 }
 

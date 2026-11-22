@@ -307,16 +307,19 @@ fn synthetic_processes(count: usize, tick: u8, user: &str) -> Vec<ProcessEntry> 
             },
             parent_pid,
             name: name.to_owned(),
+            image_path: None,
             command_line: if protected {
                 None
             } else {
                 Some(format!("C:\\Windows\\System32\\{name}"))
             },
+            command_line_denied: false,
             user: Some(if protected {
                 "NT AUTHORITY\\SYSTEM".to_owned()
             } else {
                 format!("WIN11\\{user}")
             }),
+            user_denied: false,
             threads,
             cpu_pct: cpu_pct + delta * 0.2,
             working_set_private_bytes: mem + step * MIB,
@@ -351,8 +354,11 @@ fn push_pid_reuse_case(list: &mut Vec<ProcessEntry>, boot_time: u64, tick: u8, u
         } else {
             "reused_pid_worker.exe".to_owned()
         },
+        image_path: None,
         command_line: Some("C:\\Tools\\worker.exe --reused-pid".to_owned()),
+        command_line_denied: false,
         user: Some(format!("WIN11\\{user}")),
+        user_denied: false,
         threads: 6,
         cpu_pct: 1.1 + f32::from(tick) * 0.3,
         working_set_private_bytes: 28 * MIB,
@@ -367,8 +373,11 @@ fn push_pid_reuse_case(list: &mut Vec<ProcessEntry>, boot_time: u64, tick: u8, u
         },
         parent_pid: 4820,
         name: "orphaned_child.exe".to_owned(),
+        image_path: None,
         command_line: Some("C:\\Tools\\orphaned_child.exe".to_owned()),
+        command_line_denied: false,
         user: Some(format!("WIN11\\{user}")),
+        user_denied: false,
         threads: 4,
         cpu_pct: 0.4,
         working_set_private_bytes: 16 * MIB,
@@ -404,8 +413,11 @@ fn push_background_workers(
             },
             parent_pid,
             name: name.to_owned(),
+            image_path: None,
             command_line: Some(format!("C:\\Apps\\{name} --worker={seq}")),
+            command_line_denied: false,
             user: Some(format!("WIN11\\{user}")),
+            user_denied: false,
             threads,
             cpu_pct: (cpu * 10.0).round() / 10.0,
             working_set_private_bytes: mem + (seq as u64 % 5) * 4 * MIB,
