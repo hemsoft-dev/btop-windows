@@ -1,0 +1,9 @@
+---
+source: crates/btop-ui/tests/golden.rs
+expression: grid.to_plain_text()
+---
+ btop-windows | WIN11-RYZEN8 | update 2000ms
+ CPU  30.8% (AMD Ryzen 7 7800X3D 8-Core Processor)
+ MEM 14.0 / 32.0 GiB
+ GPU gpu0: NVIDIA GeForce RTX 4080 (24%)
+ PROC 50 running

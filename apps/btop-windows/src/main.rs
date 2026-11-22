@@ -3,7 +3,11 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use btop_collect::{ReplaySource, SnapshotSource, StubLiveSource};
 use btop_config::Config;
+use btop_model::SnapshotRecorder;
+use btop_term::CrosstermInput;
+use btop_windows::run_tui_loop;
 use clap::Parser;
 
 #[derive(Debug, Parser)]
@@ -76,16 +80,49 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let _config = Config {
+    let config = Config {
         update_ms: cli.update_ms.map_or(2000, |ms| ms.max(100)),
         force_tty: cli.tty,
         truecolor: !cli.low_color,
         ..Config::default()
     };
 
-    println!(
-        "btop-windows {} scaffold initialized. Live TUI loop arrives in Milestone M1.",
-        env!("CARGO_PKG_VERSION")
-    );
-    ExitCode::SUCCESS
+    let mut source: Box<dyn SnapshotSource> = if let Some(replay_path) = cli.replay.as_deref() {
+        match ReplaySource::from_path(replay_path) {
+            Ok(replay) => Box::new(replay),
+            Err(err) => {
+                eprintln!(
+                    "error: failed to load --replay '{}': {err}",
+                    replay_path.display()
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        Box::new(StubLiveSource::new(config.update_ms))
+    };
+
+    let recorder = if let Some(record_path) = cli.record.as_deref() {
+        match SnapshotRecorder::open(record_path) {
+            Ok(rec) => Some(rec),
+            Err(err) => {
+                eprintln!(
+                    "error: failed to open --record '{}': {err}",
+                    record_path.display()
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut input = CrosstermInput;
+    match run_tui_loop(source.as_mut(), recorder, &mut input, &config) {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
 }

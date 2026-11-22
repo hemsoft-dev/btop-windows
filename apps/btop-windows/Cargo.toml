@@ -17,3 +17,4 @@ btop-sys.workspace = true
 btop-term.workspace = true
 btop-ui.workspace = true
 clap.workspace = true
+thiserror.workspace = true

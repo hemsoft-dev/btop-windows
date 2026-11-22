@@ -3,6 +3,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod fixtures;
+pub mod jsonl;
+
+pub use jsonl::{
+    JsonlError, RecordStats, SnapshotRecorder, parse_jsonl_file, parse_jsonl_reader,
+    write_snapshot_line,
+};
+
 use serde::{Deserialize, Serialize};
 
 /// Explicit availability and freshness state for any optional or async subsystem.
