@@ -77,7 +77,7 @@ We use a custom retained cell `Grid` and incremental VT diff encoder rather than
 | **Processes** | `NtQuerySystemInformation(SystemProcessInformation)` (`WorkingSetPrivateSize`), `SystemProcessIdInformation` (class 88), `ProcessCommandLineInformation`, local SID cache | Key by `(PID, CreateTime)`; validate `parent.CreateTime <= child.CreateTime` for tree; handle PPL `ACCESS_DENIED` cleanly |
 | **Process actions** | `EnumWindows` + `WM_CLOSE`, handle-verified `TerminateProcess` + `IsProcessCritical`, `SetPriorityClass` | Prevents TOCTOU PID-reuse kills and elevated BSOD on critical processes |
 | **Windows Services** | `OpenSCManagerW(SC_MANAGER_ENUMERATE_SERVICE)`, `EnumServicesStatusExW`, `QueryServiceConfigW`, `StartServiceW`, `ControlService` (Stop) | Non-elevated read-only list; Start/Stop enabled when elevated |
-| **GPU** | DXGI (`IDXGIFactory6`, exclude `DXGI_ADAPTER_FLAG_SOFTWARE`) + WDDM baseline (decided in M0 Spike `#2`) + optional `nvml.dll` from `System32` | Never use `IDXGIAdapter3::QueryVideoMemoryInfo` for system VRAM; NVML runs off the UI thread |
+| **GPU** | DXGI (`IDXGIFactory6`, exclude `DXGI_ADAPTER_FLAG_SOFTWARE`) + persistent English WDDM PDH (`\GPU Engine(*)`, `\GPU Adapter Memory(*)`, see [ADR-0002](adr/0002-gpu-baseline-api.md)) + optional `nvml.dll` from `System32` | Never use `IDXGIAdapter3::QueryVideoMemoryInfo` for system VRAM; NVML runs off the UI thread |
 | **Battery** | `GetSystemPowerStatus` | Charge %, AC/charging state, remaining time; hides when no battery is present |
 
 ## 5. Testing and CI strategy
