@@ -1,6 +1,7 @@
 //! System telemetry collectors, waitable-timer sampler, and pure delta mathematics.
 
 pub mod cpu;
+pub mod mem;
 pub mod proc;
 pub mod replay;
 pub mod sampler;
@@ -12,6 +13,7 @@ pub use cpu::{
     CpuCollector, FreqMode, LiveCollector, RunQueueEwma, classify_core_kinds, compute_cpu_deltas,
     compute_cpu_deltas_with_kinds, compute_frequency_mhz,
 };
+pub use mem::{MemoryCollector, compute_mem_snapshot, pagefile_pages_to_bytes};
 pub use proc::{ProcessCollector, ProcessDeltaTracker};
 pub use replay::{ReplaySource, StubLiveSource};
 pub use sampler::{MAX_UPDATE_MS, MIN_UPDATE_MS, Sampler};

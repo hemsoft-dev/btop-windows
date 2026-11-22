@@ -130,3 +130,77 @@ fn golden_proc_panel_200x60() {
     );
     insta::assert_snapshot!("proc_panel_200x60", rendered);
 }
+
+fn mem_only_config(mem_graphs: bool) -> Config {
+    Config {
+        shown_boxes: "mem".to_owned(),
+        mem_graphs,
+        ..Config::default()
+    }
+}
+
+#[test]
+fn golden_mem_graph_80x24() {
+    let rendered = render_fixture_with_config(
+        "win11-8core-single-gpu-desktop.jsonl",
+        &mem_only_config(true),
+        80,
+        24,
+    );
+    insta::assert_snapshot!("mem_graph_80x24", rendered);
+}
+
+#[test]
+fn golden_mem_graph_120x40() {
+    let rendered = render_fixture_with_config(
+        "win11-16core-dual-gpu-desktop.jsonl",
+        &mem_only_config(true),
+        120,
+        40,
+    );
+    insta::assert_snapshot!("mem_graph_120x40", rendered);
+}
+
+#[test]
+fn golden_mem_graph_200x60() {
+    let rendered = render_fixture_with_config(
+        "win11-16core-dual-gpu-desktop.jsonl",
+        &mem_only_config(true),
+        200,
+        60,
+    );
+    insta::assert_snapshot!("mem_graph_200x60", rendered);
+}
+
+#[test]
+fn golden_mem_meter_80x24() {
+    let rendered = render_fixture_with_config(
+        "win11-8core-single-gpu-desktop.jsonl",
+        &mem_only_config(false),
+        80,
+        24,
+    );
+    insta::assert_snapshot!("mem_meter_80x24", rendered);
+}
+
+#[test]
+fn golden_mem_meter_120x40() {
+    let rendered = render_fixture_with_config(
+        "win11-16core-dual-gpu-desktop.jsonl",
+        &mem_only_config(false),
+        120,
+        40,
+    );
+    insta::assert_snapshot!("mem_meter_120x40", rendered);
+}
+
+#[test]
+fn golden_mem_meter_200x60() {
+    let rendered = render_fixture_with_config(
+        "win11-16core-dual-gpu-desktop.jsonl",
+        &mem_only_config(false),
+        200,
+        60,
+    );
+    insta::assert_snapshot!("mem_meter_200x60", rendered);
+}

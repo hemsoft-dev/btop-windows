@@ -53,6 +53,9 @@ pub struct Config {
     pub proc_tree: bool,
     pub proc_per_core: bool,
     pub proc_mem_bytes: bool,
+    pub mem_graphs: bool,
+    pub show_swap: bool,
+    pub base_10_sizes: bool,
     pub cpu_util_mode: String,
     pub freq_mode: String,
     /// Unknown or deferred upstream keys preserved verbatim when saving `btop.conf`.
@@ -79,6 +82,9 @@ impl Default for Config {
             proc_tree: false,
             proc_per_core: false,
             proc_mem_bytes: true,
+            mem_graphs: true,
+            show_swap: true,
+            base_10_sizes: false,
             cpu_util_mode: "time".to_owned(),
             freq_mode: "average".to_owned(),
             preserved_unknown: BTreeMap::new(),
@@ -113,6 +119,10 @@ impl Config {
                 "proc_sorting = \"{proc_sorting}\"\n",
                 "proc_reversed = {proc_reversed}\n",
                 "proc_tree = {proc_tree}\n\n",
+                "#* Show historical graphs inside the memory box (False = percentage meters).\n",
+                "mem_graphs = {mem_graphs}\n",
+                "show_swap = {show_swap}\n",
+                "base_10_sizes = {base_10_sizes}\n\n",
                 "#* Windows CPU utilization mode: \"time\" or \"utility\" (Task Manager).\n",
                 "cpu_util_mode = \"{cpu_util_mode}\"\n\n",
                 "#* CPU frequency aggregation: \"first\", \"range\", \"lowest\", \"highest\", or \"average\".\n",
@@ -129,6 +139,9 @@ impl Config {
             proc_sorting = cfg.proc_sorting,
             proc_reversed = bool_title(cfg.proc_reversed),
             proc_tree = bool_title(cfg.proc_tree),
+            mem_graphs = bool_title(cfg.mem_graphs),
+            show_swap = bool_title(cfg.show_swap),
+            base_10_sizes = bool_title(cfg.base_10_sizes),
             cpu_util_mode = cfg.cpu_util_mode,
             freq_mode = cfg.freq_mode,
         )
@@ -166,6 +179,9 @@ impl Config {
                 "proc_tree" => cfg.proc_tree = parse_bool(key, &val)?,
                 "proc_per_core" => cfg.proc_per_core = parse_bool(key, &val)?,
                 "proc_mem_bytes" => cfg.proc_mem_bytes = parse_bool(key, &val)?,
+                "mem_graphs" => cfg.mem_graphs = parse_bool(key, &val)?,
+                "show_swap" => cfg.show_swap = parse_bool(key, &val)?,
+                "base_10_sizes" => cfg.base_10_sizes = parse_bool(key, &val)?,
                 "cpu_util_mode" => cfg.cpu_util_mode = val,
                 "freq_mode" => cfg.freq_mode = val,
                 "graph_symbol" => {
@@ -231,6 +247,9 @@ mod tests {
         let parsed = Config::parse(&text).expect("parse default conf");
         assert_eq!(parsed.update_ms, 2000);
         assert_eq!(parsed.graph_symbol, GraphSymbol::Braille);
+        assert!(parsed.mem_graphs);
+        assert!(parsed.show_swap);
+        assert!(!parsed.base_10_sizes);
         assert_eq!(
             parsed
                 .preserved_unknown
@@ -238,6 +257,12 @@ mod tests {
                 .map(String::as_str),
             Some("True")
         );
+
+        let custom = Config::parse("mem_graphs = False\nshow_swap = False\nbase_10_sizes = True\n")
+            .expect("parse custom mem flags");
+        assert!(!custom.mem_graphs);
+        assert!(!custom.show_swap);
+        assert!(custom.base_10_sizes);
     }
 
     #[test]
