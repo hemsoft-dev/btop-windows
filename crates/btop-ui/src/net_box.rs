@@ -19,6 +19,8 @@ pub const AUTO_SCALE_FLOOR_BPS: u64 = 10 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetViewState {
     pub selected_index: usize,
+    /// Stable `NET_LUID` of the selected adapter so enumeration reordering never switches adapters.
+    pub selected_luid: Option<u64>,
     pub preferred_iface: Option<String>,
     pub auto_scale: bool,
     pub synced_scale: bool,
@@ -30,11 +32,40 @@ impl Default for NetViewState {
     fn default() -> Self {
         Self {
             selected_index: 0,
+            selected_luid: None,
             preferred_iface: None,
             auto_scale: true,
             synced_scale: true,
             session_baselines: BTreeMap::new(),
         }
+    }
+}
+
+/// Matches a `net_iface` selector against either the adapter friendly name (case-insensitive)
+/// or its 64-bit `NET_LUID` in decimal, `0x`-prefixed hex, or `luid:`-prefixed form.
+pub fn matches_net_iface(iface: &NetInterfaceSnapshot, selector: &str) -> bool {
+    let trimmed = selector.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if iface.name.eq_ignore_ascii_case(trimmed) {
+        return true;
+    }
+    parse_luid_selector(trimmed).is_some_and(|luid| iface.luid == luid)
+}
+
+fn parse_luid_selector(selector: &str) -> Option<u64> {
+    let raw = if let Some(prefix) = selector.get(..5)
+        && prefix.eq_ignore_ascii_case("luid:")
+    {
+        selector[5..].trim()
+    } else {
+        selector
+    };
+    if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        raw.parse::<u64>().ok()
     }
 }
 
@@ -44,6 +75,7 @@ impl NetViewState {
             (!config.net_iface.trim().is_empty()).then(|| config.net_iface.trim().to_owned());
         Self {
             selected_index: 0,
+            selected_luid: None,
             preferred_iface,
             auto_scale: config.net_auto,
             synced_scale: config.net_sync,
@@ -51,7 +83,7 @@ impl NetViewState {
         }
     }
 
-    /// Updates initial session baselines and clamps selection for the latest snapshot.
+    /// Updates initial session baselines and preserves selected adapter by `NET_LUID`.
     pub fn observe_snapshot(&mut self, snapshot: &Snapshot) {
         let Some(ifaces) = active_interfaces(snapshot) else {
             return;
@@ -69,18 +101,27 @@ impl NetViewState {
                 entry.1 = 0;
             }
         }
-        if !ifaces.is_empty() {
-            if let Some(ref pref) = self.preferred_iface
-                && let Some(idx) = ifaces
-                    .iter()
-                    .position(|i| i.name.eq_ignore_ascii_case(pref))
-            {
-                self.selected_index = idx;
-                self.preferred_iface = None;
-            } else if self.selected_index >= ifaces.len() {
-                self.selected_index = 0;
-            }
+        if ifaces.is_empty() {
+            return;
         }
+        if let Some(ref pref) = self.preferred_iface
+            && let Some(idx) = ifaces.iter().position(|i| matches_net_iface(i, pref))
+        {
+            self.selected_index = idx;
+            self.selected_luid = Some(ifaces[idx].luid);
+            self.preferred_iface = None;
+            return;
+        }
+        if let Some(luid) = self.selected_luid
+            && let Some(idx) = ifaces.iter().position(|i| i.luid == luid)
+        {
+            self.selected_index = idx;
+            return;
+        }
+        if self.selected_index >= ifaces.len() {
+            self.selected_index = 0;
+        }
+        self.selected_luid = Some(ifaces[self.selected_index].luid);
     }
 
     /// Cycles to the previous hardware interface (`b`).
@@ -92,8 +133,10 @@ impl NetViewState {
             return;
         }
         let (cur, _) = self.resolve_index(ifaces);
+        let next = if cur == 0 { ifaces.len() - 1 } else { cur - 1 };
         self.preferred_iface = None;
-        self.selected_index = if cur == 0 { ifaces.len() - 1 } else { cur - 1 };
+        self.selected_index = next;
+        self.selected_luid = Some(ifaces[next].luid);
     }
 
     /// Cycles to the next hardware interface (`n`).
@@ -105,8 +148,10 @@ impl NetViewState {
             return;
         }
         let (cur, _) = self.resolve_index(ifaces);
+        let next = (cur + 1) % ifaces.len();
         self.preferred_iface = None;
-        self.selected_index = (cur + 1) % ifaces.len();
+        self.selected_index = next;
+        self.selected_luid = Some(ifaces[next].luid);
     }
 
     /// Toggles auto-scaling (`a`).
@@ -145,9 +190,12 @@ impl NetViewState {
 
     fn resolve_index(&self, ifaces: &[NetInterfaceSnapshot]) -> (usize, usize) {
         if let Some(ref pref) = self.preferred_iface
-            && let Some(idx) = ifaces
-                .iter()
-                .position(|i| i.name.eq_ignore_ascii_case(pref))
+            && let Some(idx) = ifaces.iter().position(|i| matches_net_iface(i, pref))
+        {
+            return (idx, ifaces.len());
+        }
+        if let Some(luid) = self.selected_luid
+            && let Some(idx) = ifaces.iter().position(|i| i.luid == luid)
         {
             return (idx, ifaces.len());
         }
@@ -862,6 +910,59 @@ mod tests {
         state.reset_session_totals(&snap2, &mut hist);
         if let DataState::Available(ref list) = snap2.net {
             assert_eq!(state.session_totals(&list[0]), (0, 0));
+        }
+    }
+
+    #[test]
+    fn net_view_state_matches_luid_selector_and_preserves_selection_across_reordering() {
+        let eth = NetInterfaceSnapshot {
+            luid: 0x0006_0000_0100_0000,
+            name: "Ethernet".to_owned(),
+            is_up: true,
+            ..NetInterfaceSnapshot::default()
+        };
+        let wifi = NetInterfaceSnapshot {
+            luid: 0x0047_0000_0200_0000,
+            name: "Wi-Fi".to_owned(),
+            is_up: true,
+            ..NetInterfaceSnapshot::default()
+        };
+
+        // Matches friendly name, hex LUID, decimal LUID, and `luid:` prefix.
+        assert!(matches_net_iface(&wifi, "wi-fi"));
+        assert!(matches_net_iface(&wifi, "0x0047000002000000"));
+        assert!(matches_net_iface(&wifi, &wifi.luid.to_string()));
+        assert!(matches_net_iface(&wifi, "luid:0x0047000002000000"));
+        assert!(!matches_net_iface(&eth, "0x0047000002000000"));
+
+        // Selecting Wi-Fi by hex LUID picks index 1 even when Ethernet is at index 0.
+        let cfg = Config {
+            net_iface: "0x0047000002000000".to_owned(),
+            ..Config::default()
+        };
+        let mut state = NetViewState::from_config(&cfg);
+        let snap1 = Snapshot {
+            net: DataState::Available(vec![eth.clone(), wifi.clone()]),
+            ..Snapshot::default()
+        };
+        state.observe_snapshot(&snap1);
+        assert_eq!(state.selected_index, 1);
+        assert_eq!(state.selected_luid, Some(wifi.luid));
+
+        // When Ethernet goes down and enumeration reorders to [Wi-Fi, Ethernet],
+        // selection stays locked to Wi-Fi by `NET_LUID`.
+        let mut eth_down = eth;
+        eth_down.is_up = false;
+        let snap2 = Snapshot {
+            net: DataState::Available(vec![wifi.clone(), eth_down]),
+            ..Snapshot::default()
+        };
+        state.observe_snapshot(&snap2);
+        assert_eq!(state.selected_index, 0);
+        assert_eq!(state.selected_luid, Some(wifi.luid));
+        if let DataState::Available(ref list) = snap2.net {
+            let (_, selected) = state.resolve_selected(list).expect("selected adapter");
+            assert_eq!(selected.name, "Wi-Fi");
         }
     }
 }
