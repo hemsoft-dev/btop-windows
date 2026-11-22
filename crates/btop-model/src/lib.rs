@@ -146,6 +146,9 @@ pub struct Snapshot {
     pub timestamp_ms: u64,
     pub hostname: String,
     pub username: String,
+    /// Total physical RAM in bytes when known independently of full memory counter collection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_phys_mem_bytes: Option<u64>,
     pub cpu: DataState<CpuSnapshot>,
     pub mem: DataState<MemSnapshot>,
     pub processes: DataState<Vec<ProcessEntry>>,

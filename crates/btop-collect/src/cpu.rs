@@ -3,9 +3,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use btop_model::{
-    CoreKind, CoreSample, CpuSnapshot, DataState, LogicalCpuId, MemSnapshot, Snapshot,
-};
+use btop_model::{CoreKind, CoreSample, CpuSnapshot, DataState, LogicalCpuId, Snapshot};
 use btop_sys::{
     SystemProcessorPerformanceInformation, query_processor_performance, read_cpu_model_name,
     system_uptime_secs, total_physical_memory_bytes,
@@ -144,20 +142,13 @@ impl SnapshotSource for LiveCollector {
             Ok(list) => DataState::Available(list),
             Err(err) => DataState::Unavailable(err.to_string()),
         };
-        let mem = match self.total_phys_mem {
-            Some(total_bytes) => DataState::Available(MemSnapshot {
-                total_bytes,
-                ..MemSnapshot::default()
-            }),
-            None => DataState::WarmingUp,
-        };
 
         Ok(Snapshot {
             timestamp_ms,
             hostname: self.hostname.clone(),
             username: self.username.clone(),
+            total_phys_mem_bytes: self.total_phys_mem,
             cpu: DataState::Available(cpu_snapshot),
-            mem,
             processes,
             ..Snapshot::default()
         })

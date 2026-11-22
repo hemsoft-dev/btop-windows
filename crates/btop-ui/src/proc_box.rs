@@ -3,6 +3,7 @@
 use btop_config::Config;
 use btop_model::{DataState, ProcessEntry, Snapshot};
 use btop_term::{Cell, Grid, HitAction, Rect};
+use unicode_width::UnicodeWidthChar;
 
 use crate::theme::ThemePalette;
 use crate::widgets::{draw_border_tag, draw_box_frame, fill_rect};
@@ -425,7 +426,16 @@ fn render_proc_table(
     view: &ProcViewState,
     theme: &ThemePalette,
 ) {
-    if inner.height < 2 || inner.width < 22 {
+    if inner.height < 2 || inner.width < 34 {
+        let msg = clip_text("Widen terminal", usize::from(inner.width.saturating_sub(2)));
+        grid.write_str(
+            inner.x + 1,
+            inner.y,
+            &msg,
+            theme.inactive_fg,
+            theme.main_bg,
+            false,
+        );
         return;
     }
 
@@ -440,7 +450,7 @@ fn render_proc_table(
     };
     let total_mem_bytes = match &snapshot.mem {
         DataState::Available(mem) | DataState::Stale { value: mem, .. } => mem.total_bytes,
-        _ => 0,
+        _ => snapshot.total_phys_mem_bytes.unwrap_or(0),
     };
 
     let has_scrollbar = sorted.len() > visible_rows;
@@ -450,8 +460,9 @@ fn render_proc_table(
     let thr_w: u16 = if content_w >= 48 { 6 } else { 0 };
     let mem_w: u16 = 8;
     let cpu_w: u16 = 7;
-    let fixed_w = pid_w + thr_w + mem_w + cpu_w + 6;
-    let prog_w = content_w.saturating_sub(fixed_w).max(6);
+    let thr_gap = u16::from(thr_w > 0);
+    let fixed_w = pid_w + thr_w + mem_w + cpu_w + 5 + thr_gap;
+    let prog_w = content_w.saturating_sub(fixed_w).max(4);
 
     let col_pid = inner.x + 1;
     let col_prog = col_pid + pid_w + 1;
@@ -624,17 +635,33 @@ fn render_proc_table(
     }
 }
 
-fn clip_text(text: &str, max_chars: usize) -> String {
-    let count = text.chars().count();
-    if count <= max_chars {
-        text.to_owned()
-    } else if max_chars <= 1 {
-        text.chars().take(max_chars).collect()
-    } else {
-        let mut out: String = text.chars().take(max_chars - 1).collect();
-        out.push('…');
-        out
+fn clip_text(text: &str, max_cells: usize) -> String {
+    if max_cells == 0 {
+        return String::new();
     }
+    let total_width: usize = text.chars().map(|ch| ch.width().unwrap_or(0)).sum();
+    if total_width <= max_cells {
+        return text.to_owned();
+    }
+    if max_cells == 1 {
+        return "…".to_owned();
+    }
+    let limit = max_cells - 1;
+    let mut used = 0usize;
+    let mut out = String::new();
+    for ch in text.chars() {
+        let w = ch.width().unwrap_or(0);
+        if w == 0 {
+            continue;
+        }
+        if used + w > limit {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('…');
+    out
 }
 
 /// Formats bytes concisely (`0B`, `512K`, `142M`, `1.4G`) or percentage of physical RAM.
@@ -772,5 +799,16 @@ mod tests {
             format_mem_column(16 * 1024 * 1024 * 1024, 32 * 1024 * 1024 * 1024, false, 8),
             "   50.0%"
         );
+    }
+
+    #[test]
+    fn clip_text_respects_wide_display_cells() {
+        let clipped = clip_text("日本語プロセス.exe", 7);
+        let display_w: usize = clipped.chars().map(|c| c.width().unwrap_or(0)).sum();
+        assert!(
+            display_w <= 7,
+            "clipped width {display_w} exceeded 7: {clipped}"
+        );
+        assert!(clipped.ends_with('…'));
     }
 }

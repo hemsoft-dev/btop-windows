@@ -119,6 +119,7 @@ dependencies = [
  "btop-model",
  "btop-term",
  "insta",
+ "unicode-width",
 ]
 
 [[package]]
