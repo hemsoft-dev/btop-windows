@@ -5,11 +5,15 @@
 
 #![allow(non_camel_case_types, non_snake_case)]
 
+pub mod disk;
 pub mod mem;
 pub mod pdh;
 
 use core::mem::{offset_of, size_of};
 
+pub use disk::{
+    RawDiskPerformance, RawFixedDrive, enumerate_fixed_drives, query_physical_drive_performance,
+};
 pub use mem::{
     MemPdhQuery, RawMemCacheSample, RawMemoryStatus, RawPagefileTotals, RawPerformanceInfo,
     query_memory_status, query_pagefile_totals, query_performance_info,

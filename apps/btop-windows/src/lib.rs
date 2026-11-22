@@ -265,6 +265,14 @@ fn handle_tui_event(
             config.update_ms = sampler.adjust_update_ms(-100);
             true
         }
+        TermEvent::Key(k) if !k.ctrl && !k.alt && k.code == KeyCode::Char('d') => {
+            ui_state.toggle_disks();
+            true
+        }
+        TermEvent::Key(k) if !k.ctrl && !k.alt && k.code == KeyCode::Char('i') => {
+            ui_state.toggle_io_mode();
+            true
+        }
         TermEvent::Key(k) => handle_proc_key(k.code, ui_state, proc_count, proc_rows),
         TermEvent::Resize(new_size) => {
             *size = guard.size().unwrap_or(new_size);
