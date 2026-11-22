@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use btop_config::{Config, GraphSymbol};
+use btop_config::{Config, DisablePresets, GraphSymbol};
 use btop_model::{DataState, Snapshot};
 use btop_term::{Grid, HitAction, Rect, Size};
 use thiserror::Error;
@@ -163,8 +163,8 @@ pub fn parse_preset_spec(spec: &str) -> Result<PresetSpec, PresetParseError> {
             match box_id {
                 BoxId::Cpu => cpu_bottom = true,
                 BoxId::Proc => proc_left = true,
-                BoxId::Mem | BoxId::Net => mem_below_net = true,
-                BoxId::Gpu(_) => {}
+                BoxId::Mem => mem_below_net = true,
+                BoxId::Net | BoxId::Gpu(_) => {}
             }
         }
         if let Some(sym) = symbol {
@@ -222,7 +222,7 @@ pub struct LayoutState {
     pub presets: Vec<PresetSpec>,
     /// Active preset index (`Some(0..=9)`), or `None` after manual box toggling (`1`..`4`).
     pub active_preset: Option<u8>,
-    pub disable_presets: bool,
+    pub disable_presets: DisablePresets,
     pub shown_boxes: Vec<BoxId>,
     pub cpu_bottom: bool,
     pub proc_left: bool,
@@ -248,9 +248,14 @@ impl LayoutState {
         let mut presets = vec![preset_zero.clone()];
         presets.extend(parse_presets_list(&config.presets));
 
+        let active_preset = match config.disable_presets {
+            DisablePresets::Off | DisablePresets::Custom => Some(0),
+            DisablePresets::Default | DisablePresets::All => None,
+        };
+
         Self {
             presets,
-            active_preset: Some(0),
+            active_preset,
             disable_presets: config.disable_presets,
             shown_boxes: preset_zero.boxes,
             cpu_bottom: preset_zero.cpu_bottom,
@@ -260,9 +265,25 @@ impl LayoutState {
         }
     }
 
-    /// Applies preset `index` (`0`..`9`) when presets are enabled and `index` exists.
+    fn enabled_preset_indices(&self) -> Vec<u8> {
+        let count = self.presets.len();
+        match self.disable_presets {
+            DisablePresets::All => Vec::new(),
+            DisablePresets::Custom => {
+                if count > 0 {
+                    vec![0]
+                } else {
+                    Vec::new()
+                }
+            }
+            DisablePresets::Default => (1..count).filter_map(|i| u8::try_from(i).ok()).collect(),
+            DisablePresets::Off => (0..count).filter_map(|i| u8::try_from(i).ok()).collect(),
+        }
+    }
+
+    /// Applies preset `index` (`0`..`9`) when permitted by `disable_presets` and `index` exists.
     pub fn apply_preset(&mut self, index: u8) -> bool {
-        if self.disable_presets {
+        if !self.enabled_preset_indices().contains(&index) {
             return false;
         }
         let Some(spec) = self.presets.get(usize::from(index)).cloned() else {
@@ -273,32 +294,46 @@ impl LayoutState {
         true
     }
 
-    /// Cycles to the next preset (`p`), wrapping back to Preset 0.
+    /// Cycles to the next enabled preset (`p`), wrapping around.
     pub fn cycle_preset_next(&mut self) -> bool {
-        if self.disable_presets || self.presets.len() <= 1 {
+        let indices = self.enabled_preset_indices();
+        if indices.is_empty() {
             return false;
         }
-        let len = self.presets.len();
-        let next = match self.active_preset {
-            Some(idx) => (usize::from(idx) + 1) % len,
-            None => 0,
+        let next = match self
+            .active_preset
+            .and_then(|cur| indices.iter().position(|&idx| idx == cur))
+        {
+            Some(pos) => {
+                if indices.len() <= 1 {
+                    return false;
+                }
+                indices[(pos + 1) % indices.len()]
+            }
+            None => indices[0],
         };
-        let next_u8 = u8::try_from(next).unwrap_or(0);
-        self.apply_preset(next_u8)
+        self.apply_preset(next)
     }
 
-    /// Cycles to the previous preset (`Shift+P`), wrapping from Preset 0 to the last preset.
+    /// Cycles to the previous enabled preset (`Shift+P`), wrapping around.
     pub fn cycle_preset_prev(&mut self) -> bool {
-        if self.disable_presets || self.presets.len() <= 1 {
+        let indices = self.enabled_preset_indices();
+        if indices.is_empty() {
             return false;
         }
-        let len = self.presets.len();
-        let prev = match self.active_preset {
-            Some(0) | None => len - 1,
-            Some(idx) => usize::from(idx) - 1,
+        let prev = match self
+            .active_preset
+            .and_then(|cur| indices.iter().position(|&idx| idx == cur))
+        {
+            Some(pos) => {
+                if indices.len() <= 1 {
+                    return false;
+                }
+                indices[(pos + indices.len() - 1) % indices.len()]
+            }
+            None => *indices.last().unwrap_or(&0),
         };
-        let prev_u8 = u8::try_from(prev).unwrap_or(0);
-        self.apply_preset(prev_u8)
+        self.apply_preset(prev)
     }
 
     /// Toggles visibility of `box_id` (`1`..`4`). Refuses to hide the last visible box.
@@ -996,15 +1031,23 @@ mod tests {
 
     #[test]
     fn parses_upstream_preset_syntax_and_rejects_malformed_entries() {
-        let spec =
-            parse_preset_spec("cpu:1:block,proc:1:default,net:1:tty").expect("parse valid preset");
-        assert_eq!(spec.boxes, vec![BoxId::Cpu, BoxId::Proc, BoxId::Net]);
+        let spec = parse_preset_spec("cpu:1:block,proc:1:default,mem:1:default,net:0:tty")
+            .expect("parse valid preset");
+        assert_eq!(
+            spec.boxes,
+            vec![BoxId::Cpu, BoxId::Proc, BoxId::Mem, BoxId::Net]
+        );
         assert!(spec.cpu_bottom);
         assert!(spec.proc_left);
         assert!(spec.mem_below_net);
         assert_eq!(spec.symbols.get(&BoxId::Cpu), Some(&GraphSymbol::Block));
         assert_eq!(spec.symbols.get(&BoxId::Proc), None);
         assert_eq!(spec.symbols.get(&BoxId::Net), Some(&GraphSymbol::Tty));
+
+        // Only `mem:1` controls `mem_below_net`; `net:1` leaves it unchanged (upstream parity).
+        let net_pos_one =
+            parse_preset_spec("mem:0:default,net:1:default").expect("parse mem:0 net:1");
+        assert!(!net_pos_one.mem_below_net);
 
         let gpu_spec = parse_preset_spec("cpu:0:default,gpu0:0:braille,gpu5:0:block")
             .expect("parse gpu preset");
@@ -1074,15 +1117,41 @@ mod tests {
         assert!(!state.toggle_box(BoxId::Cpu));
         assert_eq!(state.shown_boxes, vec![BoxId::Cpu]);
 
-        // Disabled presets reject cycling and direct apply.
-        let disabled_cfg = Config {
-            disable_presets: true,
+        // `DisablePresets::All` rejects cycling and direct apply.
+        let all_disabled_cfg = Config {
+            disable_presets: DisablePresets::All,
             ..Config::default()
         };
-        let mut disabled = LayoutState::from_config(&disabled_cfg);
-        assert!(!disabled.cycle_preset_next());
-        assert!(!disabled.cycle_preset_prev());
-        assert!(!disabled.apply_preset(1));
+        let mut all_disabled = LayoutState::from_config(&all_disabled_cfg);
+        assert!(!all_disabled.cycle_preset_next());
+        assert!(!all_disabled.cycle_preset_prev());
+        assert!(!all_disabled.apply_preset(0));
+        assert!(!all_disabled.apply_preset(1));
+
+        // `DisablePresets::Default` skips Preset 0 and cycles strictly over custom presets 1..=3.
+        let default_disabled_cfg = Config {
+            disable_presets: DisablePresets::Default,
+            ..Config::default()
+        };
+        let mut default_disabled = LayoutState::from_config(&default_disabled_cfg);
+        assert!(!default_disabled.apply_preset(0));
+        assert!(default_disabled.cycle_preset_next());
+        assert_eq!(default_disabled.active_preset, Some(1));
+        assert!(default_disabled.cycle_preset_prev());
+        assert_eq!(default_disabled.active_preset, Some(3));
+
+        // `DisablePresets::Custom` allows only Preset 0 and rejects custom presets 1..=3.
+        let custom_disabled_cfg = Config {
+            disable_presets: DisablePresets::Custom,
+            ..Config::default()
+        };
+        let mut custom_disabled = LayoutState::from_config(&custom_disabled_cfg);
+        assert_eq!(custom_disabled.active_preset, Some(0));
+        assert!(!custom_disabled.apply_preset(1));
+        assert!(!custom_disabled.cycle_preset_next());
+        assert!(custom_disabled.toggle_box(BoxId::Proc));
+        assert!(custom_disabled.cycle_preset_next());
+        assert_eq!(custom_disabled.active_preset, Some(0));
     }
 
     fn check_orientation(layout: &ComputedLayout, state: &LayoutState) {
@@ -1162,7 +1231,7 @@ mod tests {
                             let state = LayoutState {
                                 presets: Vec::new(),
                                 active_preset: Some(0),
-                                disable_presets: false,
+                                disable_presets: DisablePresets::Off,
                                 shown_boxes: boxes.to_vec(),
                                 cpu_bottom,
                                 proc_left,

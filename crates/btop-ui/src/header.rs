@@ -3,7 +3,7 @@
 
 use std::fmt::Write as _;
 
-use btop_config::Config;
+use btop_config::{Config, DisablePresets};
 use btop_model::{BatterySnapshot, DataState, Snapshot};
 use btop_term::{Grid, Rect};
 
@@ -452,7 +452,7 @@ fn render_preset_badge(
     state: &UiState,
     theme: &ThemePalette,
 ) {
-    if state.layout.disable_presets || left_rect.width < 28 {
+    if state.layout.disable_presets == DisablePresets::All || left_rect.width < 28 {
         return;
     }
     let label = state.layout.preset_label();

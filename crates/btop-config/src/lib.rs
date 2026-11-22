@@ -34,6 +34,41 @@ impl GraphSymbol {
     }
 }
 
+/// Upstream `disable_presets` mode (`"Off"`, `"Default"`, `"Custom"`, or `"All"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisablePresets {
+    #[default]
+    Off,
+    Default,
+    Custom,
+    All,
+}
+
+impl DisablePresets {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Default => "Default",
+            Self::Custom => "Custom",
+            Self::All => "All",
+        }
+    }
+
+    pub fn parse(key: &str, val: &str) -> Result<Self, ConfigError> {
+        match val.trim().to_ascii_lowercase().as_str() {
+            "off" | "false" | "0" | "no" => Ok(Self::Off),
+            "default" => Ok(Self::Default),
+            "custom" => Ok(Self::Custom),
+            "all" | "true" | "1" | "yes" => Ok(Self::All),
+            _ => Err(ConfigError::InvalidValue {
+                key: key.to_owned(),
+                value: val.to_owned(),
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     pub color_theme: String,
@@ -47,7 +82,7 @@ pub struct Config {
     pub graph_symbol: GraphSymbol,
     pub shown_boxes: String,
     pub presets: String,
-    pub disable_presets: bool,
+    pub disable_presets: DisablePresets,
     pub cpu_bottom: bool,
     pub proc_left: bool,
     pub mem_below_net: bool,
@@ -95,7 +130,7 @@ impl Default for Config {
             graph_symbol: GraphSymbol::Braille,
             shown_boxes: "cpu mem net proc".to_owned(),
             presets: "cpu:1:default,proc:0:default cpu:0:default,mem:0:default,net:0:default cpu:0:block,mem:0:block,net:0:block".to_owned(),
-            disable_presets: false,
+            disable_presets: DisablePresets::Off,
             cpu_bottom: false,
             proc_left: false,
             mem_below_net: false,
@@ -151,7 +186,7 @@ impl Config {
                 "shown_boxes = \"{shown_boxes}\"\n",
                 "#* Layout presets 1-9 in upstream box:pos:symbol syntax (Preset 0 uses shown_boxes).\n",
                 "presets = \"{presets}\"\n",
-                "disable_presets = {disable_presets}\n",
+                "disable_presets = \"{disable_presets}\"\n",
                 "cpu_bottom = {cpu_bottom}\n",
                 "proc_left = {proc_left}\n",
                 "mem_below_net = {mem_below_net}\n",
@@ -195,7 +230,7 @@ impl Config {
             graph_symbol = cfg.graph_symbol.as_str(),
             shown_boxes = cfg.shown_boxes,
             presets = cfg.presets,
-            disable_presets = bool_title(cfg.disable_presets),
+            disable_presets = cfg.disable_presets.as_str(),
             cpu_bottom = bool_title(cfg.cpu_bottom),
             proc_left = bool_title(cfg.proc_left),
             mem_below_net = bool_title(cfg.mem_below_net),
@@ -253,7 +288,7 @@ impl Config {
                 "disable_mouse" => cfg.disable_mouse = parse_bool(key, &val)?,
                 "shown_boxes" => cfg.shown_boxes = val,
                 "presets" => cfg.presets = val,
-                "disable_presets" => cfg.disable_presets = parse_bool(key, &val)?,
+                "disable_presets" => cfg.disable_presets = DisablePresets::parse(key, &val)?,
                 "cpu_bottom" => cfg.cpu_bottom = parse_bool(key, &val)?,
                 "proc_left" => cfg.proc_left = parse_bool(key, &val)?,
                 "mem_below_net" => cfg.mem_below_net = parse_bool(key, &val)?,
@@ -393,11 +428,24 @@ mod tests {
         assert!(custom.swap_upload_download);
         assert!(!custom.base_10_bitrate);
         assert_eq!(custom.presets, "cpu:1:block,proc:1:default");
-        assert!(custom.disable_presets);
+        assert_eq!(custom.disable_presets, DisablePresets::All);
         assert!(custom.cpu_bottom);
         assert!(custom.proc_left);
         assert!(custom.mem_below_net);
         assert!(!custom.show_battery);
+
+        for (raw, expected) in [
+            ("Off", DisablePresets::Off),
+            ("Default", DisablePresets::Default),
+            ("Custom", DisablePresets::Custom),
+            ("All", DisablePresets::All),
+            ("False", DisablePresets::Off),
+            ("True", DisablePresets::All),
+        ] {
+            let line = format!("disable_presets = \"{raw}\"\n");
+            let parsed_mode = Config::parse(&line).expect("parse upstream disable_presets");
+            assert_eq!(parsed_mode.disable_presets, expected);
+        }
     }
 
     #[test]
