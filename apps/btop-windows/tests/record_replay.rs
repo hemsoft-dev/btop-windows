@@ -74,7 +74,9 @@ fn committed_fixtures_replay_cleanly_without_windows_apis() {
         let frames =
             run_headless_frames(&mut replay, None, &config, size, 10).expect("render fixture");
         assert_eq!(frames.len(), 3);
-        assert!(frames[0].to_plain_text().contains("btop-windows"));
+        let text = frames[0].to_plain_text();
+        assert!(text.contains("cpu"));
+        assert!(text.contains("WIN11-"));
     }
 }
 
