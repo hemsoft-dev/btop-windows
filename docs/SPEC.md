@@ -86,7 +86,7 @@ To keep the initial release simple and fast to ship, v1 targets **English Window
   - Read-only SCM listing works non-elevated (service name, display name, state, start type, linked PID).
   - Basic Start and Stop actions work when elevated and appear disabled when non-elevated.
 - **Multi-GPU (WDDM baseline + NVIDIA NVML):**
-  - Universal user-mode baseline via DXGI hardware adapter enumeration (filtering `DXGI_ADAPTER_FLAG_SOFTWARE`) + WDDM system utilization and VRAM (method selected by M0 Spike `#2`).
+  - Universal user-mode baseline via DXGI hardware adapter enumeration (filtering `DXGI_ADAPTER_FLAG_SOFTWARE`) + persistent English WDDM PDH utilization and VRAM (see [ADR-0002](adr/0002-gpu-baseline-api.md)).
   - Optional dynamic `nvml.dll` loading from `System32` on a background worker for NVIDIA temperature, clocks, power, and encoder/decoder stats. AMD ADLX, Intel IGCL, and hybrid-laptop D3cold wake guards are deferred post-v1.
 - **Battery:** Simple `GetSystemPowerStatus` charge %, AC/charging status, and remaining time; hides cleanly on desktops without a battery.
 - **Record and replay:** `--record <path.jsonl>` and `--replay <path.jsonl>` for deterministic testing and bug reports.

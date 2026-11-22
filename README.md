@@ -52,6 +52,7 @@ docs/
 - [System Architecture](docs/ARCHITECTURE.md)
 - [Upstream Parity Matrix](docs/PARITY.md)
 - [ADR-0001: Tech Stack, Renderer, and Telemetry Architecture](docs/adr/0001-tech-stack-and-renderer.md)
+- [ADR-0002: Windows 11 x64 GPU Baseline API (DXGI + WDDM PDH)](docs/adr/0002-gpu-baseline-api.md)
 
 ## Local development
 
