@@ -132,8 +132,10 @@ pub fn render_overlay_menu(
 }
 
 fn centered_rect(size: Size, width: u16, height: u16) -> Rect {
-    let w = width.min(size.width.saturating_sub(2)).max(20);
-    let h = height.min(size.height.saturating_sub(2)).max(8);
+    let max_w = size.width.saturating_sub(2).max(size.width.min(1));
+    let max_h = size.height.saturating_sub(2).max(size.height.min(1));
+    let w = width.min(max_w);
+    let h = height.min(max_h);
     Rect {
         x: size.width.saturating_sub(w) / 2,
         y: size.height.saturating_sub(h) / 2,
@@ -284,56 +286,7 @@ fn render_options_menu(
 
     render_options_tabs(grid, rect, state.category, theme);
 
-    let body_top = rect.y.saturating_add(3);
-    let body_h = rect.height.saturating_sub(5);
-    let inner_w = rect.width.saturating_sub(2);
-    let left_w = (inner_w * 58 / 100).clamp(32, inner_w.saturating_sub(20));
-    let div_x = rect.x.saturating_add(1).saturating_add(left_w);
-    let right_x = div_x.saturating_add(1);
-    let right_w = rect
-        .x
-        .saturating_add(rect.width - 1)
-        .saturating_sub(right_x);
-
-    // Draw horizontal divider under category tabs and vertical split divider.
-    let hdiv = "─".repeat(usize::from(inner_w));
-    grid.write_str(
-        rect.x + 1,
-        rect.y + 2,
-        &hdiv,
-        theme.div_line,
-        theme.main_bg,
-        false,
-    );
-    for dy in 0..body_h {
-        grid.set(
-            div_x,
-            body_top.saturating_add(dy),
-            Cell {
-                ch: '│',
-                fg: theme.div_line,
-                bg: theme.main_bg,
-                bold: false,
-                continuation: false,
-            },
-        );
-    }
-
-    let list_rect = Rect {
-        x: rect.x.saturating_add(1),
-        y: body_top,
-        width: left_w,
-        height: body_h,
-    };
-    render_options_list(grid, list_rect, state, config, theme);
-
-    let detail_rect = Rect {
-        x: right_x,
-        y: body_top,
-        width: right_w,
-        height: body_h,
-    };
-    render_options_detail(grid, detail_rect, state, config, theme);
+    render_options_body(grid, rect, state, config, theme);
 
     let footer_y = rect.y.saturating_add(rect.height.saturating_sub(2));
     let footer = if state.editing.is_some() {
@@ -350,6 +303,94 @@ fn render_options_menu(
         theme.main_bg,
         false,
     );
+}
+
+fn render_options_body(
+    grid: &mut Grid,
+    rect: Rect,
+    state: &OptionsState,
+    config: &Config,
+    theme: &ThemePalette,
+) {
+    let body_top = rect.y.saturating_add(3);
+    let body_h = rect.height.saturating_sub(5);
+    let inner_w = rect.width.saturating_sub(2);
+
+    let hdiv = "─".repeat(usize::from(inner_w));
+    grid.write_str(
+        rect.x + 1,
+        rect.y + 2,
+        &hdiv,
+        theme.div_line,
+        theme.main_bg,
+        false,
+    );
+
+    if inner_w >= 54 {
+        let left_w = (inner_w * 58 / 100).clamp(24, inner_w.saturating_sub(20));
+        let div_x = rect.x.saturating_add(1).saturating_add(left_w);
+        let right_x = div_x.saturating_add(1);
+        let right_w = rect
+            .x
+            .saturating_add(rect.width.saturating_sub(1))
+            .saturating_sub(right_x);
+
+        for dy in 0..body_h {
+            grid.set(
+                div_x,
+                body_top.saturating_add(dy),
+                Cell {
+                    ch: '│',
+                    fg: theme.div_line,
+                    bg: theme.main_bg,
+                    bold: false,
+                    continuation: false,
+                },
+            );
+        }
+
+        let list_rect = Rect {
+            x: rect.x.saturating_add(1),
+            y: body_top,
+            width: left_w,
+            height: body_h,
+        };
+        render_options_list(grid, list_rect, state, config, theme);
+
+        let detail_rect = Rect {
+            x: right_x,
+            y: body_top,
+            width: right_w,
+            height: body_h,
+        };
+        render_options_detail(grid, detail_rect, state, config, theme);
+    } else if inner_w > 0 && body_h > 0 {
+        let list_h = if state.validation_error.is_some() && body_h > 2 {
+            body_h - 1
+        } else {
+            body_h
+        };
+        let list_rect = Rect {
+            x: rect.x.saturating_add(1),
+            y: body_top,
+            width: inner_w,
+            height: list_h,
+        };
+        render_options_list(grid, list_rect, state, config, theme);
+        if let Some(ref err) = state.validation_error
+            && body_h > 2
+        {
+            let msg = clip_text(&format!("Error: {err}"), usize::from(inner_w));
+            grid.write_str(
+                rect.x + 1,
+                body_top.saturating_add(list_h),
+                &msg,
+                theme.hi_fg,
+                theme.main_bg,
+                true,
+            );
+        }
+    }
 }
 
 fn render_options_tabs(grid: &mut Grid, rect: Rect, active: OptionCategory, theme: &ThemePalette) {
@@ -943,5 +984,74 @@ mod tests {
             g2.get(0, 0).map(|c| c.fg),
             "switching color_theme must immediately update rendered TrueColor palette"
         );
+    }
+
+    #[test]
+    fn narrow_and_oversized_layouts_render_all_menus_without_panicking() {
+        let snap = win11_8core_single_gpu_desktop()[0].clone();
+        let hist = UiHistory::from_snapshot(&snap);
+
+        // Narrow valid CPU-only dashboard (40x24) and tiny size-error viewports (40x12, 24x10).
+        let narrow_cfg = Config {
+            shown_boxes: "cpu".to_owned(),
+            ..Config::default()
+        };
+        let menus = [
+            OverlayMenu::main(),
+            OverlayMenu::options(),
+            OverlayMenu::help(),
+            OverlayMenu::message_box(
+                MessageBoxState::yes_no(
+                    "Confirm",
+                    vec!["Proceed?".to_owned()],
+                    MessageBoxAction::DismissOnly,
+                    true,
+                ),
+                None,
+            ),
+        ];
+        for (w, h) in [(40, 24), (40, 12), (24, 10)] {
+            for menu in &menus {
+                let mut st = UiState::from_config(&narrow_cfg);
+                st.menu = Some(menu.clone());
+                let g = render_frame(
+                    &snap,
+                    &hist,
+                    &st,
+                    &narrow_cfg,
+                    Size {
+                        width: w,
+                        height: h,
+                    },
+                );
+                assert_eq!(g.size().width, w);
+                assert_eq!(g.size().height, h);
+            }
+        }
+
+        // At 80x24 with `cpu mem net proc gpu0` (needs 25 rows -> SizeError), Options must
+        // STILL render visibly over the size-error screen so the user can edit `shown_boxes`.
+        let too_tall_cfg = Config {
+            shown_boxes: "cpu mem net proc gpu0".to_owned(),
+            ..Config::default()
+        };
+        let mut st = UiState::from_config(&too_tall_cfg);
+        st.menu = Some(OverlayMenu::options());
+        let rendered = render_frame(
+            &snap,
+            &hist,
+            &st,
+            &too_tall_cfg,
+            Size {
+                width: 80,
+                height: 24,
+            },
+        )
+        .to_plain_text();
+        assert!(
+            rendered.contains("Options (F2)"),
+            "Options menu must remain visible even when dashboard layout triggers SizeError:\n{rendered}"
+        );
+        assert!(rendered.contains("color_theme"));
     }
 }

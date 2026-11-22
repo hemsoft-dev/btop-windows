@@ -518,66 +518,67 @@ pub fn render_frame(
     let mut grid = Grid::new(size);
     let theme = ThemePalette::for_name(&config.color_theme, config.theme_background);
 
-    let layout = match compute_layout(size, &state.layout) {
-        Ok(computed) => computed,
+    match compute_layout(size, &state.layout) {
+        Ok(layout) => {
+            let has_dedicated_gpu_boxes = !layout.gpus().is_empty();
+            if let Some(rect) = layout.cpu() {
+                let cfg = box_config(config, state, BoxId::Cpu);
+                cpu_box::render_cpu_box(
+                    &mut grid,
+                    rect,
+                    snapshot,
+                    history,
+                    has_dedicated_gpu_boxes,
+                    &cfg,
+                    &theme,
+                );
+            }
+            if let Some(rect) = layout.mem() {
+                let cfg = box_config(config, state, BoxId::Mem);
+                mem_box::render_mem_box(&mut grid, rect, snapshot, history, state, &cfg, &theme);
+            }
+            if let Some(rect) = layout.net() {
+                let cfg = box_config(config, state, BoxId::Net);
+                net_box::render_net_box(
+                    &mut grid, rect, snapshot, history, &state.net, &cfg, &theme,
+                );
+            }
+            if let Some(rect) = layout.proc() {
+                let cfg = box_config(config, state, BoxId::Proc);
+                if state.services.active {
+                    services_view::render_services_view(
+                        &mut grid,
+                        rect,
+                        snapshot,
+                        &state.services,
+                        &cfg,
+                        &theme,
+                    );
+                } else {
+                    proc_box::render_proc_box(
+                        &mut grid,
+                        rect,
+                        snapshot,
+                        history,
+                        &state.proc,
+                        &cfg,
+                        &theme,
+                    );
+                }
+            }
+            for (gpu_idx, rect) in layout.gpus() {
+                let cfg = box_config(config, state, BoxId::Gpu(gpu_idx));
+                gpu_box::render_gpu_box(&mut grid, rect, gpu_idx, snapshot, history, &cfg, &theme);
+            }
+
+            header::render_top_header(&mut grid, &layout, snapshot, state, config, &theme);
+            if let Some(ref modal) = state.modal {
+                proc_actions::render_proc_action_modal(&mut grid, modal, config, &theme);
+            }
+        }
         Err(size_err) => {
             layout::render_size_error(&mut grid, size_err, config, &theme);
-            return grid;
         }
-    };
-
-    let has_dedicated_gpu_boxes = !layout.gpus().is_empty();
-    if let Some(rect) = layout.cpu() {
-        let cfg = box_config(config, state, BoxId::Cpu);
-        cpu_box::render_cpu_box(
-            &mut grid,
-            rect,
-            snapshot,
-            history,
-            has_dedicated_gpu_boxes,
-            &cfg,
-            &theme,
-        );
-    }
-    if let Some(rect) = layout.mem() {
-        let cfg = box_config(config, state, BoxId::Mem);
-        mem_box::render_mem_box(&mut grid, rect, snapshot, history, state, &cfg, &theme);
-    }
-    if let Some(rect) = layout.net() {
-        let cfg = box_config(config, state, BoxId::Net);
-        net_box::render_net_box(&mut grid, rect, snapshot, history, &state.net, &cfg, &theme);
-    }
-    if let Some(rect) = layout.proc() {
-        let cfg = box_config(config, state, BoxId::Proc);
-        if state.services.active {
-            services_view::render_services_view(
-                &mut grid,
-                rect,
-                snapshot,
-                &state.services,
-                &cfg,
-                &theme,
-            );
-        } else {
-            proc_box::render_proc_box(
-                &mut grid,
-                rect,
-                snapshot,
-                history,
-                &state.proc,
-                &cfg,
-                &theme,
-            );
-        }
-    }
-    for (gpu_idx, rect) in layout.gpus() {
-        let cfg = box_config(config, state, BoxId::Gpu(gpu_idx));
-        gpu_box::render_gpu_box(&mut grid, rect, gpu_idx, snapshot, history, &cfg, &theme);
-    }
-
-    header::render_top_header(&mut grid, &layout, snapshot, state, config, &theme);
-    if let Some(ref modal) = state.modal {
-        proc_actions::render_proc_action_modal(&mut grid, modal, config, &theme);
     }
     if let Some(ref menu) = state.menu {
         render_overlay_menu(&mut grid, menu, config, &theme);

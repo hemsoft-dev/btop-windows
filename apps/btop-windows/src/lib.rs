@@ -2165,4 +2165,68 @@ mod tests {
             })
             .expect("expected hit region")
     }
+
+    #[test]
+    fn cosmetic_option_edit_preserves_paused_proc_net_baselines_and_manual_layout() {
+        let snap = sample_snapshot_with_proc();
+        let history = UiHistory::default();
+        let size = Size {
+            width: 120,
+            height: 40,
+        };
+        let mut cfg = Config::default();
+        let mut state = UiState::from_config(&cfg);
+        let target_id = btop_model::ProcessIdentity {
+            pid: 4216,
+            create_time_100ns: 1000,
+        };
+
+        // Establish rich session state: paused process list, followed/detailed process,
+        // collapsed tree node, selected net adapter + session baseline, and manual layout toggle.
+        if let DataState::Available(ref procs) = snap.processes {
+            state.proc.toggle_pause(Some(procs), Some(&history));
+        }
+        state.proc.followed = Some(target_id);
+        state.proc.detailed = Some(target_id);
+        state.proc.collapsed.insert(target_id);
+        state.net.selected_luid = Some(0xDEAD_BEEF);
+        state.net.session_baselines.insert(0xDEAD_BEEF, (1000, 500));
+        assert!(state.layout.toggle_box(BoxId::Gpu(0)));
+        assert!(state.layout.shown_boxes.contains(&BoxId::Gpu(0)));
+
+        // Open Options and cycle `color_theme` (a cosmetic edit).
+        state.menu = Some(OverlayMenu::options());
+        let mut prev_grid = None;
+        assert_eq!(
+            handle_menu_key(
+                btop_term::KeyEvent {
+                    code: KeyCode::Right,
+                    ctrl: false,
+                    alt: false,
+                    shift: false,
+                },
+                size,
+                None,
+                &snap,
+                &mut cfg,
+                &mut state,
+                &mut prev_grid,
+            ),
+            LoopAction::Redraw
+        );
+        assert_eq!(cfg.color_theme, "Dracula");
+
+        // All unrelated session state must remain completely intact!
+        assert!(state.proc.paused);
+        assert!(state.proc.frozen_processes.is_some());
+        assert_eq!(state.proc.followed, Some(target_id));
+        assert_eq!(state.proc.detailed, Some(target_id));
+        assert!(state.proc.collapsed.contains(&target_id));
+        assert_eq!(state.net.selected_luid, Some(0xDEAD_BEEF));
+        assert_eq!(
+            state.net.session_baselines.get(&0xDEAD_BEEF),
+            Some(&(1000, 500))
+        );
+        assert!(state.layout.shown_boxes.contains(&BoxId::Gpu(0)));
+    }
 }

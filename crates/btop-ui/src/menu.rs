@@ -422,14 +422,13 @@ pub enum OptionId {
 
 const CPU_UTIL_MODES: [&str; 2] = ["time", "utility"];
 const FREQ_MODES: [&str; 5] = ["average", "highest", "lowest", "first", "range"];
-const PROC_SORT_MODES: [&str; 7] = [
+const PROC_SORT_MODES: [&str; 6] = [
     "cpu lazy",
     "cpu direct",
     "memory",
     "pid",
     "program",
     "threads",
-    "user",
 ];
 
 impl OptionId {

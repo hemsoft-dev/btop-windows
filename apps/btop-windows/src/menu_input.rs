@@ -7,8 +7,8 @@ use btop_model::Snapshot;
 use btop_term::{Grid, HitAction, KeyCode, KeyEvent, MouseButton, MouseEvent, MouseKind, Size};
 use btop_ui::{
     LayoutState, MainMenuChoice, MessageBoxAction, MessageBoxResult, MessageBoxState, NetViewState,
-    OptionCategory, OptionKind, OverlayMenu, ProcViewState, UiState, help_visible_rows,
-    options_visible_rows,
+    OptionCategory, OptionId, OptionKind, OverlayMenu, ProcSort, ProcViewState, UiState,
+    help_visible_rows, options_visible_rows, parse_shown_boxes,
 };
 
 /// Result of handling an input event inside the main TUI event loop.
@@ -60,7 +60,7 @@ pub fn handle_menu_key(
         return LoopAction::None;
     };
 
-    let mut config_changed = false;
+    let mut changed_option: Option<OptionId> = None;
     let action = match &mut menu {
         OverlayMenu::Main(state) => handle_main_menu_key(key.code, config.vim_keys, state),
         OverlayMenu::Options(state) => handle_options_key(
@@ -69,7 +69,7 @@ pub fn handle_menu_key(
             size,
             config,
             state,
-            &mut config_changed,
+            &mut changed_option,
         ),
         OverlayMenu::Help(state) => handle_help_key(key.code, config.vim_keys, size, state),
         OverlayMenu::MessageBox { dialog, .. } => {
@@ -80,14 +80,14 @@ pub fn handle_menu_key(
         }
     };
 
-    if config_changed {
-        sync_runtime_from_config(config, sampler, snapshot, ui_state);
+    if let Some(opt) = changed_option {
+        sync_option_to_runtime(opt, config, sampler, snapshot, ui_state);
     }
 
     match action {
         MenuKeyOutcome::KeepOpen(changed) => {
             ui_state.menu = Some(menu);
-            if changed || config_changed {
+            if changed || changed_option.is_some() {
                 *prev_grid = None;
                 LoopAction::Redraw
             } else {
@@ -147,7 +147,6 @@ pub fn handle_menu_mouse(
     let Some(mut menu) = ui_state.menu.take() else {
         return LoopAction::None;
     };
-    let mut config_changed = false;
 
     match (&mut menu, hit) {
         (OverlayMenu::Main(_), HitAction::MenuItem(idx)) => match MainMenuChoice::ALL.get(idx) {
@@ -174,11 +173,14 @@ pub fn handle_menu_mouse(
         }
         (OverlayMenu::Options(opts), HitAction::MenuItem(idx)) => {
             let vis = options_visible_rows(size);
+            let mut changed_opt: Option<OptionId> = None;
             if opts.selected == idx && opts.editing.is_none() {
                 if let Some(opt) = opts.selected_option() {
                     match opt.kind() {
                         OptionKind::Bool | OptionKind::Enum => {
-                            config_changed = opt.step(config, 1);
+                            if opt.step(config, 1) {
+                                changed_opt = Some(opt);
+                            }
                         }
                         OptionKind::Text | OptionKind::Int => {
                             let _ = opts.begin_edit(config);
@@ -189,8 +191,8 @@ pub fn handle_menu_mouse(
                 opts.cancel_edit();
                 opts.select_index(idx, vis);
             }
-            if config_changed {
-                sync_runtime_from_config(config, sampler, snapshot, ui_state);
+            if let Some(opt) = changed_opt {
+                sync_option_to_runtime(opt, config, sampler, snapshot, ui_state);
             }
             ui_state.menu = Some(menu);
             *prev_grid = None;
@@ -289,7 +291,7 @@ fn handle_options_text_edit_key(
     code: KeyCode,
     config: &mut Config,
     state: &mut btop_ui::OptionsState,
-    config_changed: &mut bool,
+    changed_option: &mut Option<OptionId>,
 ) -> Option<MenuKeyOutcome> {
     let editor = state.editing.as_mut()?;
     let outcome = match code {
@@ -298,8 +300,9 @@ fn handle_options_text_edit_key(
             MenuKeyOutcome::KeepOpen(true)
         }
         KeyCode::Enter => {
+            let opt = state.selected_option();
             if state.commit_edit(config).is_ok() {
-                *config_changed = true;
+                *changed_option = opt;
             }
             MenuKeyOutcome::KeepOpen(true)
         }
@@ -320,9 +323,9 @@ fn handle_options_key(
     size: Size,
     config: &mut Config,
     state: &mut btop_ui::OptionsState,
-    config_changed: &mut bool,
+    changed_option: &mut Option<OptionId>,
 ) -> MenuKeyOutcome {
-    if let Some(outcome) = handle_options_text_edit_key(code, config, state, config_changed) {
+    if let Some(outcome) = handle_options_text_edit_key(code, config, state, changed_option) {
         return outcome;
     }
 
@@ -379,15 +382,16 @@ fn handle_options_key(
         }
         KeyCode::Left | KeyCode::Right => {
             let dir = if code == KeyCode::Right { 1 } else { -1 };
-            let changed = state.selected_option().is_some_and(|o| o.step(config, dir));
+            let opt = state.selected_option();
+            let changed = opt.is_some_and(|o| o.step(config, dir));
             if changed {
                 state.validation_error = None;
-                *config_changed = true;
+                *changed_option = opt;
             }
             MenuKeyOutcome::KeepOpen(changed)
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
-            activate_selected_option(config, state, config_changed)
+            activate_selected_option(config, state, changed_option)
         }
         KeyCode::Char('r' | 'R') => {
             let dialog = MessageBoxState::yes_no(
@@ -411,7 +415,7 @@ fn handle_options_key(
 fn activate_selected_option(
     config: &mut Config,
     state: &mut btop_ui::OptionsState,
-    config_changed: &mut bool,
+    changed_option: &mut Option<OptionId>,
 ) -> MenuKeyOutcome {
     let Some(opt) = state.selected_option() else {
         return MenuKeyOutcome::KeepOpen(false);
@@ -421,7 +425,7 @@ fn activate_selected_option(
             let changed = opt.step(config, 1);
             if changed {
                 state.validation_error = None;
-                *config_changed = true;
+                *changed_option = Some(opt);
             }
             MenuKeyOutcome::KeepOpen(changed)
         }
@@ -503,7 +507,7 @@ fn apply_messagebox_result(
         MessageBoxResult::Confirmed(MessageBoxAction::QuitApp) => LoopAction::Quit,
         MessageBoxResult::Confirmed(MessageBoxAction::ResetOptionsToDefaults) => {
             *config = Config::default();
-            sync_runtime_from_config(config, sampler, snapshot, ui_state);
+            reset_runtime_from_defaults(config, sampler, snapshot, ui_state);
             ui_state.menu = parent;
             *prev_grid = None;
             LoopAction::Redraw
@@ -517,9 +521,68 @@ fn apply_messagebox_result(
     }
 }
 
-/// Synchronizes live sampler parameters and UI panel state from an edited [`Config`] without
-/// discarding the open overlay menu or runtime metadata.
-pub fn sync_runtime_from_config(
+/// Surgically propagates a single edited option to runtime state without discarding unrelated
+/// session state (paused snapshots, followed/detail identities, collapsed branches, manual
+/// layout overrides, selected network adapter, or accumulated traffic baselines).
+pub fn sync_option_to_runtime(
+    opt: OptionId,
+    config: &mut Config,
+    sampler: Option<&Sampler>,
+    snapshot: &Snapshot,
+    ui_state: &mut UiState,
+) {
+    match opt {
+        OptionId::UpdateMs => {
+            if let Some(s) = sampler {
+                config.update_ms = s.set_update_ms(config.update_ms);
+            }
+        }
+        OptionId::FreqMode => {
+            if let Some(s) = sampler {
+                s.set_freq_mode(FreqMode::from_config_str(&config.freq_mode));
+            }
+        }
+        OptionId::NvmlMeasurePcieSpeeds => {
+            if let Some(s) = sampler {
+                s.set_nvml_measure_pcie_speeds(config.nvml_measure_pcie_speeds);
+            }
+        }
+        OptionId::ShownBoxes => {
+            ui_state.layout.shown_boxes = parse_shown_boxes(&config.shown_boxes);
+            ui_state.layout.active_preset = None;
+        }
+        OptionId::CpuBottom => ui_state.layout.cpu_bottom = config.cpu_bottom,
+        OptionId::ProcLeft => ui_state.layout.proc_left = config.proc_left,
+        OptionId::MemBelowNet => ui_state.layout.mem_below_net = config.mem_below_net,
+        OptionId::ShowDisks => {
+            ui_state.show_disks = config.show_disks;
+            if !ui_state.show_disks {
+                ui_state.io_mode = false;
+            }
+        }
+        OptionId::IoMode => ui_state.io_mode = config.io_mode,
+        OptionId::ProcSorting => {
+            ui_state.proc.sort = ProcSort::from_config_str(&config.proc_sorting);
+        }
+        OptionId::ProcReversed => ui_state.proc.reversed = config.proc_reversed,
+        OptionId::ProcTree => ui_state.proc.tree_mode = config.proc_tree,
+        OptionId::ProcAggregate => ui_state.proc.aggregate = config.proc_aggregate,
+        OptionId::ProcFollowDetailed => ui_state.proc.follow_detailed = config.proc_follow_detailed,
+        OptionId::ProcPerCore => ui_state.proc.per_core_cpu = config.proc_per_core,
+        OptionId::ProcMemBytes => ui_state.proc.mem_bytes = config.proc_mem_bytes,
+        OptionId::NetAuto => ui_state.net.auto_scale = config.net_auto,
+        OptionId::NetSync => ui_state.net.synced_scale = config.net_sync,
+        OptionId::NetIface => {
+            let trimmed = config.net_iface.trim();
+            ui_state.net.preferred_iface = (!trimmed.is_empty()).then(|| trimmed.to_owned());
+            ui_state.net.observe_snapshot(snapshot);
+        }
+        _ => {}
+    }
+}
+
+/// Resets runtime layout, sampler, process, and network preferences after explicit Reset Defaults.
+fn reset_runtime_from_defaults(
     config: &mut Config,
     sampler: Option<&Sampler>,
     snapshot: &Snapshot,
