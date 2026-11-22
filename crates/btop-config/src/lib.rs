@@ -46,6 +46,12 @@ pub struct Config {
     pub disable_mouse: bool,
     pub graph_symbol: GraphSymbol,
     pub shown_boxes: String,
+    pub presets: String,
+    pub disable_presets: bool,
+    pub cpu_bottom: bool,
+    pub proc_left: bool,
+    pub mem_below_net: bool,
+    pub show_battery: bool,
     pub update_ms: u32,
     pub clock_format: String,
     pub proc_sorting: String,
@@ -88,6 +94,12 @@ impl Default for Config {
             disable_mouse: false,
             graph_symbol: GraphSymbol::Braille,
             shown_boxes: "cpu mem net proc".to_owned(),
+            presets: "cpu:1:default,proc:0:default cpu:0:default,mem:0:default,net:0:default cpu:0:block,mem:0:block,net:0:block".to_owned(),
+            disable_presets: false,
+            cpu_bottom: false,
+            proc_left: false,
+            mem_below_net: false,
+            show_battery: true,
             update_ms: 2000,
             clock_format: "%X".to_owned(),
             proc_sorting: "cpu lazy".to_owned(),
@@ -136,7 +148,14 @@ impl Config {
                 "#* Default graph symbol: \"braille\" or \"block\".\n",
                 "graph_symbol = \"{graph_symbol}\"\n\n",
                 "#* Shown panels: \"cpu mem net proc\" and \"gpu0\" through \"gpu5\".\n",
-                "shown_boxes = \"{shown_boxes}\"\n\n",
+                "shown_boxes = \"{shown_boxes}\"\n",
+                "#* Layout presets 1-9 in upstream box:pos:symbol syntax (Preset 0 uses shown_boxes).\n",
+                "presets = \"{presets}\"\n",
+                "disable_presets = {disable_presets}\n",
+                "cpu_bottom = {cpu_bottom}\n",
+                "proc_left = {proc_left}\n",
+                "mem_below_net = {mem_below_net}\n",
+                "show_battery = {show_battery}\n\n",
                 "#* Update interval in milliseconds (>= 100).\n",
                 "update_ms = {update_ms}\n\n",
                 "#* Clock format (strftime plus /host, /user, /uptime).\n",
@@ -175,6 +194,12 @@ impl Config {
             terminal_sync = bool_title(cfg.terminal_sync),
             graph_symbol = cfg.graph_symbol.as_str(),
             shown_boxes = cfg.shown_boxes,
+            presets = cfg.presets,
+            disable_presets = bool_title(cfg.disable_presets),
+            cpu_bottom = bool_title(cfg.cpu_bottom),
+            proc_left = bool_title(cfg.proc_left),
+            mem_below_net = bool_title(cfg.mem_below_net),
+            show_battery = bool_title(cfg.show_battery),
             update_ms = cfg.update_ms,
             clock_format = cfg.clock_format,
             proc_sorting = cfg.proc_sorting,
@@ -227,6 +252,12 @@ impl Config {
                 "vim_keys" => cfg.vim_keys = parse_bool(key, &val)?,
                 "disable_mouse" => cfg.disable_mouse = parse_bool(key, &val)?,
                 "shown_boxes" => cfg.shown_boxes = val,
+                "presets" => cfg.presets = val,
+                "disable_presets" => cfg.disable_presets = parse_bool(key, &val)?,
+                "cpu_bottom" => cfg.cpu_bottom = parse_bool(key, &val)?,
+                "proc_left" => cfg.proc_left = parse_bool(key, &val)?,
+                "mem_below_net" => cfg.mem_below_net = parse_bool(key, &val)?,
+                "show_battery" => cfg.show_battery = parse_bool(key, &val)?,
                 "clock_format" => cfg.clock_format = val,
                 "proc_sorting" => cfg.proc_sorting = val,
                 "proc_reversed" => cfg.proc_reversed = parse_bool(key, &val)?,
@@ -342,9 +373,9 @@ mod tests {
         );
 
         let custom = Config::parse(
-            "mem_graphs = False\nshow_swap = False\nbase_10_sizes = True\ndisks_filter = \"exclude=E\"\nshow_disks = False\nshow_io_stat = False\nio_mode = True\nio_graph_combined = True\nio_graph_speeds = \"C:500\"\nnet_iface = \"Ethernet\"\nnet_download = 250\nnet_upload = 75\nnet_auto = False\nnet_sync = False\nswap_upload_download = True\nbase_10_bitrate = False\n",
+            "mem_graphs = False\nshow_swap = False\nbase_10_sizes = True\ndisks_filter = \"exclude=E\"\nshow_disks = False\nshow_io_stat = False\nio_mode = True\nio_graph_combined = True\nio_graph_speeds = \"C:500\"\nnet_iface = \"Ethernet\"\nnet_download = 250\nnet_upload = 75\nnet_auto = False\nnet_sync = False\nswap_upload_download = True\nbase_10_bitrate = False\npresets = \"cpu:1:block,proc:1:default\"\ndisable_presets = True\ncpu_bottom = True\nproc_left = True\nmem_below_net = True\nshow_battery = False\n",
         )
-        .expect("parse custom mem, disk, and net flags");
+        .expect("parse custom mem, disk, net, and layout flags");
         assert!(!custom.mem_graphs);
         assert!(!custom.show_swap);
         assert!(custom.base_10_sizes);
@@ -361,6 +392,12 @@ mod tests {
         assert!(!custom.net_sync);
         assert!(custom.swap_upload_download);
         assert!(!custom.base_10_bitrate);
+        assert_eq!(custom.presets, "cpu:1:block,proc:1:default");
+        assert!(custom.disable_presets);
+        assert!(custom.cpu_bottom);
+        assert!(custom.proc_left);
+        assert!(custom.mem_below_net);
+        assert!(!custom.show_battery);
     }
 
     #[test]

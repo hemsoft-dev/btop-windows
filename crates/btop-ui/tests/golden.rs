@@ -330,3 +330,45 @@ fn golden_net_fixed_200x60() {
     );
     insta::assert_snapshot!("net_fixed_200x60", rendered);
 }
+
+fn render_fixture_preset(fixture: &str, preset: u8, width: u16, height: u16) -> String {
+    let snapshots = parse_jsonl_file(&fixture_path(fixture)).expect("load fixture");
+    let mut history = UiHistory::default();
+    for _ in 0..8 {
+        for snap in &snapshots {
+            history.push(snap);
+        }
+    }
+    let latest = snapshots.last().expect("non-empty fixture");
+    let config = Config::default();
+    let mut state = btop_ui::UiState::from_config(&config);
+    assert!(
+        state.layout.apply_preset(preset),
+        "preset {preset} should exist in default config"
+    );
+    btop_ui::render_frame(latest, &history, &state, &config, Size { width, height }).to_plain_text()
+}
+
+#[test]
+fn golden_preset_0_120x40() {
+    let rendered = render_fixture_preset("win11-16core-dual-gpu-desktop.jsonl", 0, 120, 40);
+    insta::assert_snapshot!("preset_0_120x40", rendered);
+}
+
+#[test]
+fn golden_preset_1_120x40() {
+    let rendered = render_fixture_preset("win11-16core-dual-gpu-desktop.jsonl", 1, 120, 40);
+    insta::assert_snapshot!("preset_1_120x40", rendered);
+}
+
+#[test]
+fn golden_preset_2_120x40() {
+    let rendered = render_fixture_preset("win11-16core-dual-gpu-desktop.jsonl", 2, 120, 40);
+    insta::assert_snapshot!("preset_2_120x40", rendered);
+}
+
+#[test]
+fn golden_size_error_40x12() {
+    let rendered = render_fixture_preset("win11-8core-single-gpu-desktop.jsonl", 0, 40, 12);
+    insta::assert_snapshot!("size_error_40x12", rendered);
+}

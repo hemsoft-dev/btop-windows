@@ -13,6 +13,7 @@ workspace = true
 btop-config.workspace = true
 btop-model.workspace = true
 btop-term.workspace = true
+thiserror.workspace = true
 unicode-width.workspace = true
 
 [dev-dependencies]

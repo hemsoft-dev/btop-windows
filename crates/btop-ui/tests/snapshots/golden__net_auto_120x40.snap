@@ -2,7 +2,7 @@
 source: crates/btop-ui/tests/golden.rs
 expression: rendered
 ---
-╭─┐³net┌─┐auto┌─┐ysync┌─┐zero┌─────────────────────────────────────────────────────────────────────────┐<b Ethernet n>┌╮
+╭─┐³net┌─┐auto┌─┐ysync┌─┐zero┌─┐p0┌────────────────────┐01:00:04┌──────────────────────────────────────┐<b Ethernet n>┌╮
 │302 Mbps                                                                    ⡇⢸ ⡇⢸ ⡇⢸ ⡇⢸│ ▼ Down 302 Mbps              │
 │                                                                            ⡇⢸ ⡇⢸ ⡇⢸ ⡇⢸│  Top: 302 Mbps               │
 │                                                                            ⡇⢸ ⡇⢸ ⡇⢸ ⡇⢸│  Tot: 14.1 GiB               │
