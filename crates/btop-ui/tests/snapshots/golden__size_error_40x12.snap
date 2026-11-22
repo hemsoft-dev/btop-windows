@@ -1,0 +1,13 @@
+---
+source: crates/btop-ui/tests/golden.rs
+expression: rendered
+---
+
+
+╭──────────────────────────────────────╮
+│       Terminal size too small        │
+│            Current: 40x12            │
+│            Minimum: 64x19            │
+│                                      │
+│   Resize window, or press p / 1-4    │
+╰──────────────────────────────────────╯

@@ -9,6 +9,7 @@ pub mod disk;
 pub mod mem;
 pub mod net;
 pub mod pdh;
+pub mod power;
 
 use core::mem::{offset_of, size_of};
 
@@ -23,6 +24,7 @@ pub use net::{
     RawNetEntry, RawNetInterface, enumerate_hardware_interfaces, refresh_interface_entry,
 };
 pub use pdh::{CpuPdhQuery, CpuPdhSample};
+pub use power::{RawPowerStatus, local_utc_offset_secs, query_system_power_status};
 
 /// Matches `UNICODE_STRING` in `winternl.h` (16 bytes on 64-bit targets).
 #[repr(C)]

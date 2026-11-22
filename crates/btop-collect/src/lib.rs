@@ -1,5 +1,6 @@
 //! System telemetry collectors, waitable-timer sampler, and pure delta mathematics.
 
+pub mod battery;
 pub mod cpu;
 pub mod disk;
 pub mod mem;
@@ -10,6 +11,10 @@ pub mod sampler;
 
 use btop_model::Snapshot;
 use thiserror::Error;
+
+pub use battery::{
+    BATTERY_FLAG_CHARGING, BATTERY_FLAG_NO_BATTERY, BatteryCollector, decode_power_status,
+};
 
 pub use cpu::{
     CpuCollector, FreqMode, LiveCollector, RunQueueEwma, classify_core_kinds, compute_cpu_deltas,

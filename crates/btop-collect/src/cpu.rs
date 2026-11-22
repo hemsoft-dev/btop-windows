@@ -12,6 +12,7 @@ use btop_sys::{
     total_physical_memory_bytes,
 };
 
+use crate::battery::BatteryCollector;
 use crate::disk::DiskCollector;
 use crate::math::cpu_busy_percent;
 use crate::mem::MemoryCollector;
@@ -315,6 +316,7 @@ pub struct LiveCollector {
     disks: DiskCollector,
     net: NetCollector,
     procs: ProcessCollector,
+    battery: BatteryCollector,
     runq: RunQueueEwma,
     last_runq_instant: Option<Instant>,
 }
@@ -351,6 +353,7 @@ impl LiveCollector {
             disks,
             net,
             procs,
+            battery: BatteryCollector::new(),
             runq: RunQueueEwma::default(),
             last_runq_instant: None,
         })
@@ -406,6 +409,8 @@ impl SnapshotSource for LiveCollector {
             }
         };
 
+        let battery = self.battery.sample();
+
         Ok(Snapshot {
             timestamp_ms,
             hostname: self.hostname.clone(),
@@ -416,6 +421,7 @@ impl SnapshotSource for LiveCollector {
             disks,
             net,
             processes,
+            battery,
             ..Snapshot::default()
         })
     }

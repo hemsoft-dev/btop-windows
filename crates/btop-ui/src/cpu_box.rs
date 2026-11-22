@@ -131,29 +131,20 @@ fn render_cpu_chrome(
         );
     }
 
-    // Embedded CPU model name + uptime tag when available
+    // Embedded CPU model name when room allows without colliding with top-row header clock/preset.
     if let DataState::Available(cpu) | DataState::Stale { value: cpu, .. } = &snapshot.cpu {
-        let uptime_label = format!("up {}", format_uptime(cpu.uptime_secs));
-        let uptime_w = u16::try_from(uptime_label.chars().count() + 2).unwrap_or(10);
-        let uptime_x = cadence_x.saturating_sub(uptime_w + 2);
-        if uptime_x > rect.x.saturating_add(14) {
-            let _ = draw_border_tag(
-                grid,
-                uptime_x,
-                rect.y,
-                cadence_x.saturating_sub(1),
-                None,
-                &uptime_label,
-                theme.cpu_box,
-                theme.main_fg,
-                theme.hi_fg,
-                theme.main_bg,
-            );
-        }
-
-        let model_start = rect.x.saturating_add(10);
-        let model_limit = uptime_x.saturating_sub(1);
-        if model_limit > model_start.saturating_add(6) {
+        let (model_start, model_limit) = if rect.y == 0 {
+            (
+                rect.x.saturating_add(16),
+                rect.x
+                    .saturating_add(rect.width / 2)
+                    .saturating_sub(9)
+                    .min(cadence_x.saturating_sub(1)),
+            )
+        } else {
+            (rect.x.saturating_add(10), cadence_x.saturating_sub(1))
+        };
+        if model_limit > model_start.saturating_add(8) {
             let _ = draw_border_tag(
                 grid,
                 model_start,

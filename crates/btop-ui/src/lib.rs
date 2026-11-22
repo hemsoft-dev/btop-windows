@@ -4,19 +4,27 @@
 
 pub mod cpu_box;
 pub mod disk_view;
+pub mod header;
+pub mod layout;
 pub mod mem_box;
 pub mod net_box;
 pub mod proc_box;
 pub mod theme;
 pub mod widgets;
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
 
 use btop_config::Config;
 use btop_model::{DataState, Snapshot};
-use btop_term::{Grid, Rect, Size};
+use btop_term::{Grid, Size};
 
 pub use disk_view::{format_rate_bytes_per_sec, parse_io_graph_speeds};
+pub use header::{format_battery, format_clock};
+pub use layout::{
+    BoxId, ComputedLayout, LayoutState, PresetParseError, PresetSpec, SizeError, compute_layout,
+    parse_preset_spec, parse_presets_list, parse_shown_boxes,
+};
 pub use mem_box::{format_mem_bytes, stacked_physical_segments};
 pub use net_box::{AUTO_SCALE_FLOOR_BPS, NetViewState, compute_net_scale_ceilings, format_bitrate};
 pub use proc_box::{ProcSort, ProcViewState};
@@ -29,19 +37,24 @@ const DEFAULT_HISTORY_CAPACITY: usize = 512;
 /// Pure UI interaction state passed into [`render_frame`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UiState {
+    pub layout: LayoutState,
     pub proc: ProcViewState,
     pub net: NetViewState,
     pub show_disks: bool,
     pub io_mode: bool,
+    /// Offset from UTC in seconds applied when formatting `clock_format` (`0` = deterministic UTC).
+    pub tz_offset_secs: i32,
 }
 
 impl Default for UiState {
     fn default() -> Self {
         Self {
+            layout: LayoutState::default(),
             proc: ProcViewState::default(),
             net: NetViewState::default(),
             show_disks: true,
             io_mode: false,
+            tz_offset_secs: 0,
         }
     }
 }
@@ -49,10 +62,12 @@ impl Default for UiState {
 impl UiState {
     pub fn from_config(config: &Config) -> Self {
         Self {
+            layout: LayoutState::from_config(config),
             proc: ProcViewState::from_config(config),
             net: NetViewState::from_config(config),
             show_disks: config.show_disks,
             io_mode: config.io_mode,
+            tz_offset_secs: 0,
         }
     }
 
@@ -293,148 +308,22 @@ fn push_bounded_u64(buf: &mut VecDeque<u64>, value: u64, capacity: usize) {
     buf.make_contiguous();
 }
 
-/// Computes the number of visible process rows for a given viewport size and config.
-pub fn visible_proc_rows(size: Size, config: &Config) -> usize {
-    let layout = compute_layout(size, config);
-    layout
-        .proc
+/// Computes the number of visible process rows for a given viewport size and active UI layout state.
+pub fn visible_proc_rows(size: Size, state: &UiState) -> usize {
+    compute_layout(size, &state.layout)
+        .ok()
+        .and_then(|layout| layout.proc())
         .map_or(0, |r| usize::from(r.height.saturating_sub(3)))
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct PanelLayout {
-    cpu: Option<Rect>,
-    mem: Option<Rect>,
-    net: Option<Rect>,
-    proc: Option<Rect>,
-}
-
-fn split_top_bottom(area: Rect) -> (Rect, Rect) {
-    let top_h = u16::try_from((u32::from(area.height) * 2 / 5).clamp(8, 22)).unwrap_or(22);
-    let bottom_h = area.height.saturating_sub(top_h);
-    (
-        Rect {
-            height: top_h,
-            ..area
-        },
-        Rect {
-            y: area.y.saturating_add(top_h),
-            height: bottom_h,
-            ..area
-        },
-    )
-}
-
-fn split_mem_proc(area: Rect) -> (Rect, Rect) {
-    let left_w = u16::try_from((u32::from(area.width) * 42 / 100).clamp(32, 80)).unwrap_or(80);
-    let proc_w = area.width.saturating_sub(left_w);
-    (
-        Rect {
-            width: left_w,
-            ..area
-        },
-        Rect {
-            x: area.x.saturating_add(left_w),
-            width: proc_w,
-            ..area
-        },
-    )
-}
-
-fn split_left_column(area: Rect, show_mem: bool, show_net: bool) -> (Option<Rect>, Option<Rect>) {
-    match (show_mem, show_net) {
-        (true, true) if area.height >= 12 => {
-            let mem_h =
-                u16::try_from((u32::from(area.height) * 55) / 100).unwrap_or(area.height / 2);
-            let mem_h = mem_h.max(6).min(area.height.saturating_sub(6));
-            let net_h = area.height.saturating_sub(mem_h);
-            (
-                Some(Rect {
-                    height: mem_h,
-                    ..area
-                }),
-                Some(Rect {
-                    y: area.y.saturating_add(mem_h),
-                    height: net_h,
-                    ..area
-                }),
-            )
-        }
-        (true, _) => (Some(area), None),
-        (false, true) => (None, Some(area)),
-        (false, false) => (None, None),
-    }
-}
-
-fn compute_layout(size: Size, config: &Config) -> PanelLayout {
-    let boxes: Vec<&str> = config.shown_boxes.split_whitespace().collect();
-    let show_cpu = boxes.contains(&"cpu") || boxes.is_empty();
-    let show_mem = boxes.contains(&"mem");
-    let show_net = boxes.contains(&"net");
-    let show_proc = boxes.contains(&"proc");
-    let show_left = show_mem || show_net;
-
-    let full = Rect {
-        x: 0,
-        y: 0,
-        width: size.width,
-        height: size.height,
-    };
-
-    if show_cpu && (show_left || show_proc) && size.height >= 14 {
-        let (cpu_rect, bottom) = split_top_bottom(full);
-        let (mem, net, proc) = match (show_left, show_proc) {
-            (true, true) if size.width >= 68 => {
-                let (left_col, proc_rect) = split_mem_proc(bottom);
-                let (mem_rect, net_rect) = split_left_column(left_col, show_mem, show_net);
-                (mem_rect, net_rect, Some(proc_rect))
-            }
-            (true, false) => {
-                let (mem_rect, net_rect) = split_left_column(bottom, show_mem, show_net);
-                (mem_rect, net_rect, None)
-            }
-            (_, true) => (None, None, Some(bottom)),
-            (false, false) => (None, None, None),
-        };
-        return PanelLayout {
-            cpu: Some(cpu_rect),
-            mem,
-            net,
-            proc,
-        };
-    }
-
-    if !show_cpu {
-        if show_left && show_proc && size.width >= 68 {
-            let (left_col, proc_rect) = split_mem_proc(full);
-            let (mem, net) = split_left_column(left_col, show_mem, show_net);
-            return PanelLayout {
-                cpu: None,
-                mem,
-                net,
-                proc: Some(proc_rect),
-            };
-        }
-        if show_left && !show_proc {
-            let (mem, net) = split_left_column(full, show_mem, show_net);
-            return PanelLayout {
-                cpu: None,
-                mem,
-                net,
-                proc: None,
-            };
-        }
-        if show_proc {
-            return PanelLayout {
-                proc: Some(full),
-                ..PanelLayout::default()
-            };
-        }
-    }
-
-    PanelLayout {
-        cpu: Some(full),
-        ..PanelLayout::default()
+fn box_config<'a>(config: &'a Config, state: &UiState, id: BoxId) -> Cow<'a, Config> {
+    let sym = state.layout.symbol_for(id, config.graph_symbol);
+    if sym == config.graph_symbol {
+        Cow::Borrowed(config)
+    } else {
+        let mut cloned = config.clone();
+        cloned.graph_symbol = sym;
+        Cow::Owned(cloned)
     }
 }
 
@@ -467,26 +356,36 @@ pub fn render_frame(
     let mut grid = Grid::new(size);
     let theme = ThemePalette::default_dark(config.theme_background);
 
-    if size.width < 24 || size.height < 6 {
-        grid.write_str(0, 0, "Terminal too small", theme.hi_fg, theme.main_bg, true);
-        return grid;
+    let layout = match compute_layout(size, &state.layout) {
+        Ok(computed) => computed,
+        Err(size_err) => {
+            layout::render_size_error(&mut grid, size_err, config, &theme);
+            return grid;
+        }
+    };
+
+    if let Some(rect) = layout.cpu() {
+        let cfg = box_config(config, state, BoxId::Cpu);
+        cpu_box::render_cpu_box(&mut grid, rect, snapshot, history, &cfg, &theme);
+    }
+    if let Some(rect) = layout.mem() {
+        let cfg = box_config(config, state, BoxId::Mem);
+        mem_box::render_mem_box(&mut grid, rect, snapshot, history, state, &cfg, &theme);
+    }
+    if let Some(rect) = layout.net() {
+        let cfg = box_config(config, state, BoxId::Net);
+        net_box::render_net_box(&mut grid, rect, snapshot, history, &state.net, &cfg, &theme);
+    }
+    if let Some(rect) = layout.proc() {
+        let cfg = box_config(config, state, BoxId::Proc);
+        proc_box::render_proc_box(&mut grid, rect, snapshot, &state.proc, &cfg, &theme);
+    }
+    for (gpu_idx, rect) in layout.gpus() {
+        let cfg = box_config(config, state, BoxId::Gpu(gpu_idx));
+        layout::render_gpu_placeholder(&mut grid, rect, gpu_idx, snapshot, &cfg, &theme);
     }
 
-    let layout = compute_layout(size, config);
-    if let Some(rect) = layout.cpu {
-        cpu_box::render_cpu_box(&mut grid, rect, snapshot, history, config, &theme);
-    }
-    if let Some(rect) = layout.mem {
-        mem_box::render_mem_box(&mut grid, rect, snapshot, history, state, config, &theme);
-    }
-    if let Some(rect) = layout.net {
-        net_box::render_net_box(
-            &mut grid, rect, snapshot, history, &state.net, config, &theme,
-        );
-    }
-    if let Some(rect) = layout.proc {
-        proc_box::render_proc_box(&mut grid, rect, snapshot, &state.proc, config, &theme);
-    }
+    header::render_top_header(&mut grid, &layout, snapshot, state, config, &theme);
     grid
 }
 
@@ -538,5 +437,55 @@ mod tests {
             hist.push(&snap);
         }
         assert_eq!(hist.cpu_total_slice(), &[20.0, 30.0, 40.0]);
+    }
+
+    #[test]
+    fn top_header_renders_clock_and_hides_battery_when_absent() {
+        let mut snap = Snapshot {
+            timestamp_ms: 1_795_375_845_000, // 19:30:45 UTC
+            hostname: "LAPTOP".to_owned(),
+            username: "franz".to_owned(),
+            cpu: DataState::Available(CpuSnapshot {
+                model_name: "Ryzen 9".to_owned(),
+                total_busy_pct: 25.0,
+                uptime_secs: 3600,
+                ..CpuSnapshot::default()
+            }),
+            battery: DataState::Unavailable("no battery".to_owned()),
+            ..Snapshot::default()
+        };
+        let cfg = Config {
+            shown_boxes: "cpu".to_owned(),
+            clock_format: "%X /host".to_owned(),
+            ..Config::default()
+        };
+        let without_bat = render(
+            &snap,
+            &cfg,
+            Size {
+                width: 100,
+                height: 16,
+            },
+        )
+        .to_plain_text();
+        assert!(without_bat.contains("19:30:45 LAPTOP"));
+        assert!(!without_bat.contains("BAT "));
+
+        snap.battery = DataState::Available(btop_model::BatterySnapshot {
+            charge_pct: 78,
+            status: "discharging".to_owned(),
+            watts: None,
+            remaining_secs: Some(7200),
+        });
+        let with_bat = render(
+            &snap,
+            &cfg,
+            Size {
+                width: 100,
+                height: 16,
+            },
+        )
+        .to_plain_text();
+        assert!(with_bat.contains("BAT 78% - 2h00m"));
     }
 }

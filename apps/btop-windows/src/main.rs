@@ -82,6 +82,7 @@ fn main() -> ExitCode {
 
     let overrides = ConfigOverrides {
         update_ms: cli.update_ms,
+        preset: cli.preset,
         force_tty: cli.tty,
         low_color: cli.low_color,
     };

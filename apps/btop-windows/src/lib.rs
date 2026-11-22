@@ -9,7 +9,7 @@ use btop_model::{DataState, RecordStats, SnapshotRecorder};
 use btop_term::{
     DiffEncoder, Grid, InputSource, KeyCode, Size, TermError, TermEvent, TerminalGuard,
 };
-use btop_ui::{UiHistory, UiState, visible_proc_rows};
+use btop_ui::{BoxId, UiHistory, UiState, visible_proc_rows};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -34,6 +34,7 @@ pub enum AppError {
 #[derive(Debug, Clone, Default)]
 pub struct ConfigOverrides {
     pub update_ms: Option<u32>,
+    pub preset: Option<u8>,
     pub force_tty: bool,
     pub low_color: bool,
 }
@@ -108,6 +109,15 @@ pub fn run_headless_frames(
     Ok(frames)
 }
 
+fn build_ui_state(config: &Config, overrides: &ConfigOverrides) -> UiState {
+    let mut ui_state = UiState::from_config(config);
+    ui_state.tz_offset_secs = btop_sys::local_utc_offset_secs();
+    if let Some(preset) = overrides.preset {
+        let _ = ui_state.layout.apply_preset(preset);
+    }
+    ui_state
+}
+
 /// Runs the live Windows Terminal TUI loop backed by a waitable-timer [`Sampler`] and
 /// `ArcSwap<Snapshot>`, supporting `+`/`-` cadence control, `Ctrl+R` config reload, and
 /// clean exit on `q`/`Ctrl+C`.
@@ -128,7 +138,7 @@ pub fn run_tui_loop(
         height: 24,
     });
     let mut history = UiHistory::default();
-    let mut ui_state = UiState::from_config(&config);
+    let mut ui_state = build_ui_state(&config, overrides);
     let mut last_generation = sampler.generation();
     let mut current_snapshot = sampler.latest();
     history.push_with_util_mode(&current_snapshot, is_utility_mode(&config));
@@ -144,6 +154,7 @@ pub fn run_tui_loop(
             if gen_now != last_generation {
                 last_generation = gen_now;
                 current_snapshot = sampler.latest();
+                ui_state.tz_offset_secs = btop_sys::local_utc_offset_secs();
                 history.push_with_util_mode(&current_snapshot, is_utility_mode(&config));
                 ui_state.net.observe_snapshot(&current_snapshot);
                 dirty = true;
@@ -153,7 +164,7 @@ pub fn run_tui_loop(
                 DataState::Available(list) | DataState::Stale { value: list, .. } => list.len(),
                 _ => 0,
             };
-            let proc_rows = visible_proc_rows(size, &config);
+            let proc_rows = visible_proc_rows(size, &ui_state);
             ui_state.proc.clamp(proc_count, proc_rows);
 
             if dirty {
@@ -257,48 +268,20 @@ fn handle_tui_event(
                 *config = reloaded;
                 config.update_ms = sampler.set_update_ms(config.update_ms);
                 sampler.set_freq_mode(FreqMode::from_config_str(&config.freq_mode));
-                *ui_state = UiState::from_config(config);
+                *ui_state = build_ui_state(config, overrides);
                 ui_state.net.observe_snapshot(snapshot);
                 *prev_grid = None;
                 return true;
             }
             false
         }
-        TermEvent::Key(k) if matches!(k.code, KeyCode::Char('+' | '=')) => {
-            config.update_ms = sampler.adjust_update_ms(100);
-            true
-        }
-        TermEvent::Key(k) if matches!(k.code, KeyCode::Char('-' | '_')) => {
-            config.update_ms = sampler.adjust_update_ms(-100);
-            true
-        }
-        TermEvent::Key(k) if !k.ctrl && !k.alt && k.code == KeyCode::Char('d') => {
-            ui_state.toggle_disks();
-            true
-        }
-        TermEvent::Key(k) if !k.ctrl && !k.alt && k.code == KeyCode::Char('i') => {
-            ui_state.toggle_io_mode();
-            true
-        }
-        TermEvent::Key(k) if !k.ctrl && !k.alt && k.code == KeyCode::Char('b') => {
-            ui_state.net.select_prev(snapshot);
-            true
-        }
-        TermEvent::Key(k) if !k.ctrl && !k.alt && k.code == KeyCode::Char('n') => {
-            ui_state.net.select_next(snapshot);
-            true
-        }
-        TermEvent::Key(k) if !k.ctrl && !k.alt && k.code == KeyCode::Char('a') => {
-            ui_state.net.toggle_auto();
-            true
-        }
-        TermEvent::Key(k) if !k.ctrl && !k.alt && k.code == KeyCode::Char('y') => {
-            ui_state.net.toggle_sync();
-            true
-        }
-        TermEvent::Key(k) if !k.ctrl && !k.alt && k.code == KeyCode::Char('z') => {
-            ui_state.net.reset_session_totals(snapshot, history);
-            true
+        TermEvent::Key(k) if !k.ctrl && !k.alt => {
+            if handle_layout_key(k.code, ui_state, prev_grid) {
+                return true;
+            }
+            handle_panel_key(
+                k.code, sampler, snapshot, history, config, ui_state, proc_count, proc_rows,
+            )
         }
         TermEvent::Key(k) => handle_proc_key(k.code, ui_state, proc_count, proc_rows),
         TermEvent::Resize(new_size) => {
@@ -307,6 +290,74 @@ fn handle_tui_event(
             true
         }
         TermEvent::Mouse(_) => false,
+    }
+}
+
+fn handle_layout_key(code: KeyCode, ui_state: &mut UiState, prev_grid: &mut Option<Grid>) -> bool {
+    let changed = match code {
+        KeyCode::Char('p') => ui_state.layout.cycle_preset_next(),
+        KeyCode::Char('P') => ui_state.layout.cycle_preset_prev(),
+        KeyCode::Char('1') => ui_state.layout.toggle_box(BoxId::Cpu),
+        KeyCode::Char('2') => ui_state.layout.toggle_box(BoxId::Mem),
+        KeyCode::Char('3') => ui_state.layout.toggle_box(BoxId::Net),
+        KeyCode::Char('4') => ui_state.layout.toggle_box(BoxId::Proc),
+        _ => false,
+    };
+    if changed {
+        *prev_grid = None;
+    }
+    changed
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_panel_key(
+    code: KeyCode,
+    sampler: &Sampler,
+    snapshot: &btop_model::Snapshot,
+    history: &mut UiHistory,
+    config: &mut Config,
+    ui_state: &mut UiState,
+    proc_count: usize,
+    proc_rows: usize,
+) -> bool {
+    match code {
+        KeyCode::Char('+' | '=') => {
+            config.update_ms = sampler.adjust_update_ms(100);
+            true
+        }
+        KeyCode::Char('-' | '_') => {
+            config.update_ms = sampler.adjust_update_ms(-100);
+            true
+        }
+        KeyCode::Char('d') => {
+            ui_state.toggle_disks();
+            true
+        }
+        KeyCode::Char('i') => {
+            ui_state.toggle_io_mode();
+            true
+        }
+        KeyCode::Char('b') => {
+            ui_state.net.select_prev(snapshot);
+            true
+        }
+        KeyCode::Char('n') => {
+            ui_state.net.select_next(snapshot);
+            true
+        }
+        KeyCode::Char('a') => {
+            ui_state.net.toggle_auto();
+            true
+        }
+        KeyCode::Char('y') => {
+            ui_state.net.toggle_sync();
+            true
+        }
+        KeyCode::Char('z') => {
+            ui_state.net.reset_session_totals(snapshot, history);
+            true
+        }
+        other => handle_proc_key(other, ui_state, proc_count, proc_rows),
     }
 }
 
@@ -376,6 +427,7 @@ mod tests {
 
         let overrides = ConfigOverrides {
             update_ms: Some(500),
+            preset: Some(2),
             force_tty: false,
             low_color: false,
         };
