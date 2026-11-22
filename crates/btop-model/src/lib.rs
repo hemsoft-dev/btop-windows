@@ -133,14 +133,69 @@ pub struct ProcessEntry {
     pub identity: ProcessIdentity,
     pub parent_pid: u32,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_path: Option<String>,
     pub command_line: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub command_line_denied: bool,
     pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub user_denied: bool,
     pub threads: u32,
     pub cpu_pct: f32,
     pub working_set_private_bytes: u64,
     pub io_read_bytes: u64,
     pub io_write_bytes: u64,
     pub is_protected: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl ProcessEntry {
+    /// Explicit availability state for the process command line (`DataState::Denied` on PPL).
+    pub fn command_line_state(&self) -> DataState<&str> {
+        if let Some(ref cmd) = self.command_line
+            && !cmd.is_empty()
+        {
+            return DataState::Available(cmd.as_str());
+        }
+        if self.command_line_denied || self.is_protected {
+            DataState::Denied
+        } else {
+            DataState::Unavailable("no command line".to_owned())
+        }
+    }
+
+    /// Explicit availability state for the process owner user (`DataState::Denied` on PPL).
+    pub fn user_state(&self) -> DataState<&str> {
+        if let Some(ref user) = self.user
+            && !user.is_empty()
+        {
+            return DataState::Available(user.as_str());
+        }
+        if self.user_denied || self.is_protected {
+            DataState::Denied
+        } else {
+            DataState::Unavailable("unknown user".to_owned())
+        }
+    }
+
+    /// Explicit availability state for the full image path (`SystemProcessIdInformation`, class 88).
+    pub fn image_path_state(&self) -> DataState<&str> {
+        if let Some(ref path) = self.image_path
+            && !path.is_empty()
+        {
+            return DataState::Available(path.as_str());
+        }
+        if self.is_protected {
+            DataState::Denied
+        } else {
+            DataState::Unavailable("image path unavailable".to_owned())
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

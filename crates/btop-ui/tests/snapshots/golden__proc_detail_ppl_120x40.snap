@@ -1,0 +1,44 @@
+---
+source: crates/btop-ui/tests/golden.rs
+expression: rendered
+---
+╭─┐⁴proc┌─┐p0┌─────────────────────────────────────────┐01:00:04┌────────────────────────────┐< cpu lazy ↓ >┌──┐43/52┌─╮
+│╭─┐detail: csrss.exe (720)┌─────────────────────────────────────────────────────────────────┐PPL┌──┐Esc/Enter close┌─╮│
+││ CPU   0.6%                  │ MEM 8.0M (0.0%)             │ PID: 720     Parent: smss.exe (512)                    ││
+││                             │                 ⡄⢠ ⡄⢠ ⡄⢠ ⡄⢠ │ Uptime: 01:00:01     Threads: 14                       ││
+││                             │                ⣼⣧⣿⣼⣧⣿⣼⣧⣿⣼⣧⣿ │ Priv WS: 8.0M        User: -                           ││
+││                             │                ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ │ I/O Read: 16.5M      Write: 4.1M                       ││
+││                ⢀⡀⣀⢀⡀⣀⢀⡀⣀⢀⡀⣀ │                ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ │ Status: Protected (PPL)                                ││
+││ Path: C:\Windows\System32\csrss.exe                                                                                ││
+││ Cmd:  -                                                                                                            ││
+│╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯│
+│     Pid Program                                                                       Thr     MemB    Graph    Cpu%  │
+│    5088 Code.exe                                                                       10     118M ▃▃▂▃▃▂▃▃     2.7 ││
+│    5024 msedge.exe                                                                     12     100M ▂▃▂▂▃▂▂▃     2.4 ││
+│    5084 msedge.exe                                                                     12     100M ▂▃▂▂▃▂▂▃     2.4 ││
+│    3120 WindowsTerminal.exe                                                            22     118M ▂▃▂▂▃▂▂▃     2.2 ││
+│    5020 svchost.exe                                                                     8    24.0M ▂▂▂▂▂▂▂▂     2.1 ││
+│    5080 svchost.exe                                                                     8    24.0M ▂▂▂▂▂▂▂▂     2.1 ││
+│    2048 explorer.exe                                                                   64     187M ▂▂▂▂▂▂▂▂     1.8 ││
+│    5016 conhost.exe                                                                     4    30.0M ▂▂▂▂▂▂▂▂     1.8 ││
+│    5076 conhost.exe                                                                     4    30.0M ▂▂▂▂▂▂▂▂     1.8 ││
+│    5136 conhost.exe                                                                     4    30.0M ▂▂▂▂▂▂▂▂     1.8 ││
+│    4820 reused_pid_worker.exe                                                           6    28.0M        ▂     1.7 ││
+│    5012 cargo.exe                                                                       6    54.0M ▂▂▂▂▂▂▂▂     1.5 ││
+│    5072 cargo.exe                                                                       6    54.0M ▂▂▂▂▂▂▂▂     1.5 ││
+│    5132 cargo.exe                                                                       6    54.0M ▂▂▂▂▂▂▂▂     1.5 ││
+│    5008 Code.exe                                                                       10     118M ▂▂▁▂▂▁▂▂     1.2 ││
+│    5068 Code.exe                                                                       10     118M ▂▂▁▂▂▁▂▂     1.2 ││
+│    5128 Code.exe                                                                       10     118M ▂▂▁▂▂▁▂▂     1.2 █│
+│       4 System                                                                        168    14.0M ▂▂▂▂▂▂▂▂     1.2 ││
+│    3412 pwsh.exe                                                                       14    86.0M ▂▂▁▂▂▁▂▂     1.0 ││
+│    5004 msedge.exe                                                                     12     100M ▁▂▁▁▂▁▁▂     0.9 ││
+│    5064 msedge.exe                                                                     12     100M ▁▂▁▁▂▁▁▂     0.9 ││
+│    5124 msedge.exe                                                                     12     100M ▁▂▁▁▂▁▁▂     0.9 ││
+│    1204 svchost.exe                                                                    24    40.0M ▁▂▁▁▂▁▁▂     0.8 ││
+│     912 services.exe                                                                   10    16.0M ▁▁▁▁▁▁▁▁     0.7 ││
+│    5000 svchost.exe                                                                     8    24.0M ▁▁ ▁▁ ▁▁     0.6 ││
+│    5060 svchost.exe                                                                     8    24.0M ▁▁ ▁▁ ▁▁     0.6 ││
+│    5120 svchost.exe                                                                     8    24.0M ▁▁ ▁▁ ▁▁     0.6 ││
+│     720 csrss.exe                                                                      14     8.0M ▁▁▁▁▁▁▁▁     0.6 ││
+╰─┐Detail open | ↑↓ sel | Enter/Esc close | f filter | u pause | F follow┌─────────────────────────────────────────────╯

@@ -111,17 +111,11 @@ pub fn run_headless_frames(
 }
 
 fn sync_proc_selection(snapshot: &btop_model::Snapshot, ui_state: &mut UiState, proc_rows: usize) {
-    if let Some(active_procs) = ui_state.proc.active_processes(snapshot) {
-        let (built_rows, _) = build_visible_rows(active_procs, &ui_state.proc);
-        let visible_count = built_rows.len();
-        let target_idx = ui_state
+    if let Some(active_procs) = ui_state.proc.active_processes(snapshot).map(<[_]>::to_vec) {
+        let (built_rows, _) = build_visible_rows(&active_procs, &ui_state.proc);
+        ui_state
             .proc
-            .followed
-            .and_then(|target| built_rows.iter().position(|r| r.entry.identity == target));
-        if let Some(idx) = target_idx {
-            ui_state.proc.selected = idx;
-        }
-        ui_state.proc.clamp(visible_count, proc_rows);
+            .sync_detail_and_follow(&active_procs, &built_rows, proc_rows);
     } else {
         ui_state.proc.clamp(0, proc_rows);
     }
@@ -436,12 +430,52 @@ fn handle_proc_key(
     let proc_count = rows_built.as_ref().map_or(0, Vec::len);
 
     match code {
-        KeyCode::Up => state.proc.move_up(proc_count, proc_rows),
-        KeyCode::Down => state.proc.move_down(proc_count, proc_rows),
-        KeyCode::PageUp => state.proc.page_up(proc_count, proc_rows),
-        KeyCode::PageDown => state.proc.page_down(proc_count, proc_rows),
-        KeyCode::Home => state.proc.home(proc_count, proc_rows),
-        KeyCode::End => state.proc.end(proc_count, proc_rows),
+        KeyCode::Up => {
+            state.proc.move_up(proc_count, proc_rows);
+            if let Some(rows) = rows_built.as_deref() {
+                state.proc.sync_detail_after_navigation(rows);
+            }
+        }
+        KeyCode::Down => {
+            state.proc.move_down(proc_count, proc_rows);
+            if let Some(rows) = rows_built.as_deref() {
+                state.proc.sync_detail_after_navigation(rows);
+            }
+        }
+        KeyCode::PageUp => {
+            state.proc.page_up(proc_count, proc_rows);
+            if let Some(rows) = rows_built.as_deref() {
+                state.proc.sync_detail_after_navigation(rows);
+            }
+        }
+        KeyCode::PageDown => {
+            state.proc.page_down(proc_count, proc_rows);
+            if let Some(rows) = rows_built.as_deref() {
+                state.proc.sync_detail_after_navigation(rows);
+            }
+        }
+        KeyCode::Home => {
+            state.proc.home(proc_count, proc_rows);
+            if let Some(rows) = rows_built.as_deref() {
+                state.proc.sync_detail_after_navigation(rows);
+            }
+        }
+        KeyCode::End => {
+            state.proc.end(proc_count, proc_rows);
+            if let Some(rows) = rows_built.as_deref() {
+                state.proc.sync_detail_after_navigation(rows);
+            }
+        }
+        KeyCode::Enter => {
+            return rows_built
+                .as_deref()
+                .is_some_and(|rows| state.proc.toggle_detail_selected(rows, proc_rows));
+        }
+        KeyCode::Esc => {
+            return rows_built
+                .as_deref()
+                .is_some_and(|rows| state.proc.close_detail(rows, proc_rows));
+        }
         KeyCode::Left => state.proc.prev_sort(),
         KeyCode::Right => state.proc.next_sort(),
         KeyCode::Char('r') => state.proc.toggle_reverse(),

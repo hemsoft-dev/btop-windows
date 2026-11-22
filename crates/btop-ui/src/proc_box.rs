@@ -90,7 +90,11 @@ pub struct ProcViewState {
     pub paused: bool,
     pub frozen_processes: Option<Vec<ProcessEntry>>,
     pub frozen_cpu_history: Option<BTreeMap<ProcessIdentity, Vec<f32>>>,
+    pub frozen_mem_history: Option<BTreeMap<ProcessIdentity, Vec<u64>>>,
     pub followed: Option<ProcessIdentity>,
+    pub detailed: Option<ProcessIdentity>,
+    pub detailed_snapshot: Option<ProcessEntry>,
+    pub follow_detailed: bool,
     pub per_core_cpu: bool,
     pub mem_bytes: bool,
 }
@@ -110,7 +114,11 @@ impl Default for ProcViewState {
             paused: false,
             frozen_processes: None,
             frozen_cpu_history: None,
+            frozen_mem_history: None,
             followed: None,
+            detailed: None,
+            detailed_snapshot: None,
+            follow_detailed: true,
             per_core_cpu: false,
             mem_bytes: true,
         }
@@ -132,7 +140,11 @@ impl ProcViewState {
             paused: false,
             frozen_processes: None,
             frozen_cpu_history: None,
+            frozen_mem_history: None,
             followed: None,
+            detailed: None,
+            detailed_snapshot: None,
+            follow_detailed: config.proc_follow_detailed,
             per_core_cpu: config.proc_per_core,
             mem_bytes: config.proc_mem_bytes,
         }
@@ -328,8 +340,8 @@ impl ProcViewState {
         true
     }
 
-    /// Toggles pause (`u`), freezing both the process list and per-process sparkline history
-    /// so live ticks neither shift rows nor mutate/evict paused sparklines.
+    /// Toggles pause (`u`), freezing the process list and per-process CPU/memory history
+    /// so live ticks neither shift rows nor mutate/evict paused graphs.
     pub fn toggle_pause(
         &mut self,
         live_procs: Option<&[ProcessEntry]>,
@@ -339,15 +351,17 @@ impl ProcViewState {
             self.paused = false;
             self.frozen_processes = None;
             self.frozen_cpu_history = None;
+            self.frozen_mem_history = None;
         } else if let Some(procs) = live_procs {
             self.paused = true;
             self.frozen_processes = Some(procs.to_vec());
             self.frozen_cpu_history = history.map(UiHistory::snapshot_proc_cpu_map);
+            self.frozen_mem_history = history.map(UiHistory::snapshot_proc_mem_map);
         }
     }
 
-    /// Returns the per-process sparkline series for `id`, reading from `frozen_cpu_history`
-    /// while paused so live history updates or process exits cannot alter paused sparklines.
+    /// Returns the per-process sparkline/detail CPU series for `id`, reading from
+    /// `frozen_cpu_history` while paused so live updates cannot alter paused graphs.
     pub fn cpu_sparkline_series<'a>(
         &'a self,
         id: ProcessIdentity,
@@ -359,6 +373,68 @@ impl ProcViewState {
             return frozen.get(&id).map_or(&[], Vec::as_slice);
         }
         live_history.proc_cpu_slice(id)
+    }
+
+    /// Returns the per-process private working-set history series for `id`, reading from
+    /// `frozen_mem_history` while paused.
+    pub fn mem_history_series<'a>(
+        &'a self,
+        id: ProcessIdentity,
+        live_history: &'a UiHistory,
+    ) -> &'a [u64] {
+        if self.paused
+            && let Some(ref frozen) = self.frozen_mem_history
+        {
+            return frozen.get(&id).map_or(&[], Vec::as_slice);
+        }
+        live_history.proc_mem_slice(id)
+    }
+
+    /// Opens, switches, or closes the selected-process detail overlay (`Enter`).
+    pub fn toggle_detail_selected(
+        &mut self,
+        rows: &[DisplayProcRow<'_>],
+        visible_rows: usize,
+    ) -> bool {
+        if let Some(row) = rows.get(self.selected) {
+            if self.detailed == Some(row.entry.identity) {
+                return self.close_detail(rows, visible_rows);
+            }
+            self.detailed = Some(row.entry.identity);
+            self.detailed_snapshot = Some(row.entry.clone());
+            return true;
+        }
+        self.close_detail(rows, visible_rows)
+    }
+
+    /// Closes the detail overlay (`Esc` / `Enter` on same process), aligning selection back
+    /// onto the previously inspected process when `follow_detailed` is enabled.
+    pub fn close_detail(&mut self, rows: &[DisplayProcRow<'_>], visible_rows: usize) -> bool {
+        let Some(closed_id) = self.detailed.take() else {
+            return false;
+        };
+        self.detailed_snapshot = None;
+        if self.follow_detailed
+            && self.followed.is_none()
+            && let Some(idx) = rows.iter().position(|r| r.entry.identity == closed_id)
+        {
+            self.selected = idx;
+        }
+        self.clamp(rows.len(), visible_rows);
+        true
+    }
+
+    /// Keeps the open detail overlay synchronized after interactive navigation when
+    /// `follow_detailed` is enabled and no explicit `F` follow lock is active.
+    pub fn sync_detail_after_navigation(&mut self, rows: &[DisplayProcRow<'_>]) {
+        if self.detailed.is_some()
+            && self.follow_detailed
+            && self.followed.is_none()
+            && let Some(row) = rows.get(self.selected)
+        {
+            self.detailed = Some(row.entry.identity);
+            self.detailed_snapshot = Some(row.entry.clone());
+        }
     }
 
     /// Toggles process following (`F`) on the currently selected row by exact `(PID, CreateTime)`.
@@ -374,9 +450,45 @@ impl ProcViewState {
         false
     }
 
+    /// Updates selection to track the followed or detailed `(PID, CreateTime)` row (when
+    /// `follow_detailed` is enabled), refreshes cached detail metadata, and clamps scroll bounds.
+    pub fn sync_detail_and_follow(
+        &mut self,
+        active_procs: &[ProcessEntry],
+        rows: &[DisplayProcRow<'_>],
+        visible_rows: usize,
+    ) {
+        if let Some(target) = self.followed {
+            if let Some(idx) = rows.iter().position(|r| r.entry.identity == target) {
+                self.selected = idx;
+                if self.detailed.is_some() && self.follow_detailed {
+                    self.detailed = Some(target);
+                }
+            }
+        } else if self.follow_detailed
+            && let Some(target) = self.detailed
+            && let Some(idx) = rows.iter().position(|r| r.entry.identity == target)
+        {
+            self.selected = idx;
+        }
+
+        if let Some(target) = self.detailed
+            && let Some(live) = active_procs.iter().find(|p| p.identity == target)
+        {
+            self.detailed_snapshot = Some(live.clone());
+        }
+
+        self.clamp(rows.len(), visible_rows);
+    }
+
     /// Updates selection to track the followed `(PID, CreateTime)` row and clamps scroll bounds.
     pub fn sync_follow_and_clamp(&mut self, rows: &[DisplayProcRow<'_>], visible_rows: usize) {
         if let Some(target) = self.followed
+            && let Some(idx) = rows.iter().position(|r| r.entry.identity == target)
+        {
+            self.selected = idx;
+        } else if self.follow_detailed
+            && let Some(target) = self.detailed
             && let Some(idx) = rows.iter().position(|r| r.entry.identity == target)
         {
             self.selected = idx;
@@ -589,6 +701,8 @@ fn render_proc_chrome(
     let bottom_y = rect.y.saturating_add(rect.height - 1);
     let footer = if view.filter_editing {
         "Filter mode: type text or !regex | Enter done | Del clear | Esc exit"
+    } else if view.detailed.is_some() {
+        "Detail open | ↑↓ sel | Enter/Esc close | f filter | u pause | F follow"
     } else if view.tree_mode {
         "↑↓ sel | e tree | Space/+/- fold | E all | f filter | u pause | F follow"
     } else {
@@ -883,6 +997,41 @@ fn render_table_header(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn render_optional_detail_overlay(
+    grid: &mut Grid,
+    inner: Rect,
+    snapshot: &Snapshot,
+    history: &UiHistory,
+    active_procs: &[ProcessEntry],
+    view: &ProcViewState,
+    config: &Config,
+    theme: &ThemePalette,
+) -> u16 {
+    let detail_h = crate::proc_detail::detail_overlay_height(inner.height, view.detailed.is_some());
+    if detail_h > 0
+        && let Some(target) = view.detailed
+    {
+        crate::proc_detail::render_proc_detail(
+            grid,
+            Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: detail_h,
+            },
+            target,
+            snapshot,
+            history,
+            active_procs,
+            view,
+            config,
+            theme,
+        );
+    }
+    detail_h
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_proc_table(
     grid: &mut Grid,
     inner: Rect,
@@ -908,17 +1057,45 @@ fn render_proc_table(
         return;
     }
 
-    let banner_rows =
-        render_status_banners(grid, inner, active_procs, rows, filter_error, view, theme);
-    let header_y = inner.y.saturating_add(banner_rows);
-    let table_h = inner.height.saturating_sub(banner_rows);
+    let detail_h = render_optional_detail_overlay(
+        grid,
+        inner,
+        snapshot,
+        history,
+        active_procs,
+        view,
+        config,
+        theme,
+    );
+
+    let table_inner = Rect {
+        x: inner.x,
+        y: inner.y.saturating_add(detail_h),
+        width: inner.width,
+        height: inner.height.saturating_sub(detail_h),
+    };
+    if table_inner.height < 2 {
+        return;
+    }
+
+    let banner_rows = render_status_banners(
+        grid,
+        table_inner,
+        active_procs,
+        rows,
+        filter_error,
+        view,
+        theme,
+    );
+    let header_y = table_inner.y.saturating_add(banner_rows);
+    let table_h = table_inner.height.saturating_sub(banner_rows);
     if table_h < 2 {
         return;
     }
 
     let visible_rows = usize::from(table_h.saturating_sub(1));
     let mut clamped = view.clone();
-    clamped.sync_follow_and_clamp(rows, visible_rows);
+    clamped.sync_detail_and_follow(active_procs, rows, visible_rows);
 
     let logical_cpus = match &snapshot.cpu {
         DataState::Available(cpu) | DataState::Stale { value: cpu, .. } => cpu.cores.len().max(1),
@@ -929,7 +1106,12 @@ fn render_proc_table(
         _ => snapshot.total_phys_mem_bytes.unwrap_or(0),
     };
 
-    let cols = compute_columns(inner, rows.len(), visible_rows, config.proc_cpu_graphs);
+    let cols = compute_columns(
+        table_inner,
+        rows.len(),
+        visible_rows,
+        config.proc_cpu_graphs,
+    );
     render_table_header(grid, header_y, &cols, &clamped, theme);
 
     for row_idx in 0..visible_rows {
@@ -940,7 +1122,7 @@ fn render_proc_table(
         let y = header_y + 1 + u16::try_from(row_idx).unwrap_or(0);
         render_proc_row(
             grid,
-            inner,
+            table_inner,
             y,
             &cols,
             row,
@@ -957,7 +1139,7 @@ fn render_proc_table(
     if cols.has_scrollbar && visible_rows > 0 {
         render_scrollbar(
             grid,
-            inner,
+            table_inner,
             header_y + 1,
             visible_rows,
             rows.len(),
@@ -1153,7 +1335,7 @@ fn render_scrollbar(
     }
 }
 
-fn clip_text(text: &str, max_cells: usize) -> String {
+pub(crate) fn clip_text(text: &str, max_cells: usize) -> String {
     if max_cells == 0 {
         return String::new();
     }
@@ -1236,8 +1418,11 @@ mod tests {
             },
             parent_pid: 4,
             name: name.to_owned(),
+            image_path: None,
             command_line: None,
+            command_line_denied: false,
             user: None,
+            user_denied: false,
             threads,
             cpu_pct: cpu,
             working_set_private_bytes: mem,
@@ -1408,5 +1593,72 @@ mod tests {
         assert_eq!(clip_text("hello world", 5), "hell…");
         assert_eq!(clip_text("🔥test", 3), "🔥…");
         assert_eq!(clip_text("🔥test", 2), "…");
+    }
+
+    #[test]
+    fn proc_follow_detailed_keeps_selection_aligned_on_update_and_close() {
+        let tick1 = vec![
+            entry(10, "alpha.exe", 4, 10_000, 5.0),
+            entry(20, "target.exe", 4, 20_000, 15.0),
+            entry(30, "omega.exe", 4, 30_000, 2.0),
+        ];
+
+        // Case 1: follow_detailed = true
+        let mut view = ProcViewState {
+            sort: ProcSort::CpuDirect,
+            follow_detailed: true,
+            ..ProcViewState::default()
+        };
+        let (rows1, _) = build_visible_rows(&tick1, &view);
+        assert_eq!(rows1[0].entry.identity.pid, 20);
+        assert!(view.toggle_detail_selected(&rows1, 10));
+        assert_eq!(view.detailed, Some(tick1[1].identity));
+
+        // On tick 2, alpha.exe jumps above target.exe; selection tracks target.exe at index 1.
+        let tick2 = vec![
+            entry(10, "alpha.exe", 4, 10_000, 45.0),
+            entry(20, "target.exe", 4, 20_000, 15.0),
+            entry(30, "omega.exe", 4, 30_000, 2.0),
+        ];
+        let (rows2, _) = build_visible_rows(&tick2, &view);
+        view.sync_detail_and_follow(&tick2, &rows2, 10);
+        assert_eq!(view.selected, 1);
+        assert_eq!(rows2[view.selected].entry.identity.pid, 20);
+
+        // Moving selection down updates the detailed process when follow_detailed is true.
+        view.move_down(rows2.len(), 10);
+        view.sync_detail_after_navigation(&rows2);
+        assert_eq!(view.selected, 2);
+        assert_eq!(view.detailed, Some(tick2[2].identity));
+
+        // Closing aligns selection onto the closed detailed process even if sort moved it.
+        let tick3 = vec![
+            entry(30, "omega.exe", 4, 30_000, 80.0),
+            entry(10, "alpha.exe", 4, 10_000, 45.0),
+            entry(20, "target.exe", 4, 20_000, 15.0),
+        ];
+        let (rows3, _) = build_visible_rows(&tick3, &view);
+        assert!(view.close_detail(&rows3, 10));
+        assert_eq!(view.detailed, None);
+        assert_eq!(view.selected, 0);
+        assert_eq!(rows3[view.selected].entry.identity.pid, 30);
+
+        // Case 2: follow_detailed = false keeps selection and detail target independent.
+        let mut unlinked = ProcViewState {
+            sort: ProcSort::CpuDirect,
+            follow_detailed: false,
+            ..ProcViewState::default()
+        };
+        assert!(unlinked.toggle_detail_selected(&rows1, 10));
+        assert_eq!(unlinked.detailed, Some(tick1[1].identity));
+        unlinked.sync_detail_and_follow(&tick2, &rows2, 10);
+        assert_eq!(unlinked.selected, 0);
+        unlinked.move_down(rows2.len(), 10);
+        unlinked.sync_detail_after_navigation(&rows2);
+        assert_eq!(unlinked.selected, 1);
+        assert_eq!(unlinked.detailed, Some(tick1[1].identity));
+        assert!(unlinked.close_detail(&rows3, 10));
+        assert_eq!(unlinked.detailed, None);
+        assert_eq!(unlinked.selected, 1);
     }
 }

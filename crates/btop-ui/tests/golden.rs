@@ -443,3 +443,79 @@ fn golden_proc_followed_120x40() {
     });
     insta::assert_snapshot!("proc_followed_120x40", rendered);
 }
+
+fn render_proc_detail_golden(target_pid: u32) -> String {
+    let mut snapshots =
+        parse_jsonl_file(&fixture_path("win11-16core-dual-gpu-desktop.jsonl")).expect("fixture");
+    // Enrich fixture entries with realistic SystemProcessIdInformation image paths and PPL states
+    // so golden snapshots cover both standard and PPL-restricted overlays deterministically.
+    for snap in &mut snapshots {
+        if let btop_model::DataState::Available(ref mut list) = snap.processes {
+            for proc_entry in list {
+                match proc_entry.identity.pid {
+                    4216 => {
+                        proc_entry.image_path = Some(
+                            "C:\\Users\\franz\\.rustup\\toolchains\\stable-x86_64-pc-windows-msvc\\bin\\rust-analyzer.exe"
+                                .to_owned(),
+                        );
+                        proc_entry.command_line = Some(
+                            "\"C:\\Users\\franz\\.rustup\\toolchains\\stable-x86_64-pc-windows-msvc\\bin\\rust-analyzer.exe\" --log-file C:\\Temp\\ra.log"
+                                .to_owned(),
+                        );
+                    }
+                    720 => {
+                        proc_entry.image_path = Some("C:\\Windows\\System32\\csrss.exe".to_owned());
+                        proc_entry.command_line = None;
+                        proc_entry.command_line_denied = true;
+                        proc_entry.user = None;
+                        proc_entry.user_denied = true;
+                        proc_entry.is_protected = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let mut history = UiHistory::default();
+    for _ in 0..8 {
+        for snap in &snapshots {
+            history.push(snap);
+        }
+    }
+    let latest = snapshots.last().expect("non-empty fixture");
+    let config = Config {
+        shown_boxes: "proc".to_owned(),
+        ..Config::default()
+    };
+    let mut state = btop_ui::UiState::from_config(&config);
+    if let btop_model::DataState::Available(ref list) = latest.processes {
+        let (rows, _) = btop_ui::build_visible_rows(list, &state.proc);
+        if let Some(idx) = rows.iter().position(|r| r.entry.identity.pid == target_pid) {
+            state.proc.selected = idx;
+            let _ = state.proc.toggle_detail_selected(&rows, 20);
+        }
+    }
+    btop_ui::render_frame(
+        latest,
+        &history,
+        &state,
+        &config,
+        Size {
+            width: 120,
+            height: 40,
+        },
+    )
+    .to_plain_text()
+}
+
+#[test]
+fn golden_proc_detail_standard_120x40() {
+    let rendered = render_proc_detail_golden(4216);
+    insta::assert_snapshot!("proc_detail_standard_120x40", rendered);
+}
+
+#[test]
+fn golden_proc_detail_ppl_120x40() {
+    let rendered = render_proc_detail_golden(720);
+    insta::assert_snapshot!("proc_detail_ppl_120x40", rendered);
+}
