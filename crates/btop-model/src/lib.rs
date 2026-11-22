@@ -102,6 +102,25 @@ pub struct DiskSnapshot {
     pub busy_pct: Option<f32>,
 }
 
+/// Live 64-bit IP Helper telemetry for one hardware Windows network interface keyed by `NET_LUID`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NetInterfaceSnapshot {
+    pub luid: u64,
+    pub name: String,
+    pub description: String,
+    pub is_up: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv4: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv6: Option<String>,
+    pub rx_bytes_per_sec: u64,
+    pub tx_bytes_per_sec: u64,
+    pub rx_total_bytes: u64,
+    pub tx_total_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_speed_bps: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessIdentity {
     pub pid: u32,
@@ -174,6 +193,8 @@ pub struct Snapshot {
     pub mem: DataState<MemSnapshot>,
     #[serde(default)]
     pub disks: DataState<Vec<DiskSnapshot>>,
+    #[serde(default)]
+    pub net: DataState<Vec<NetInterfaceSnapshot>>,
     pub processes: DataState<Vec<ProcessEntry>>,
     pub services: DataState<Vec<ServiceEntry>>,
     pub gpus: Vec<DataState<GpuSnapshot>>,

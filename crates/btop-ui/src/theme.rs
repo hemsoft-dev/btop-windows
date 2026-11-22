@@ -26,6 +26,7 @@ pub struct ThemePalette {
     pub div_line: Color,
     pub cpu_box: Color,
     pub mem_box: Color,
+    pub net_box: Color,
     pub proc_box: Color,
     pub selected_bg: Color,
     pub selected_fg: Color,
@@ -45,11 +46,18 @@ pub struct ThemePalette {
     pub free_start: Rgb,
     pub free_mid: Rgb,
     pub free_end: Rgb,
+    pub download_start: Rgb,
+    pub download_mid: Rgb,
+    pub download_end: Rgb,
+    pub upload_start: Rgb,
+    pub upload_mid: Rgb,
+    pub upload_end: Rgb,
 }
 
 impl ThemePalette {
     /// Default dark `TrueColor` palette inspired by upstream `aristocratos/btop`.
     pub fn default_dark(theme_background: bool) -> Self {
+        let rgb = |r, g, b| Rgb { r, g, b };
         Self {
             main_bg: if theme_background {
                 rgb_color(16, 18, 24)
@@ -63,85 +71,32 @@ impl ThemePalette {
             div_line: rgb_color(60, 68, 82),
             cpu_box: rgb_color(98, 150, 112),
             mem_box: rgb_color(170, 146, 94),
+            net_box: rgb_color(142, 116, 178),
             proc_box: rgb_color(104, 138, 192),
             selected_bg: rgb_color(44, 62, 92),
             selected_fg: rgb_color(248, 250, 255),
             meter_bg: rgb_color(48, 54, 68),
-            cpu_start: Rgb {
-                r: 86,
-                g: 196,
-                b: 122,
-            },
-            cpu_mid: Rgb {
-                r: 235,
-                g: 203,
-                b: 102,
-            },
-            cpu_end: Rgb {
-                r: 230,
-                g: 85,
-                b: 85,
-            },
-            used_start: Rgb {
-                r: 196,
-                g: 96,
-                b: 96,
-            },
-            used_mid: Rgb {
-                r: 224,
-                g: 112,
-                b: 92,
-            },
-            used_end: Rgb {
-                r: 245,
-                g: 76,
-                b: 88,
-            },
-            available_start: Rgb {
-                r: 214,
-                g: 176,
-                b: 84,
-            },
-            available_mid: Rgb {
-                r: 196,
-                g: 212,
-                b: 98,
-            },
-            available_end: Rgb {
-                r: 132,
-                g: 222,
-                b: 126,
-            },
-            cached_start: Rgb {
-                r: 82,
-                g: 152,
-                b: 204,
-            },
-            cached_mid: Rgb {
-                r: 98,
-                g: 186,
-                b: 224,
-            },
-            cached_end: Rgb {
-                r: 134,
-                g: 222,
-                b: 242,
-            },
-            free_start: Rgb {
-                r: 72,
-                g: 162,
-                b: 120,
-            },
-            free_mid: Rgb {
-                r: 94,
-                g: 198,
-                b: 142,
-            },
-            free_end: Rgb {
-                r: 132,
-                g: 232,
-                b: 172,
-            },
+            cpu_start: rgb(86, 196, 122),
+            cpu_mid: rgb(235, 203, 102),
+            cpu_end: rgb(230, 85, 85),
+            used_start: rgb(196, 96, 96),
+            used_mid: rgb(224, 112, 92),
+            used_end: rgb(245, 76, 88),
+            available_start: rgb(214, 176, 84),
+            available_mid: rgb(196, 212, 98),
+            available_end: rgb(132, 222, 126),
+            cached_start: rgb(82, 152, 204),
+            cached_mid: rgb(98, 186, 224),
+            cached_end: rgb(134, 222, 242),
+            free_start: rgb(72, 162, 120),
+            free_mid: rgb(94, 198, 142),
+            free_end: rgb(132, 232, 172),
+            download_start: rgb(72, 152, 212),
+            download_mid: rgb(96, 196, 235),
+            download_end: rgb(148, 232, 248),
+            upload_start: rgb(168, 102, 204),
+            upload_mid: rgb(212, 118, 192),
+            upload_end: rgb(242, 142, 168),
         }
     }
 
@@ -182,6 +137,22 @@ impl ThemePalette {
             start: self.free_start,
             mid: self.free_mid,
             end: self.free_end,
+        }
+    }
+
+    pub const fn download_stops(&self) -> GradientStops {
+        GradientStops {
+            start: self.download_start,
+            mid: self.download_mid,
+            end: self.download_end,
+        }
+    }
+
+    pub const fn upload_stops(&self) -> GradientStops {
+        GradientStops {
+            start: self.upload_start,
+            mid: self.upload_mid,
+            end: self.upload_end,
         }
     }
 
