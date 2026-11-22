@@ -3,11 +3,11 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use btop_collect::{ReplaySource, SnapshotSource, StubLiveSource};
+use btop_collect::{LiveCollector, ReplaySource, SnapshotSource};
 use btop_config::Config;
 use btop_model::SnapshotRecorder;
 use btop_term::CrosstermInput;
-use btop_windows::run_tui_loop;
+use btop_windows::{ConfigOverrides, load_config, run_tui_loop};
 use clap::Parser;
 
 #[derive(Debug, Parser)]
@@ -80,14 +80,21 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let config = Config {
-        update_ms: cli.update_ms.map_or(2000, |ms| ms.max(100)),
+    let overrides = ConfigOverrides {
+        update_ms: cli.update_ms,
         force_tty: cli.tty,
-        truecolor: !cli.low_color,
-        ..Config::default()
+        low_color: cli.low_color,
     };
 
-    let mut source: Box<dyn SnapshotSource> = if let Some(replay_path) = cli.replay.as_deref() {
+    let config = match load_config(cli.config_file.as_deref(), &overrides) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            eprintln!("error: failed to load config: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let source: Box<dyn SnapshotSource> = if let Some(replay_path) = cli.replay.as_deref() {
         match ReplaySource::from_path(replay_path) {
             Ok(replay) => Box::new(replay),
             Err(err) => {
@@ -99,7 +106,13 @@ fn main() -> ExitCode {
             }
         }
     } else {
-        Box::new(StubLiveSource::new(config.update_ms))
+        match LiveCollector::new() {
+            Ok(live) => Box::new(live),
+            Err(err) => {
+                eprintln!("error: failed to initialize live telemetry collector: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
     };
 
     let recorder = if let Some(record_path) = cli.record.as_deref() {
@@ -118,7 +131,14 @@ fn main() -> ExitCode {
     };
 
     let mut input = CrosstermInput;
-    match run_tui_loop(source.as_mut(), recorder, &mut input, &config) {
+    match run_tui_loop(
+        source,
+        recorder,
+        &mut input,
+        config,
+        cli.config_file.as_deref(),
+        &overrides,
+    ) {
         Ok(_) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("error: {err}");

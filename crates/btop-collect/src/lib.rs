@@ -1,11 +1,15 @@
-//! System telemetry collectors and pure delta mathematics.
+//! System telemetry collectors, waitable-timer sampler, and pure delta mathematics.
 
+pub mod cpu;
 pub mod replay;
+pub mod sampler;
 
 use btop_model::Snapshot;
 use thiserror::Error;
 
+pub use cpu::{CpuCollector, LiveCollector, compute_cpu_deltas};
 pub use replay::{ReplaySource, StubLiveSource};
+pub use sampler::{MAX_UPDATE_MS, MIN_UPDATE_MS, Sampler};
 
 #[derive(Debug, Error)]
 pub enum CollectError {
