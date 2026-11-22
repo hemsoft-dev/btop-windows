@@ -10,6 +10,7 @@ pub mod mem;
 pub mod net;
 pub mod pdh;
 pub mod power;
+pub mod proc_actions;
 pub mod proc_info;
 
 use core::mem::{offset_of, size_of};
@@ -26,6 +27,11 @@ pub use net::{
 };
 pub use pdh::{CpuPdhQuery, CpuPdhSample};
 pub use power::{RawPowerStatus, local_utc_offset_secs, query_system_power_status};
+pub use proc_actions::{
+    PriorityClass, PriorityUpdateOutcome, ProcActionError, graceful_close_process,
+    guard_process_identity, guard_terminate_decision, query_process_priority, set_process_priority,
+    terminate_process,
+};
 pub use proc_info::{
     ProcFieldQuery, RawProcessMetadata, SidAccountCache, SystemProcessIdInformation,
     is_ps_protection_active, query_nt_device_drive_map, query_process_command_line,

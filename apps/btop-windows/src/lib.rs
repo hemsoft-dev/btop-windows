@@ -6,10 +6,17 @@ use std::time::Duration;
 use btop_collect::{CollectError, FreqMode, Sampler, SnapshotSource};
 use btop_config::{Config, ConfigError};
 use btop_model::{DataState, RecordStats, SnapshotRecorder};
+use btop_sys::{
+    PriorityClass, graceful_close_process, query_process_priority, set_process_priority,
+    terminate_process,
+};
 use btop_term::{
     DiffEncoder, Grid, InputSource, KeyCode, Size, TermError, TermEvent, TerminalGuard,
 };
-use btop_ui::{BoxId, UiHistory, UiState, build_visible_rows, visible_proc_rows};
+use btop_ui::{
+    BoxId, ProcActionModal, UiHistory, UiPriorityClass, UiState, build_visible_rows,
+    visible_proc_rows,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -198,7 +205,9 @@ pub fn run_tui_loop(
             match input.poll(Duration::from_millis(50))? {
                 Some(TermEvent::Key(k))
                     if k.is_ctrl_c()
-                        || (!ui_state.proc.filter_editing && k.code == KeyCode::Char('q')) =>
+                        || (!ui_state.proc.filter_editing
+                            && ui_state.modal.is_none()
+                            && k.code == KeyCode::Char('q')) =>
                 {
                     break;
                 }
@@ -275,6 +284,9 @@ fn handle_tui_event(
     prev_grid: &mut Option<Grid>,
 ) -> bool {
     match event {
+        TermEvent::Key(k) if ui_state.modal.is_some() => {
+            handle_modal_key(k.code, k.ctrl, k.alt, ui_state, prev_grid)
+        }
         TermEvent::Key(k) if ui_state.proc.filter_editing => {
             handle_filter_edit_key(k.code, k.ctrl, k.alt, ui_state)
         }
@@ -305,6 +317,134 @@ fn handle_tui_event(
             true
         }
         TermEvent::Mouse(_) => false,
+    }
+}
+
+fn handle_modal_key(
+    code: KeyCode,
+    ctrl: bool,
+    alt: bool,
+    ui_state: &mut UiState,
+    prev_grid: &mut Option<Grid>,
+) -> bool {
+    if ctrl || alt {
+        return false;
+    }
+    let Some(modal) = ui_state.modal.clone() else {
+        return false;
+    };
+    match modal {
+        ProcActionModal::ConfirmTerminate { target, name } => match code {
+            KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
+                match terminate_process(target.pid, target.create_time_100ns) {
+                    Ok(()) => {
+                        ui_state.modal = None;
+                        ui_state.proc.action_status =
+                            Some(format!("Terminated {name} (PID {})", target.pid));
+                    }
+                    Err(err) => {
+                        ui_state.modal = Some(ProcActionModal::ActionNotice {
+                            title: "Terminate Refused".to_owned(),
+                            message: err.to_string(),
+                            is_error: true,
+                        });
+                    }
+                }
+                *prev_grid = None;
+                true
+            }
+            KeyCode::Esc | KeyCode::Char('n' | 'N') => {
+                ui_state.modal = None;
+                *prev_grid = None;
+                true
+            }
+            _ => false,
+        },
+        ProcActionModal::PrioritySelector { .. } => match code {
+            KeyCode::Up => {
+                if let Some(ref mut m) = ui_state.modal {
+                    m.move_priority_up();
+                }
+                true
+            }
+            KeyCode::Down => {
+                if let Some(ref mut m) = ui_state.modal {
+                    m.move_priority_down();
+                }
+                true
+            }
+            KeyCode::Enter => {
+                if let Some((target, name, ui_class)) = modal.selected_priority() {
+                    let sys_class = ui_to_sys_priority(ui_class);
+                    match set_process_priority(target.pid, target.create_time_100ns, sys_class) {
+                        Ok(outcome) => {
+                            ui_state.modal = None;
+                            let status = if outcome.applied == outcome.requested {
+                                format!(
+                                    "Set priority for {name} (PID {}) to {}",
+                                    target.pid,
+                                    outcome.applied.label()
+                                )
+                            } else {
+                                format!(
+                                    "Priority for {name} (PID {}) clamped to {} ({} requires Administrator)",
+                                    target.pid,
+                                    outcome.applied.label(),
+                                    outcome.requested.label()
+                                )
+                            };
+                            ui_state.proc.action_status = Some(status);
+                        }
+                        Err(err) => {
+                            ui_state.modal = Some(ProcActionModal::ActionNotice {
+                                title: "Priority Change Refused".to_owned(),
+                                message: err.to_string(),
+                                is_error: true,
+                            });
+                        }
+                    }
+                    *prev_grid = None;
+                    return true;
+                }
+                false
+            }
+            KeyCode::Esc => {
+                ui_state.modal = None;
+                *prev_grid = None;
+                true
+            }
+            _ => false,
+        },
+        ProcActionModal::ActionNotice { .. } => match code {
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Char(' ') => {
+                ui_state.modal = None;
+                *prev_grid = None;
+                true
+            }
+            _ => false,
+        },
+    }
+}
+
+const fn ui_to_sys_priority(class: UiPriorityClass) -> PriorityClass {
+    match class {
+        UiPriorityClass::Idle => PriorityClass::Idle,
+        UiPriorityClass::BelowNormal => PriorityClass::BelowNormal,
+        UiPriorityClass::Normal => PriorityClass::Normal,
+        UiPriorityClass::AboveNormal => PriorityClass::AboveNormal,
+        UiPriorityClass::High => PriorityClass::High,
+        UiPriorityClass::Realtime => PriorityClass::Realtime,
+    }
+}
+
+const fn sys_to_ui_priority(class: PriorityClass) -> UiPriorityClass {
+    match class {
+        PriorityClass::Idle => UiPriorityClass::Idle,
+        PriorityClass::BelowNormal => UiPriorityClass::BelowNormal,
+        PriorityClass::Normal => UiPriorityClass::Normal,
+        PriorityClass::AboveNormal => UiPriorityClass::AboveNormal,
+        PriorityClass::High => UiPriorityClass::High,
+        PriorityClass::Realtime => UiPriorityClass::Realtime,
     }
 }
 
@@ -472,9 +612,16 @@ fn handle_proc_key(
                 .is_some_and(|rows| state.proc.toggle_detail_selected(rows, proc_rows));
         }
         KeyCode::Esc => {
-            return rows_built
+            if rows_built
                 .as_deref()
-                .is_some_and(|rows| state.proc.close_detail(rows, proc_rows));
+                .is_some_and(|rows| state.proc.close_detail(rows, proc_rows))
+            {
+                return true;
+            }
+            return state.proc.action_status.take().is_some();
+        }
+        KeyCode::Char('t' | 'k' | 'N') => {
+            return handle_proc_action_shortcut(code, rows_built.as_deref(), state);
         }
         KeyCode::Left => state.proc.prev_sort(),
         KeyCode::Right => state.proc.next_sort(),
@@ -508,6 +655,59 @@ fn handle_proc_key(
                 .as_deref()
                 .is_some_and(|rows| state.proc.toggle_follow(rows));
         }
+        _ => return false,
+    }
+    true
+}
+
+fn handle_proc_action_shortcut(
+    code: KeyCode,
+    rows_built: Option<&[btop_ui::DisplayProcRow<'_>]>,
+    state: &mut UiState,
+) -> bool {
+    let Some(row) = rows_built.and_then(|rows| rows.get(state.proc.selected)) else {
+        return false;
+    };
+    let id = row.entry.identity;
+    let name = row.entry.name.clone();
+    match code {
+        KeyCode::Char('t') => match graceful_close_process(id.pid, id.create_time_100ns) {
+            Ok(count) => {
+                let plural = if count == 1 { "" } else { "s" };
+                state.proc.action_status = Some(format!(
+                    "Sent WM_CLOSE to {name} (PID {}, {count} window{plural})",
+                    id.pid
+                ));
+            }
+            Err(err) => {
+                state.modal = Some(ProcActionModal::ActionNotice {
+                    title: "Graceful Close Refused".to_owned(),
+                    message: err.to_string(),
+                    is_error: true,
+                });
+            }
+        },
+        KeyCode::Char('k') => {
+            state.modal = Some(ProcActionModal::ConfirmTerminate { target: id, name });
+        }
+        KeyCode::Char('N') => match query_process_priority(id.pid, id.create_time_100ns) {
+            Ok(current) => {
+                let ui_cur = sys_to_ui_priority(current);
+                state.modal = Some(ProcActionModal::PrioritySelector {
+                    target: id,
+                    name,
+                    current: Some(ui_cur),
+                    selected: ui_cur.index(),
+                });
+            }
+            Err(err) => {
+                state.modal = Some(ProcActionModal::ActionNotice {
+                    title: "Priority Change Refused".to_owned(),
+                    message: err.to_string(),
+                    is_error: true,
+                });
+            }
+        },
         _ => return false,
     }
     true
