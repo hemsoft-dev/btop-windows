@@ -24,11 +24,11 @@ Both reviewers converged strongly on core platform choices and surfaced critical
 
 ## Decisions
 
-1. **Language & targets:** Rust (Edition 2024, MSRV 1.95), targeting `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc` with `+crt-static`, `panic = "unwind"` (so console-restoring `Drop` guards and panic hooks always execute), `windows-sys` for raw FFI, and `windows` minimally for COM/DXGI.
-2. **Renderer (`btop-term`):** Custom `Grid`, per-frame `HitMap`, and DEC 2026 VT `DiffEncoder`, verified by `vt100` emulator roundtrip property tests. Start with `crossterm::event` behind an `InputSource` trait, adding explicit ConHost mouse-offset and `srWindow` resize fixes.
+1. **Language & v1 target:** Rust (Edition 2024, MSRV 1.95), targeting **English Windows 11 x64** (`x86_64-pc-windows-msvc`) in Windows Terminal with `+crt-static`, `panic = "unwind"` (so console-restoring `Drop` guards and panic hooks always execute), `windows-sys` for raw FFI, and `windows` minimally for COM/DXGI. Windows 10, non-English locales, ConHost, ARM64, and >64-LP multi-group CPUs are deferred post-v1 (see [AGENTS.md](../../AGENTS.md)).
+2. **Renderer (`btop-term`):** Custom `Grid`, per-frame `HitMap`, and DEC 2026 VT `DiffEncoder` targeting 24-bit TrueColor Windows Terminal, with `crossterm::event` behind an `InputSource` trait.
 3. **Workspace layout:** 6 workspace crates (`btop-sys`, `btop-model`, `btop-config`, `btop-collect`, `btop-term`, `btop-ui`) plus `apps/btop-windows`. `btop-model`, `btop-config`, and `btop-ui` enforce `#![forbid(unsafe_code)]` and run fast cross-platform CI on Linux.
-4. **Risk retirement before committing APIs (M0 Spikes):** Resolve D3DKMT vs WDDM PDH overhead/reliability, ConHost vs Windows Terminal input quirks, ADLX C-header binding + hybrid dGPU wake behavior, and non-elevated process/EMI field coverage in time-boxed M0 spikes recorded as ADR-0002 through ADR-0005.
-5. **M1 vertical slice:** Ship a working CPU graph + read-only process list + `--record`/`--replay` + clean terminal restoration in M1 so real Windows telemetry and rendering validate the architecture immediately.
+4. **Focused M0 spike:** Run one focused spike (`#2`) comparing D3DKMT vs WDDM PDH for Windows 11 x64 system GPU utilization and VRAM before implementing M4.
+5. **M1 vertical slice:** Ship a working CPU graph + read-only process list + `--record`/`--replay` + clean terminal restoration in M1 so real Windows 11 telemetry and rendering validate the architecture immediately.
 
 ## Consequences
 

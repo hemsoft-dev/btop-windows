@@ -61,51 +61,43 @@ Every capability below was verified against the upstream `aristocratos/btop` sou
 - **Top header bar:** Embedded clock (`clock_format` supporting `strftime` plus `/host`, `/user`, `/uptime`).
 - **CLI flags:** `-c/--config`, `-d/--debug`, `-f/--filter`, `--force-utf`, `-l/--low-color`, `-p/--preset`, `-t/--tty`, `--no-tty`, `--themes-dir`, `-u/--update`, `--default-config`, `-h/--help`, `-V/--version`.
 
-## 3. Windows-first requirements and extensions
+## 3. Windows 11 v1 requirements and scope boundaries
 
-`btop-windows` maps every applicable upstream feature to Windows semantics and adds native Windows capabilities where Unix primitives do not apply:
+To keep the initial release simple and fast to ship, v1 targets **English Windows 11 x64** in **Windows Terminal** (see [AGENTS.md](../AGENTS.md)). Edge cases such as Windows 10, non-English locales, ConHost quirks, ARM64, >64-LP multi-group CPUs, 256-color/16-color TTY fallback, AMD ADLX / Intel IGCL bindings, and external sensor bridges are explicitly deferred post-v1.
 
 ### 3.1 Platform and terminal baseline
 
-- **Operating systems:** Windows 11 (23H2+) and Windows 10 (22H2+).
-- **Architectures:** Native `x86_64` (`x86_64-pc-windows-msvc`) and `ARM64` (`aarch64-pc-windows-msvc`). No 32-bit x86 (WOW64 degrades visibility into 64-bit processes).
-- **Supported terminal hosts:** Windows Terminal (primary target, default Braille symbols), VT-capable ConHost (Windows 10 1903+/Windows 11, default Block symbols when `WT_SESSION` is absent), VS Code integrated terminal, WezTerm, and Win32-OpenSSH sessions. Legacy non-VT ConHost exits cleanly with a clear remediation message.
-- **Privileges:** Runs non-elevated by default with no UAC prompt. Unavailable privileged fields display an explicit unavailable/denied marker instead of failing. Includes an in-app "Restart elevated" action (`ShellExecuteExW` with `runas`) and enables `SeDebugPrivilege` when already elevated.
+- **Operating system:** English Windows 11 (23H2+), `x86_64` (`x86_64-pc-windows-msvc`).
+- **Terminal host:** Windows Terminal (ConPTY, UTF-8, 24-bit TrueColor, Braille and Block graphs, DEC 2026 synchronized output).
+- **Privileges:** Runs non-elevated by default with no UAC prompt. Unavailable privileged fields display a clean unavailable/denied marker instead of failing.
 
 ### 3.2 Windows-specific metric and workflow semantics
 
-- **CPU utilization:** Supports >64 logical processors across multiple Windows processor groups keyed by `(group, number)`. Exposes a configurable metric mode: standard time-based utilization `(DeltaKernel + DeltaUser - DeltaIdle) / (DeltaKernel + DeltaUser)` and Windows Task Manager `% Processor Utility` (frequency-scaled, may exceed 100%). Displays hybrid P-core/E-core classes where reported. Emulates 1/5/15-minute load averages via an EWMA of Ready/Running thread counts, clearly labeled as `RunQ`.
-- **Memory accounting:** Reports Physical Total, Used (`Total - Available`), Available, Cached (`Standby + Modified`), Free (`Free + Zero`), Commit Charge / Commit Limit, Pagefile usage, and Compressed Memory without double-counting Standby inside stacked displays.
-- **Disks and I/O:** Separates volume capacity (drive letters, mount paths, BitLocker locked state, `only_physical` via `BusType`) from physical disk throughput and busy percentage (`IOCTL_DISK_PERFORMANCE` + `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS`), skipping remote SMB shares by default to avoid blocking.
-- **Network:** 64-bit `GetIfTable2` counters keyed by `NET_LUID`, filtering out WFP/QoS/loopback pseudo-interfaces by default, auto-selecting active traffic interfaces (including Hyper-V `vEthernet`), and handling adapter resets cleanly.
-- **Processes:** Fast single-call `SystemProcessInformation` enumeration with `WorkingSetPrivateSize` (matching Task Manager's Memory column), `(PID, CreateTime)` identity keys, parent-child tree validation (`parent.CreateTime < child.CreateTime`) to prevent PID-reuse orphans, and graceful handling of Protected Process Light (PPL) and special kernel processes (`Idle`, `System`, `Registry`, `Memory Compression`, `Secure System`).
-- **Windows process actions (replacing POSIX signals & `renice`):**
-  - **Graceful Close (`t`):** Enumerates top-level windows for the target PID and posts `WM_CLOSE` (best-effort, subject to UIPI).
-  - **Terminate (`k`):** Opens handle with `PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION`, verifies `CreateTime` on that handle, checks `IsProcessCritical` (refusing or requiring explicit name confirmation to prevent elevated BSOD), then calls `TerminateProcess`.
-  - **Action menu (`s`):** Graceful Close, Terminate, Kill Process Tree (verified by create-time ancestry), Suspend / Resume (`NtSuspendProcess`/`NtResumeProcess` with critical-process guard), Toggle Efficiency Mode (`ProcessPowerThrottling` + `IDLE_PRIORITY_CLASS`).
+- **CPU utilization:** Single-group Windows 11 CPUs (`<= 64` logical processors). Standard time-based utilization `(DeltaKernel + DeltaUser - DeltaIdle) / (DeltaKernel + DeltaUser)` plus optional Task Manager `% Processor Utility` mode, live frequency via English PDH `\Processor Information(*)\% Processor Performance`, P/E-core labels where reported, and 1/5/15-minute `RunQ` EWMA of Ready/Running threads.
+- **Memory accounting:** Physical Total, Used (`Total - Available`), Available, Cached (`Standby + Modified`), Free (`Free + Zero`), Commit Charge / Commit Limit, and Pagefile usage without double-counting Standby in stacked displays.
+- **Disks and I/O:** Local fixed volumes (`DRIVE_FIXED`) via `GetDiskFreeSpaceExW` paired with physical disk throughput and busy percentage (`IOCTL_DISK_PERFORMANCE`). Remote SMB shares, BitLocker-locked volumes, and spanned Storage Spaces extents are out of scope for v1.
+- **Network:** 64-bit `GetIfTable2` counters keyed by `NET_LUID`, filtering hardware interfaces by default and clamping negative deltas on counter resets.
+- **Processes:** Single-call `NtQuerySystemInformation(SystemProcessInformation)` with `WorkingSetPrivateSize` (matching Task Manager's Memory column), `(PID, CreateTime)` identity keys, cycle-free tree validation (`parent.CreateTime <= child.CreateTime`), live substring and `!regex` filtering, pause, follow, and `Enter` detail overlay.
+- **Windows process actions (v1 simple set):**
+  - **Graceful Close (`t`):** Enumerates top-level windows for the target PID and posts `WM_CLOSE`.
+  - **Terminate (`k`):** Opens handle with minimum rights, verifies `CreateTime` on that handle, checks `IsProcessCritical` (refusing critical system processes to prevent elevated BSOD), then calls `TerminateProcess`.
   - **Priority Class (`N`):** `Idle`, `Below Normal`, `Normal`, `Above Normal`, `High`, `Realtime` via `SetPriorityClass`.
-- **Windows Services view (toggleable inside the Proc panel, Windows-only extension):**
-  - Read-only SCM listing works non-elevated: service name, display name, state, start type (including Delayed Auto-Start), PID, and resource link.
-  - Service control actions (Start, Stop, Pause, Continue, Start Type change) detect elevation, handle `START_PENDING`/`STOP_PENDING` transitions cleanly, and grey out when non-elevated.
-  - Process detail view for `svchost.exe` lists hosted services matched by `dwProcessId`.
-- **Multi-GPU (up to 6 GPUs) without WinRing0:**
-  - Universal user-mode baseline via DXGI adapter identity (filtering software renderers) + WDDM utilization and VRAM counters, keyed by PCI bus/device/function (BDF) with LUID fallback.
-  - Optional dynamic vendor enrichment via trusted-path loading of `nvml.dll` (NVIDIA), `amdadlx64.dll` via C headers (AMD ADLX), and `ControlLib.dll` (Intel IGCL for Arc).
-  - **Hybrid-laptop dGPU wake guard:** Polls vendor DLLs only when the baseline shows the adapter active; defaults to battery-safe behavior when a battery is detected so sleeping discrete GPUs stay in D3cold.
-- **Temperature and power sensors (zero-driver tiered model):**
-  - **Tier 1 (built-in user-mode):** Battery status/wattage/ETA via SetupAPI `IOCTL_BATTERY_QUERY_*`, Windows Energy Meter Interface (EMI) rails where exposed, and non-admin thermal zones when valid. Missing CPU package temperature hides cleanly instead of displaying bogus constants.
-  - **Tier 2 (opt-in external providers):** Connects to user-run LibreHardwareMonitor HTTP (`/data.json`) or HWiNFO shared memory (`Global\HWiNFO_SENS_SM2`, surfacing stale status when HWiNFO's 12-hour free timer expires).
-- **Record and replay (Windows-first diagnostic & test tool):**
-  - `--record <path.jsonl>` writes timestamped `Snapshot` records per tick.
-  - `--replay <path.jsonl>` drives the full TUI deterministically from recorded or synthetic snapshots without live Windows calls.
+- **Windows Services view (toggleable inside the Proc panel):**
+  - Read-only SCM listing works non-elevated (service name, display name, state, start type, linked PID).
+  - Basic Start and Stop actions work when elevated and appear disabled when non-elevated.
+- **Multi-GPU (WDDM baseline + NVIDIA NVML):**
+  - Universal user-mode baseline via DXGI hardware adapter enumeration (filtering `DXGI_ADAPTER_FLAG_SOFTWARE`) + WDDM system utilization and VRAM (method selected by M0 Spike `#2`).
+  - Optional dynamic `nvml.dll` loading from `System32` on a background worker for NVIDIA temperature, clocks, power, and encoder/decoder stats. AMD ADLX, Intel IGCL, and hybrid-laptop D3cold wake guards are deferred post-v1.
+- **Battery:** Simple `GetSystemPowerStatus` charge %, AC/charging status, and remaining time; hides cleanly on desktops without a battery.
+- **Record and replay:** `--record <path.jsonl>` and `--replay <path.jsonl>` for deterministic testing and bug reports.
 
 ## 4. Non-functional requirements and budgets
 
-Measured on an 8-core Windows 11 x64 reference machine at `2000 ms` update interval and `200x60` terminal viewport:
+Measured on an 8-core English Windows 11 x64 machine at `2000 ms` update interval and `200x60` Windows Terminal viewport:
 
 | Metric | Target budget |
 | --- | --- |
-| Self CPU overhead (steady state) | `< 1.0%` of one logical core (`< 0.2%` total system) |
+| Self CPU overhead (steady state) | `< 1.0%` of one logical core |
 | Resident memory (RSS / Working Set Private) | `< 30 MB` |
 | Frame layout + Grid render + VT diff encode | `< 2.0 ms` p95 |
 | Binary size (release, x64 `+crt-static`) | `<= 6 MB` (target 2-4 MB) |

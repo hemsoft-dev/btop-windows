@@ -1,12 +1,15 @@
 # Contributing to btop-windows
 
+Read [AGENTS.md](AGENTS.md) first. Initial release scope is strictly **English Windows 11 x64 in Windows Terminal**, guided by the **Principle of Simplicity**.
+
 ## Engineering rules
 
-1. **Isolate `unsafe`.** `btop-model`, `btop-config`, and `btop-ui` enforce `#![forbid(unsafe_code)]`. All raw Win32/NT/WDK FFI belongs in `crates/btop-sys` with compile-time `size_of` and `offset_of` assertions for x64 and ARM64.
-2. **Never ship or load kernel drivers.** No WinRing0 or unsigned kernel helpers. User-mode Windows APIs and opt-in out-of-process providers only.
-3. **Never block the UI loop.** Slow or blocking telemetry (vendor GPU DLLs, `LookupAccountSidW`, remote disk space, SCM polling, external HTTP/shared-memory sensors) must run on dedicated worker threads with timeouts and publish freshness states (`WarmingUp`, `Available`, `Unavailable`, `Denied`, `Stale`).
-4. **Restore the console on every exit.** Normal exit, `Ctrl+C`, `CTRL_CLOSE_EVENT`, and panics must restore input/output console modes, leave the alternate screen, and unhide the cursor. Never set `panic = "abort"`.
-5. **Keep pure math testable.** Delta calculations, unit formatting, config/theme parsing, and `btop-ui` layout/rendering must be pure functions tested without Windows hardware dependencies.
+1. **Keep scope tight and simple.** Do not add Windows 10, non-English locale, legacy ConHost, ARM64, or >64-LP multi-group workarounds to v1.
+2. **Isolate `unsafe`.** `btop-model`, `btop-config`, and `btop-ui` enforce `#![forbid(unsafe_code)]`. All raw Win32/NT FFI belongs in `crates/btop-sys` with compile-time `size_of` and `offset_of` assertions on `x86_64`.
+3. **Never ship or load kernel drivers.** No WinRing0 or unsigned kernel helpers. User-mode Windows APIs and safe `nvml.dll` loading from `System32` only.
+4. **Never block the UI loop.** Slow optional calls (`nvml.dll`, SCM polling) run off the UI thread and publish explicit freshness states (`WarmingUp`, `Available`, `Unavailable`, `Denied`, `Stale`).
+5. **Restore the console on every exit.** Normal exit, `Ctrl+C`, `CTRL_CLOSE_EVENT`, and panics must restore console modes, leave the alternate screen, and unhide the cursor. Never set `panic = "abort"`.
+6. **Keep pure math testable.** Delta calculations, unit formatting, config/theme parsing, and `btop-ui` layout/rendering must be pure functions tested without Windows hardware dependencies.
 
 ## Required quality gates
 

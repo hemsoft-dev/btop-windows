@@ -52,8 +52,7 @@ pub struct Config {
     pub proc_reversed: bool,
     pub proc_tree: bool,
     pub cpu_util_mode: String,
-    pub gpu_wake_dgpu_on_battery: bool,
-    /// Unknown or Unix-only keys preserved verbatim when saving `btop.conf`.
+    /// Unknown or deferred upstream keys preserved verbatim when saving `btop.conf`.
     pub preserved_unknown: BTreeMap<String, String>,
 }
 
@@ -76,7 +75,6 @@ impl Default for Config {
             proc_reversed: false,
             proc_tree: false,
             cpu_util_mode: "time".to_owned(),
-            gpu_wake_dgpu_on_battery: false,
             preserved_unknown: BTreeMap::new(),
         }
     }
@@ -88,20 +86,16 @@ impl Config {
         let cfg = Self::default();
         format!(
             concat!(
-                "#? Config file for btop-windows (compatible with aristocratos/btop v1.4.8)\n\n",
-                "#* Name of a .theme file, \"Default\", or \"TTY\" for built-in themes.\n",
+                "#? Config file for btop-windows (English Windows 11 x64)\n\n",
+                "#* Name of a .theme file or \"Default\".\n",
                 "color_theme = \"{color_theme}\"\n\n",
                 "#* Show theme background color; set False for terminal transparency.\n",
                 "theme_background = {theme_background}\n\n",
-                "#* Enable 24-bit truecolor; quantizes to 256-color when False.\n",
-                "truecolor = {truecolor}\n\n",
-                "#* Force 16-color TTY mode.\n",
-                "force_tty = {force_tty}\n\n",
-                "#* Rounded corners on boxes (ignored in TTY mode).\n",
+                "#* Rounded corners on boxes.\n",
                 "rounded_corners = {rounded_corners}\n\n",
                 "#* Use DEC 2026 synchronized output sequences to prevent tearing.\n",
                 "terminal_sync = {terminal_sync}\n\n",
-                "#* Default graph symbol: \"braille\", \"block\", or \"tty\".\n",
+                "#* Default graph symbol: \"braille\" or \"block\".\n",
                 "graph_symbol = \"{graph_symbol}\"\n\n",
                 "#* Shown panels: \"cpu mem net proc\" and \"gpu0\" through \"gpu5\".\n",
                 "shown_boxes = \"{shown_boxes}\"\n\n",
@@ -114,14 +108,10 @@ impl Config {
                 "proc_reversed = {proc_reversed}\n",
                 "proc_tree = {proc_tree}\n\n",
                 "#* Windows CPU utilization mode: \"time\" or \"utility\" (Task Manager).\n",
-                "cpu_util_mode = \"{cpu_util_mode}\"\n\n",
-                "#* Avoid waking sleeping discrete GPUs on hybrid laptops while on battery.\n",
-                "gpu_wake_dgpu_on_battery = {gpu_wake_dgpu_on_battery}\n",
+                "cpu_util_mode = \"{cpu_util_mode}\"\n",
             ),
             color_theme = cfg.color_theme,
             theme_background = bool_title(cfg.theme_background),
-            truecolor = bool_title(cfg.truecolor),
-            force_tty = bool_title(cfg.force_tty),
             rounded_corners = bool_title(cfg.rounded_corners),
             terminal_sync = bool_title(cfg.terminal_sync),
             graph_symbol = cfg.graph_symbol.as_str(),
@@ -132,7 +122,6 @@ impl Config {
             proc_reversed = bool_title(cfg.proc_reversed),
             proc_tree = bool_title(cfg.proc_tree),
             cpu_util_mode = cfg.cpu_util_mode,
-            gpu_wake_dgpu_on_battery = bool_title(cfg.gpu_wake_dgpu_on_battery),
         )
     }
 
@@ -167,9 +156,6 @@ impl Config {
                 "proc_reversed" => cfg.proc_reversed = parse_bool(key, &val)?,
                 "proc_tree" => cfg.proc_tree = parse_bool(key, &val)?,
                 "cpu_util_mode" => cfg.cpu_util_mode = val,
-                "gpu_wake_dgpu_on_battery" => {
-                    cfg.gpu_wake_dgpu_on_battery = parse_bool(key, &val)?;
-                }
                 "graph_symbol" => {
                     cfg.graph_symbol = match val.as_str() {
                         "braille" => GraphSymbol::Braille,

@@ -1,6 +1,13 @@
 # btop-windows
 
-A fast, zero-driver, native Windows terminal resource monitor written in Rust, bringing modern [btop++](https://github.com/aristocratos/btop) (v1.4.8) capabilities and Windows-first process and service workflows to Windows 11 and Windows 10 (x64 and ARM64).
+A fast, zero-driver, native Windows terminal resource monitor written in Rust, bringing modern [btop++](https://github.com/aristocratos/btop) (v1.4.8) capabilities and Windows-first process and service workflows to English Windows 11 (x64) in Windows Terminal.
+
+## Initial release scope and simplicity
+
+Read [AGENTS.md](AGENTS.md) before contributing. To keep v1 focused and maintainable:
+
+- **Target baseline:** English Windows 11 x64 in Windows Terminal (24-bit TrueColor, UTF-8, Braille/Block graphs).
+- **Deferred post-v1:** Windows 10, non-English locales, legacy ConHost workarounds, ARM64, >64-LP multi-group CPUs, 256-color/16-color TTY fallback, AMD ADLX / Intel IGCL SDKs, external LHM/HWiNFO sensor bridges, and package-manager publishing.
 
 ## Why btop-windows
 
@@ -8,17 +15,17 @@ Upstream `aristocratos/btop` targets Linux, macOS, and BSDs. The separate `arist
 
 `btop-windows` is a clean-room Rust implementation built around four principles:
 
-1. **Zero bundled kernel drivers.** Every core metric uses documented user-mode Windows APIs and safe dynamic loading of vendor GPU libraries (`nvml.dll`, AMD ADLX, Intel IGCL). No WinRing0, no Defender false positives.
-2. **Modern btop parity plus Windows workflows.** Full CPU (including >64 logical processors and hybrid P/E-core topology), memory and commit accounting, disk I/O, 64-bit network counters, multi-GPU boxes (up to 6 GPUs with hybrid-laptop dGPU wake protection), process tree/filter/follow/pause, plus a native Windows Services (SCM) view, Priority Class, and Efficiency Mode controls.
-3. **Single static binary.** Compiled in Rust with `+crt-static` on x64 and ARM64 with no runtime installer dependencies.
-4. **Deterministic testing from day one.** Platform-independent model, config, renderer, and UI crates build and run unit and golden snapshot tests on Linux and Windows, backed by `--record` and `--replay` snapshot streams.
+1. **Zero bundled kernel drivers.** Every core metric uses user-mode Windows APIs plus optional safe loading of `nvml.dll`. No WinRing0, no Defender false positives.
+2. **Modern btop core plus Windows workflows.** CPU (with P/E-core labels, frequency, and optional Task Manager utility mode), memory and commit accounting, local disk I/O, 64-bit network counters, GPU boxes (WDDM baseline + NVIDIA NVML), process tree/filter/follow/pause, and a simple Windows Services (SCM) view.
+3. **Single static binary.** Compiled in Rust with `+crt-static` on x64 with no runtime installer dependencies.
+4. **Simple, testable architecture.** Platform-independent model, config, renderer, and UI crates build and test cleanly on Linux and Windows, backed by `--record` and `--replay` snapshot streams.
 
 ## Tech stack
 
-- **Language:** Rust (Edition 2024, MSRV 1.95), static CRT (`+crt-static`) on x64 and ARM64
-- **Windows bindings:** `windows-sys` for raw Win32/NT FFI, `windows` minimally for COM/DXGI, hand-audited NT/WDK structs with compile-time layout assertions in `crates/btop-sys`
+- **Language:** Rust (Edition 2024, MSRV 1.95), static CRT (`+crt-static`) on Windows 11 x64
+- **Windows bindings:** `windows-sys` for raw Win32/NT FFI, `windows` minimally for COM/DXGI, hand-audited NT structs with compile-time layout assertions in `crates/btop-sys`
 - **Terminal rendering:** Custom cell `Grid`, per-frame `HitMap`, and DEC 2026 synchronized VT diff encoder in `crates/btop-term`, with `crossterm` behind an `InputSource` trait
-- **State & concurrency:** Immutable timestamped `Snapshot` publication via `arc-swap`; blocking collectors and optional vendor libraries run on isolated worker threads with timeouts so UI input never stalls
+- **State & concurrency:** Immutable timestamped `Snapshot` publication via `arc-swap`; optional slow vendor GPU calls run off the UI thread so input stays responsive
 
 ## Workspace layout
 
