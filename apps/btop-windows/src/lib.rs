@@ -154,6 +154,7 @@ pub fn run_tui_loop(
             if gen_now != last_generation {
                 last_generation = gen_now;
                 current_snapshot = sampler.latest();
+                ui_state.tz_offset_secs = btop_sys::local_utc_offset_secs();
                 history.push_with_util_mode(&current_snapshot, is_utility_mode(&config));
                 ui_state.net.observe_snapshot(&current_snapshot);
                 dirty = true;

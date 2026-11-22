@@ -138,9 +138,20 @@ pub fn format_clock(format: &str, snapshot: &Snapshot, tz_offset_secs: i32) -> S
         }
         if let Some(after_pct) = rest.strip_prefix('%') {
             let mut chars = after_pct.chars();
-            if let Some(spec) = chars.next() {
-                append_strftime_token(&mut out, spec, dt);
-                rest = chars.as_str();
+            if let Some(first) = chars.next() {
+                // Handle POSIX `%E` / `%O` alternative-format modifiers cleanly.
+                let (spec, next_rest) = if matches!(first, 'E' | 'O') {
+                    let mut mod_chars = chars.clone();
+                    if let Some(modified) = mod_chars.next() {
+                        (modified, mod_chars.as_str())
+                    } else {
+                        (first, chars.as_str())
+                    }
+                } else {
+                    (first, chars.as_str())
+                };
+                append_strftime_token(&mut out, spec, dt, base_secs, tz_offset_secs);
+                rest = next_rest;
                 continue;
             }
             out.push('%');
@@ -159,21 +170,104 @@ pub fn format_clock(format: &str, snapshot: &Snapshot, tz_offset_secs: i32) -> S
     out
 }
 
-fn append_strftime_token(out: &mut String, spec: char, dt: CivilDateTime) {
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
+/// Computes ISO 8601 `(iso_year, iso_week)` (`1..=53`) for `dt`.
+fn iso_week_date(dt: CivilDateTime) -> (i64, u32) {
+    let iso_wd = if dt.weekday == 0 {
+        7
+    } else {
+        u32::try_from(dt.weekday).unwrap_or(1)
+    };
+    let doy_i32 = i32::try_from(dt.day_of_year).unwrap_or(1);
+    let wd_i32 = i32::try_from(iso_wd).unwrap_or(1);
+    let raw_week = (doy_i32 - wd_i32 + 10) / 7;
+
+    if raw_week < 1 {
+        let prev_year = dt.year - 1;
+        let dec31 = civil_from_unix_secs(days_from_civil(prev_year, 12, 31) * 86_400);
+        return iso_week_date(dec31);
+    }
+    let max_weeks = iso_weeks_in_year(dt.year);
+    if raw_week > i32::try_from(max_weeks).unwrap_or(52) {
+        return (dt.year + 1, 1);
+    }
+    (dt.year, u32::try_from(raw_week).unwrap_or(1))
+}
+
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let m = i64::from(month);
+    let d = i64::from(day);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn iso_weeks_in_year(year: i64) -> u32 {
+    let jan1_days = days_from_civil(year, 1, 1);
+    let jan1_wd = (jan1_days + 4).rem_euclid(7); // 0 = Sun, 4 = Thu
+    if jan1_wd == 4 || (jan1_wd == 3 && is_leap_year(year)) {
+        53
+    } else {
+        52
+    }
+}
+
+fn append_tz_offset(out: &mut String, tz_offset_secs: i32, with_prefix_colon: bool) {
+    let sign = if tz_offset_secs < 0 { '-' } else { '+' };
+    let abs_mins = tz_offset_secs.unsigned_abs() / 60;
+    let hours = abs_mins / 60;
+    let mins = abs_mins % 60;
+    if with_prefix_colon {
+        if tz_offset_secs == 0 {
+            out.push_str("UTC");
+        } else {
+            let _ = write!(out, "UTC{sign}{hours:02}:{mins:02}");
+        }
+    } else {
+        let _ = write!(out, "{sign}{hours:02}{mins:02}");
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn append_strftime_token(
+    out: &mut String,
+    spec: char,
+    dt: CivilDateTime,
+    base_unix_secs: i64,
+    tz_offset_secs: i32,
+) {
     let hour_12 = match dt.hour % 12 {
         0 => 12,
         h => h,
     };
     let am_pm = if dt.hour < 12 { "AM" } else { "PM" };
+    let am_pm_lower = if dt.hour < 12 { "am" } else { "pm" };
     let month_idx = usize::try_from(dt.month.saturating_sub(1))
         .unwrap_or(0)
         .min(11);
     let iso_weekday = if dt.weekday == 0 { 7 } else { dt.weekday };
+    let sun_week = (dt.day_of_year + 6 - u32::try_from(dt.weekday).unwrap_or(0)) / 7;
+    let mon_wd = u32::try_from((dt.weekday + 6) % 7).unwrap_or(0);
+    let mon_week = (dt.day_of_year + 6 - mon_wd) / 7;
 
     match spec {
         '%' => out.push('%'),
+        'n' | 't' => out.push(' '),
         'X' | 'T' => {
             let _ = write!(out, "{:02}:{:02}:{:02}", dt.hour, dt.minute, dt.second);
+        }
+        'r' => {
+            let _ = write!(
+                out,
+                "{hour_12:02}:{:02}:{:02} {am_pm}",
+                dt.minute, dt.second
+            );
         }
         'R' => {
             let _ = write!(out, "{:02}:{:02}", dt.hour, dt.minute);
@@ -181,8 +275,14 @@ fn append_strftime_token(out: &mut String, spec: char, dt: CivilDateTime) {
         'H' => {
             let _ = write!(out, "{:02}", dt.hour);
         }
+        'k' => {
+            let _ = write!(out, "{:>2}", dt.hour);
+        }
         'I' => {
             let _ = write!(out, "{hour_12:02}");
+        }
+        'l' => {
+            let _ = write!(out, "{hour_12:>2}");
         }
         'M' => {
             let _ = write!(out, "{:02}", dt.minute);
@@ -191,6 +291,10 @@ fn append_strftime_token(out: &mut String, spec: char, dt: CivilDateTime) {
             let _ = write!(out, "{:02}", dt.second);
         }
         'p' => out.push_str(am_pm),
+        'P' => out.push_str(am_pm_lower),
+        'C' => {
+            let _ = write!(out, "{:02}", dt.year.div_euclid(100));
+        }
         'Y' => {
             let _ = write!(out, "{:04}", dt.year);
         }
@@ -209,6 +313,15 @@ fn append_strftime_token(out: &mut String, spec: char, dt: CivilDateTime) {
         'F' => {
             let _ = write!(out, "{:04}-{:02}-{:02}", dt.year, dt.month, dt.day);
         }
+        'D' => {
+            let _ = write!(
+                out,
+                "{:02}/{:02}/{:02}",
+                dt.month,
+                dt.day,
+                dt.year.rem_euclid(100)
+            );
+        }
         'x' => {
             let _ = write!(out, "{:02}/{:02}/{:04}", dt.month, dt.day, dt.year);
         }
@@ -219,12 +332,35 @@ fn append_strftime_token(out: &mut String, spec: char, dt: CivilDateTime) {
         'j' => {
             let _ = write!(out, "{:03}", dt.day_of_year);
         }
+        'U' => {
+            let _ = write!(out, "{sun_week:02}");
+        }
+        'W' => {
+            let _ = write!(out, "{mon_week:02}");
+        }
+        'V' => {
+            let (_, iso_week) = iso_week_date(dt);
+            let _ = write!(out, "{iso_week:02}");
+        }
+        'G' => {
+            let (iso_year, _) = iso_week_date(dt);
+            let _ = write!(out, "{iso_year:04}");
+        }
+        'g' => {
+            let (iso_year, _) = iso_week_date(dt);
+            let _ = write!(out, "{:02}", iso_year.rem_euclid(100));
+        }
         'u' => {
             let _ = write!(out, "{iso_weekday}");
         }
         'w' => {
             let _ = write!(out, "{}", dt.weekday);
         }
+        's' => {
+            let _ = write!(out, "{base_unix_secs}");
+        }
+        'z' => append_tz_offset(out, tz_offset_secs, false),
+        'Z' => append_tz_offset(out, tz_offset_secs, true),
         'c' => {
             let _ = write!(
                 out,
@@ -493,6 +629,12 @@ mod tests {
             format_clock("/host /user up /uptime %%", &snap, 0),
             "WIN11-RIG franz up 1d 01:01:01 %"
         );
+        assert_eq!(
+            format_clock("%r %D %C %U %W %G-W%V %z %Z", &snap, -5 * 3600),
+            "02:30:45 PM 11/22/26 20 47 46 2026-W47 -0500 UTC-05:00"
+        );
+        assert_eq!(format_clock("%k:%M %l%P %Z", &snap, 0), "19:30  7pm UTC");
+        assert_eq!(format_clock("%s", &snap, 0), "1795375845");
         assert_eq!(format_clock("", &snap, 0), "");
     }
 
