@@ -109,6 +109,7 @@ pub struct Config {
     pub force_tty: bool,
     pub rounded_corners: bool,
     pub terminal_sync: bool,
+    pub background_update: bool,
     pub vim_keys: bool,
     pub disable_mouse: bool,
     pub graph_symbol: GraphSymbol,
@@ -165,6 +166,7 @@ impl Default for Config {
             force_tty: false,
             rounded_corners: true,
             terminal_sync: true,
+            background_update: true,
             vim_keys: false,
             disable_mouse: false,
             graph_symbol: GraphSymbol::Braille,
@@ -239,6 +241,8 @@ impl Config {
                 "rounded_corners = {rounded_corners}\n\n",
                 "#* Use DEC 2026 synchronized output sequences to prevent tearing.\n",
                 "terminal_sync = {terminal_sync}\n\n",
+                "#* Continue updating live telemetry in the background while overlay menus are open.\n",
+                "background_update = {background_update}\n\n",
                 "#* Default graph symbol: \"braille\" or \"block\".\n",
                 "graph_symbol = \"{graph_symbol}\"\n\n",
                 "#* Shown panels: \"cpu mem net proc\" and \"gpu0\" through \"gpu5\".\n",
@@ -260,35 +264,13 @@ impl Config {
                 "proc_tree = {proc_tree}\n",
                 "proc_aggregate = {proc_aggregate}\n",
                 "proc_cpu_graphs = {proc_cpu_graphs}\n",
-                "proc_follow_detailed = {proc_follow_detailed}\n\n",
-                "#* Show historical graphs inside the memory box (False = percentage meters).\n",
-                "mem_graphs = {mem_graphs}\n",
-                "show_swap = {show_swap}\n",
-                "base_10_sizes = {base_10_sizes}\n\n",
-                "#* Local fixed drive filter (e.g. \"C D\" or \"exclude=E F\").\n",
-                "disks_filter = \"{disks_filter}\"\n",
-                "show_disks = {show_disks}\n",
-                "show_io_stat = {show_io_stat}\n",
-                "io_mode = {io_mode}\n",
-                "io_graph_combined = {io_graph_combined}\n",
-                "io_graph_speeds = \"{io_graph_speeds}\"\n\n",
-                "#* Network interface selection and scaling (Mbit/s ceilings when net_auto = False).\n",
-                "net_iface = \"{net_iface}\"\n",
-                "net_download = {net_download}\n",
-                "net_upload = {net_upload}\n",
-                "net_auto = {net_auto}\n",
-                "net_sync = {net_sync}\n",
-                "swap_upload_download = {swap_upload_download}\n",
-                "base_10_bitrate = {base_10_bitrate}\n\n",
-                "#* Windows CPU utilization mode: \"time\" or \"utility\" (Task Manager).\n",
-                "cpu_util_mode = \"{cpu_util_mode}\"\n\n",
-                "#* CPU frequency aggregation: \"first\", \"range\", \"lowest\", \"highest\", or \"average\".\n",
-                "freq_mode = \"{freq_mode}\"\n",
+                "proc_follow_detailed = {proc_follow_detailed}\n",
             ),
             color_theme = cfg.color_theme,
             theme_background = bool_title(cfg.theme_background),
             rounded_corners = bool_title(cfg.rounded_corners),
             terminal_sync = bool_title(cfg.terminal_sync),
+            background_update = bool_title(cfg.background_update),
             graph_symbol = cfg.graph_symbol.as_str(),
             shown_boxes = cfg.shown_boxes,
             presets = cfg.presets,
@@ -305,25 +287,8 @@ impl Config {
             proc_aggregate = bool_title(cfg.proc_aggregate),
             proc_cpu_graphs = bool_title(cfg.proc_cpu_graphs),
             proc_follow_detailed = bool_title(cfg.proc_follow_detailed),
-            mem_graphs = bool_title(cfg.mem_graphs),
-            show_swap = bool_title(cfg.show_swap),
-            base_10_sizes = bool_title(cfg.base_10_sizes),
-            disks_filter = cfg.disks_filter,
-            show_disks = bool_title(cfg.show_disks),
-            show_io_stat = bool_title(cfg.show_io_stat),
-            io_mode = bool_title(cfg.io_mode),
-            io_graph_combined = bool_title(cfg.io_graph_combined),
-            io_graph_speeds = cfg.io_graph_speeds,
-            net_iface = cfg.net_iface,
-            net_download = cfg.net_download,
-            net_upload = cfg.net_upload,
-            net_auto = bool_title(cfg.net_auto),
-            net_sync = bool_title(cfg.net_sync),
-            swap_upload_download = bool_title(cfg.swap_upload_download),
-            base_10_bitrate = bool_title(cfg.base_10_bitrate),
-            cpu_util_mode = cfg.cpu_util_mode,
-            freq_mode = cfg.freq_mode,
         );
+        out.push_str(&render_mem_net_cpu_defaults(&cfg));
         out.push_str(&render_gpu_defaults(&cfg));
         out
     }
@@ -348,6 +313,54 @@ impl Config {
         }
         Ok(cfg)
     }
+}
+
+fn render_mem_net_cpu_defaults(cfg: &Config) -> String {
+    format!(
+        concat!(
+            "\n#* Show historical graphs inside the memory box (False = percentage meters).\n",
+            "mem_graphs = {mem_graphs}\n",
+            "show_swap = {show_swap}\n",
+            "base_10_sizes = {base_10_sizes}\n\n",
+            "#* Local fixed drive filter (e.g. \"C D\" or \"exclude=E F\").\n",
+            "disks_filter = \"{disks_filter}\"\n",
+            "show_disks = {show_disks}\n",
+            "show_io_stat = {show_io_stat}\n",
+            "io_mode = {io_mode}\n",
+            "io_graph_combined = {io_graph_combined}\n",
+            "io_graph_speeds = \"{io_graph_speeds}\"\n\n",
+            "#* Network interface selection and scaling (Mbit/s ceilings when net_auto = False).\n",
+            "net_iface = \"{net_iface}\"\n",
+            "net_download = {net_download}\n",
+            "net_upload = {net_upload}\n",
+            "net_auto = {net_auto}\n",
+            "net_sync = {net_sync}\n",
+            "swap_upload_download = {swap_upload_download}\n",
+            "base_10_bitrate = {base_10_bitrate}\n\n",
+            "#* Windows CPU utilization mode: \"time\" or \"utility\" (Task Manager).\n",
+            "cpu_util_mode = \"{cpu_util_mode}\"\n\n",
+            "#* CPU frequency aggregation: \"first\", \"range\", \"lowest\", \"highest\", or \"average\".\n",
+            "freq_mode = \"{freq_mode}\"\n",
+        ),
+        mem_graphs = bool_title(cfg.mem_graphs),
+        show_swap = bool_title(cfg.show_swap),
+        base_10_sizes = bool_title(cfg.base_10_sizes),
+        disks_filter = cfg.disks_filter,
+        show_disks = bool_title(cfg.show_disks),
+        show_io_stat = bool_title(cfg.show_io_stat),
+        io_mode = bool_title(cfg.io_mode),
+        io_graph_combined = bool_title(cfg.io_graph_combined),
+        io_graph_speeds = cfg.io_graph_speeds,
+        net_iface = cfg.net_iface,
+        net_download = cfg.net_download,
+        net_upload = cfg.net_upload,
+        net_auto = bool_title(cfg.net_auto),
+        net_sync = bool_title(cfg.net_sync),
+        swap_upload_download = bool_title(cfg.swap_upload_download),
+        base_10_bitrate = bool_title(cfg.base_10_bitrate),
+        cpu_util_mode = cfg.cpu_util_mode,
+        freq_mode = cfg.freq_mode,
+    )
 }
 
 fn render_gpu_defaults(cfg: &Config) -> String {
@@ -383,6 +396,7 @@ fn apply_config_entry(cfg: &mut Config, key: &str, val: String) -> Result<(), Co
         "force_tty" => cfg.force_tty = parse_bool(key, &val)?,
         "rounded_corners" => cfg.rounded_corners = parse_bool(key, &val)?,
         "terminal_sync" => cfg.terminal_sync = parse_bool(key, &val)?,
+        "background_update" => cfg.background_update = parse_bool(key, &val)?,
         "vim_keys" => cfg.vim_keys = parse_bool(key, &val)?,
         "disable_mouse" => cfg.disable_mouse = parse_bool(key, &val)?,
         "shown_boxes" => cfg.shown_boxes = val,
@@ -530,9 +544,10 @@ mod tests {
         );
 
         let custom = Config::parse(
-            "mem_graphs = False\nshow_swap = False\nbase_10_sizes = True\ndisks_filter = \"exclude=E\"\nshow_disks = False\nshow_io_stat = False\nio_mode = True\nio_graph_combined = True\nio_graph_speeds = \"C:500\"\nnet_iface = \"Ethernet\"\nnet_download = 250\nnet_upload = 75\nnet_auto = False\nnet_sync = False\nswap_upload_download = True\nbase_10_bitrate = False\npresets = \"cpu:1:block,proc:1:default\"\ndisable_presets = True\ncpu_bottom = True\nproc_left = True\nmem_below_net = True\nshow_battery = False\nproc_aggregate = True\nproc_cpu_graphs = False\nproc_follow_detailed = False\n",
+            "background_update = False\nmem_graphs = False\nshow_swap = False\nbase_10_sizes = True\ndisks_filter = \"exclude=E\"\nshow_disks = False\nshow_io_stat = False\nio_mode = True\nio_graph_combined = True\nio_graph_speeds = \"C:500\"\nnet_iface = \"Ethernet\"\nnet_download = 250\nnet_upload = 75\nnet_auto = False\nnet_sync = False\nswap_upload_download = True\nbase_10_bitrate = False\npresets = \"cpu:1:block,proc:1:default\"\ndisable_presets = True\ncpu_bottom = True\nproc_left = True\nmem_below_net = True\nshow_battery = False\nproc_aggregate = True\nproc_cpu_graphs = False\nproc_follow_detailed = False\n",
         )
         .expect("parse custom mem, disk, net, layout, and proc flags");
+        assert!(!custom.background_update);
         assert!(!custom.mem_graphs);
         assert!(!custom.show_swap);
         assert!(custom.base_10_sizes);

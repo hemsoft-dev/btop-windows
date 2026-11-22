@@ -78,6 +78,10 @@ pub enum HitAction {
     ToggleServicesView,
     SelectProcess(u32),
     OpenMenu(String),
+    MenuItem(usize),
+    MenuCategory(usize),
+    MenuClose,
+    MessageBoxButton(bool),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -86,6 +90,10 @@ pub struct HitMap {
 }
 
 impl HitMap {
+    pub fn clear(&mut self) {
+        self.regions.clear();
+    }
+
     pub fn push(&mut self, rect: Rect, action: HitAction) {
         self.regions.push((rect, action));
     }

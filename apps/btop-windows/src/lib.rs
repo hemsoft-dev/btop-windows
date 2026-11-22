@@ -1,5 +1,7 @@
 //! Runtime session loop shared by the `btop-windows` binary and integration tests.
 
+mod menu_input;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,10 +21,11 @@ use btop_term::{
     TermEvent, TerminalGuard,
 };
 use btop_ui::{
-    BoxId, ProcActionModal, UiHistory, UiPriorityClass, UiState, build_visible_rows,
+    BoxId, OverlayMenu, ProcActionModal, UiHistory, UiPriorityClass, UiState, build_visible_rows,
     build_visible_service_rows, compute_layout, is_modal_visible, modal_rect, visible_proc_rows,
     visible_service_rows,
 };
+use menu_input::{LoopAction, handle_menu_key, handle_menu_mouse, try_open_menu_shortcut};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -274,7 +277,7 @@ pub fn run_tui_loop(
                         tx: &svc_tx,
                         in_flight: &svc_in_flight,
                     };
-                    dirty |= handle_tui_event(
+                    match handle_tui_event(
                         event,
                         &sampler,
                         &guard,
@@ -290,7 +293,11 @@ pub fn run_tui_loop(
                         allow_live_actions,
                         Some(&dispatch),
                         &mut prev_grid,
-                    );
+                    ) {
+                        LoopAction::None => {}
+                        LoopAction::Redraw => dirty = true,
+                        LoopAction::Quit => break,
+                    }
                 }
                 None => {
                     if let Ok(live) = guard.size()
@@ -317,6 +324,7 @@ fn is_quit_key(k: btop_term::KeyEvent, ui_state: &UiState) -> bool {
         || (!ui_state.proc.filter_editing
             && !ui_state.services.filter_editing
             && ui_state.modal.is_none()
+            && ui_state.menu.is_none()
             && k.code == KeyCode::Char('q'))
 }
 
@@ -362,6 +370,9 @@ fn poll_sampler_updates(
     ui_state: &mut UiState,
     config: &Config,
 ) -> bool {
+    if ui_state.menu.is_some() && !config.background_update {
+        return false;
+    }
     let gen_now = sampler.generation();
     if gen_now == *last_generation {
         return false;
@@ -438,9 +449,22 @@ fn handle_tui_event(
     allow_live_actions: bool,
     service_dispatch: Option<&ServiceDispatch<'_>>,
     prev_grid: &mut Option<Grid>,
-) -> bool {
+) -> LoopAction {
     match event {
-        TermEvent::Key(k) if ui_state.modal.is_some() => handle_modal_key(
+        TermEvent::Key(k) if ui_state.menu.is_some() => {
+            let outcome = handle_menu_key(
+                k,
+                *size,
+                Some(sampler),
+                snapshot,
+                config,
+                ui_state,
+                prev_grid,
+            );
+            sampler.set_services_active(should_poll_services(*size, ui_state));
+            outcome
+        }
+        TermEvent::Key(k) if ui_state.modal.is_some() => bool_to_loop_action(handle_modal_key(
             k.code,
             k.ctrl,
             k.alt,
@@ -449,49 +473,39 @@ fn handle_tui_event(
             service_dispatch,
             ui_state,
             prev_grid,
-        ),
+        )),
         TermEvent::Key(k)
             if ui_state.proc.filter_editing
                 || (ui_state.services.active && ui_state.services.filter_editing) =>
         {
-            handle_filter_edit_key(k.code, k.ctrl, k.alt, ui_state)
+            bool_to_loop_action(handle_filter_edit_key(k.code, k.ctrl, k.alt, ui_state))
         }
         TermEvent::Key(k) if k.ctrl && matches!(k.code, KeyCode::Char('r' | 'R')) => {
-            if let Ok(reloaded) = load_config(config_path, overrides) {
-                *config = reloaded;
-                config.update_ms = sampler.set_update_ms(config.update_ms);
-                sampler.set_freq_mode(FreqMode::from_config_str(&config.freq_mode));
-                sampler.set_nvml_measure_pcie_speeds(config.nvml_measure_pcie_speeds);
-                *ui_state = build_ui_state(config, overrides);
-                ui_state.net.observe_snapshot(snapshot);
-                sampler.set_services_active(should_poll_services(*size, ui_state));
-                *prev_grid = None;
-                return true;
-            }
-            false
-        }
-        TermEvent::Key(k) if !k.ctrl && !k.alt => {
-            if handle_layout_key(k.code, ui_state, prev_grid) {
-                sampler.set_services_active(should_poll_services(*size, ui_state));
-                return true;
-            }
-            if k.code == KeyCode::Char('S') {
-                return toggle_services_view(*size, ui_state, Some(sampler), prev_grid);
-            }
-            handle_panel_key(
-                k.code,
+            handle_ctrl_r_reload(
                 sampler,
                 snapshot,
-                history,
-                config,
                 *size,
+                config,
+                config_path,
+                overrides,
                 ui_state,
-                proc_rows,
-                service_rows,
-                allow_live_actions,
+                prev_grid,
             )
         }
-        TermEvent::Key(k) => handle_unmodified_proc_key(
+        TermEvent::Key(k) if !k.ctrl && !k.alt => handle_unmodified_global_key(
+            k.code,
+            sampler,
+            snapshot,
+            history,
+            config,
+            *size,
+            ui_state,
+            proc_rows,
+            service_rows,
+            allow_live_actions,
+            prev_grid,
+        ),
+        TermEvent::Key(k) => bool_to_loop_action(handle_unmodified_proc_key(
             k.code,
             k.ctrl,
             k.alt,
@@ -501,18 +515,124 @@ fn handle_tui_event(
             ui_state,
             proc_rows,
             allow_live_actions,
-        ),
+        )),
         TermEvent::Resize(new_size) => {
             *size = guard.size().unwrap_or(new_size);
             sampler.set_services_active(should_poll_services(*size, ui_state));
             let _ = cancel_invisible_modal(*size, ui_state, prev_grid);
             *prev_grid = None;
-            true
+            LoopAction::Redraw
         }
         TermEvent::Mouse(mouse) => {
-            handle_mouse_event(mouse, *size, ui_state, Some(sampler), prev_grid)
+            if config.disable_mouse {
+                return LoopAction::None;
+            }
+            if ui_state.menu.is_some() {
+                let outcome = handle_menu_mouse(
+                    mouse,
+                    *size,
+                    Some(sampler),
+                    snapshot,
+                    config,
+                    ui_state,
+                    prev_grid,
+                );
+                sampler.set_services_active(should_poll_services(*size, ui_state));
+                return outcome;
+            }
+            bool_to_loop_action(handle_mouse_event(
+                mouse,
+                *size,
+                ui_state,
+                Some(sampler),
+                prev_grid,
+            ))
         }
     }
+}
+
+const fn bool_to_loop_action(changed: bool) -> LoopAction {
+    if changed {
+        LoopAction::Redraw
+    } else {
+        LoopAction::None
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_ctrl_r_reload(
+    sampler: &Sampler,
+    snapshot: &btop_model::Snapshot,
+    size: Size,
+    config: &mut Config,
+    config_path: Option<&Path>,
+    overrides: &ConfigOverrides,
+    ui_state: &mut UiState,
+    prev_grid: &mut Option<Grid>,
+) -> LoopAction {
+    if let Ok(reloaded) = load_config(config_path, overrides) {
+        *config = reloaded;
+        config.update_ms = sampler.set_update_ms(config.update_ms);
+        sampler.set_freq_mode(FreqMode::from_config_str(&config.freq_mode));
+        sampler.set_nvml_measure_pcie_speeds(config.nvml_measure_pcie_speeds);
+        *ui_state = build_ui_state(config, overrides);
+        ui_state.net.observe_snapshot(snapshot);
+        sampler.set_services_active(should_poll_services(size, ui_state));
+        *prev_grid = None;
+        return LoopAction::Redraw;
+    }
+    LoopAction::None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_unmodified_global_key(
+    code: KeyCode,
+    sampler: &Sampler,
+    snapshot: &btop_model::Snapshot,
+    history: &mut UiHistory,
+    config: &mut Config,
+    size: Size,
+    ui_state: &mut UiState,
+    proc_rows: usize,
+    service_rows: usize,
+    allow_live_actions: bool,
+    prev_grid: &mut Option<Grid>,
+) -> LoopAction {
+    if try_open_menu_shortcut(code, config, ui_state, prev_grid) {
+        return LoopAction::Redraw;
+    }
+    if handle_layout_key(code, ui_state, prev_grid) {
+        sampler.set_services_active(should_poll_services(size, ui_state));
+        return LoopAction::Redraw;
+    }
+    if code == KeyCode::Char('S') {
+        return if toggle_services_view(size, ui_state, Some(sampler), prev_grid) {
+            LoopAction::Redraw
+        } else {
+            LoopAction::None
+        };
+    }
+    let handled = handle_panel_key(
+        code,
+        sampler,
+        snapshot,
+        history,
+        config,
+        size,
+        ui_state,
+        proc_rows,
+        service_rows,
+        allow_live_actions,
+    );
+    if handled {
+        return LoopAction::Redraw;
+    }
+    if code == KeyCode::Esc {
+        ui_state.menu = Some(OverlayMenu::main());
+        *prev_grid = None;
+        return LoopAction::Redraw;
+    }
+    LoopAction::None
 }
 
 fn toggle_services_view(
@@ -1856,5 +1976,193 @@ mod tests {
             ));
             assert!(!state.layout.shown_boxes.contains(&BoxId::Gpu(idx)));
         }
+    }
+
+    #[test]
+    fn overlay_menus_honor_background_update_and_vim_keys() {
+        let mut cfg = Config {
+            background_update: false,
+            vim_keys: false,
+            ..Config::default()
+        };
+        let mut state = UiState::from_config(&cfg);
+        let mut prev_grid = None;
+
+        // `h` opens Help when vim_keys=False; `H` opens Help when vim_keys=True.
+        assert!(try_open_menu_shortcut(
+            KeyCode::Char('h'),
+            &cfg,
+            &mut state,
+            &mut prev_grid
+        ));
+        assert!(matches!(state.menu, Some(OverlayMenu::Help(_))));
+        state.menu = None;
+        cfg.vim_keys = true;
+        assert!(!try_open_menu_shortcut(
+            KeyCode::Char('h'),
+            &cfg,
+            &mut state,
+            &mut prev_grid
+        ));
+        assert!(try_open_menu_shortcut(
+            KeyCode::Char('H'),
+            &cfg,
+            &mut state,
+            &mut prev_grid
+        ));
+        assert!(matches!(state.menu, Some(OverlayMenu::Help(_))));
+
+        // Background updates pause while menu is open and `background_update = false`.
+        let source = Box::new(btop_collect::StubLiveSource::new(100));
+        let sampler = Sampler::spawn(source, 100, None).expect("spawn sampler");
+        let mut last_gen = sampler.generation();
+        let mut last_tel_gen = sampler.telemetry_generation();
+        let mut current = sampler.latest();
+        let mut history = UiHistory::default();
+        std::thread::sleep(Duration::from_millis(240));
+        assert!(
+            sampler.generation() > last_gen,
+            "sampler should advance in background"
+        );
+        assert!(
+            !poll_sampler_updates(
+                &sampler,
+                &mut last_gen,
+                &mut last_tel_gen,
+                &mut current,
+                &mut history,
+                &mut state,
+                &cfg,
+            ),
+            "background_update=false must freeze UI snapshot updates while a menu is open"
+        );
+        state.menu = None;
+        assert!(
+            poll_sampler_updates(
+                &sampler,
+                &mut last_gen,
+                &mut last_tel_gen,
+                &mut current,
+                &mut history,
+                &mut state,
+                &cfg,
+            ),
+            "closing menu must resume snapshot updates immediately"
+        );
+        let _ = sampler.stop();
+    }
+
+    #[test]
+    fn overlay_menus_mouse_and_messagebox_reset_flow() {
+        let snap = sample_snapshot_with_proc();
+        let history = UiHistory::default();
+        let size = Size {
+            width: 120,
+            height: 40,
+        };
+        let mut cfg = Config::default();
+        let mut state = UiState::from_config(&cfg);
+
+        // Main menu mouse click on OPTIONS opens Options.
+        state.menu = Some(OverlayMenu::main());
+        let main_grid = btop_ui::render_frame(&snap, &history, &state, &cfg, size);
+        let (opt_x, opt_y) = find_hit(&main_grid, &HitAction::MenuItem(0));
+        let mut prev_grid = Some(main_grid);
+        assert_eq!(
+            handle_menu_mouse(
+                btop_term::MouseEvent {
+                    col: opt_x,
+                    row: opt_y,
+                    kind: MouseKind::Down(MouseButton::Left),
+                },
+                size,
+                None,
+                &snap,
+                &mut cfg,
+                &mut state,
+                &mut prev_grid,
+            ),
+            LoopAction::Redraw
+        );
+        assert!(matches!(state.menu, Some(OverlayMenu::Options(_))));
+
+        // Right arrow cycles color_theme live to Dracula.
+        let plain_key = |code| btop_term::KeyEvent {
+            code,
+            ctrl: false,
+            alt: false,
+            shift: false,
+        };
+        assert_eq!(
+            handle_menu_key(
+                plain_key(KeyCode::Right),
+                size,
+                None,
+                &snap,
+                &mut cfg,
+                &mut state,
+                &mut prev_grid,
+            ),
+            LoopAction::Redraw
+        );
+        assert_eq!(cfg.color_theme, "Dracula");
+
+        // Pressing 'r' opens Reset Options MessageBox; toggling Left keeps return_to intact;
+        // clicking Yes resets color_theme to Default and returns cleanly to Options.
+        assert_eq!(
+            handle_menu_key(
+                plain_key(KeyCode::Char('r')),
+                size,
+                None,
+                &snap,
+                &mut cfg,
+                &mut state,
+                &mut prev_grid,
+            ),
+            LoopAction::Redraw
+        );
+        assert_eq!(
+            handle_menu_key(
+                plain_key(KeyCode::Left),
+                size,
+                None,
+                &snap,
+                &mut cfg,
+                &mut state,
+                &mut prev_grid,
+            ),
+            LoopAction::Redraw
+        );
+        let msg_grid = btop_ui::render_frame(&snap, &history, &state, &cfg, size);
+        let (yes_x, yes_y) = find_hit(&msg_grid, &HitAction::MessageBoxButton(true));
+        prev_grid = Some(msg_grid);
+        assert_eq!(
+            handle_menu_mouse(
+                btop_term::MouseEvent {
+                    col: yes_x,
+                    row: yes_y,
+                    kind: MouseKind::Down(MouseButton::Left),
+                },
+                size,
+                None,
+                &snap,
+                &mut cfg,
+                &mut state,
+                &mut prev_grid,
+            ),
+            LoopAction::Redraw
+        );
+        assert_eq!(cfg.color_theme, "Default");
+        assert!(matches!(state.menu, Some(OverlayMenu::Options(_))));
+    }
+
+    fn find_hit(grid: &Grid, target: &HitAction) -> (u16, u16) {
+        let size = grid.size();
+        (0..size.height)
+            .find_map(|y| {
+                (0..size.width)
+                    .find_map(|x| (grid.hit_map.hit_test(x, y) == Some(target)).then_some((x, y)))
+            })
+            .expect("expected hit region")
     }
 }

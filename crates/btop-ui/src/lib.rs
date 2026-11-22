@@ -8,6 +8,8 @@ pub mod gpu_box;
 pub mod header;
 pub mod layout;
 pub mod mem_box;
+pub mod menu;
+pub mod menu_render;
 pub mod net_box;
 pub mod proc_actions;
 pub mod proc_box;
@@ -32,6 +34,12 @@ pub use layout::{
     parse_preset_spec, parse_presets_list, parse_shown_boxes,
 };
 pub use mem_box::{format_mem_bytes, stacked_physical_segments};
+pub use menu::{
+    HELP_BINDINGS, HelpEntry, HelpState, MainMenuChoice, MainMenuState, MessageBoxAction,
+    MessageBoxKind, MessageBoxResult, MessageBoxState, OptionCategory, OptionId, OptionKind,
+    OptionsState, OverlayMenu, TextEdit,
+};
+pub use menu_render::{dim_grid, help_visible_rows, options_visible_rows, render_overlay_menu};
 pub use net_box::{AUTO_SCALE_FLOOR_BPS, NetViewState, compute_net_scale_ceilings, format_bitrate};
 pub use proc_actions::{ProcActionModal, UiPriorityClass, modal_rect};
 pub use proc_box::{ProcSort, ProcViewState};
@@ -65,6 +73,8 @@ pub struct UiState {
     pub tz_offset_secs: i32,
     /// Optional centered modal dialog (terminate confirmation, priority picker, or refusal notice).
     pub modal: Option<ProcActionModal>,
+    /// Optional dimmed overlay menu (Main, Options, Help, or `MessageBox`).
+    pub menu: Option<OverlayMenu>,
 }
 
 impl Default for UiState {
@@ -78,6 +88,7 @@ impl Default for UiState {
             io_mode: false,
             tz_offset_secs: 0,
             modal: None,
+            menu: None,
         }
     }
 }
@@ -93,6 +104,7 @@ impl UiState {
             io_mode: config.io_mode,
             tz_offset_secs: 0,
             modal: None,
+            menu: None,
         }
     }
 
@@ -504,7 +516,7 @@ pub fn render_frame(
     size: Size,
 ) -> Grid {
     let mut grid = Grid::new(size);
-    let theme = ThemePalette::default_dark(config.theme_background);
+    let theme = ThemePalette::for_name(&config.color_theme, config.theme_background);
 
     let layout = match compute_layout(size, &state.layout) {
         Ok(computed) => computed,
@@ -566,6 +578,9 @@ pub fn render_frame(
     header::render_top_header(&mut grid, &layout, snapshot, state, config, &theme);
     if let Some(ref modal) = state.modal {
         proc_actions::render_proc_action_modal(&mut grid, modal, config, &theme);
+    }
+    if let Some(ref menu) = state.menu {
+        render_overlay_menu(&mut grid, menu, config, &theme);
     }
     grid
 }
