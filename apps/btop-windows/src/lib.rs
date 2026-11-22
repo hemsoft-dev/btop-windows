@@ -9,7 +9,7 @@ use btop_model::{DataState, RecordStats, SnapshotRecorder};
 use btop_term::{
     DiffEncoder, Grid, InputSource, KeyCode, Size, TermError, TermEvent, TerminalGuard,
 };
-use btop_ui::{BoxId, UiHistory, UiState, visible_proc_rows};
+use btop_ui::{BoxId, UiHistory, UiState, build_visible_rows, visible_proc_rows};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -35,6 +35,7 @@ pub enum AppError {
 pub struct ConfigOverrides {
     pub update_ms: Option<u32>,
     pub preset: Option<u8>,
+    pub filter: Option<String>,
     pub force_tty: bool,
     pub low_color: bool,
 }
@@ -109,11 +110,31 @@ pub fn run_headless_frames(
     Ok(frames)
 }
 
+fn sync_proc_selection(snapshot: &btop_model::Snapshot, ui_state: &mut UiState, proc_rows: usize) {
+    if let Some(active_procs) = ui_state.proc.active_processes(snapshot) {
+        let (built_rows, _) = build_visible_rows(active_procs, &ui_state.proc);
+        let visible_count = built_rows.len();
+        let target_idx = ui_state
+            .proc
+            .followed
+            .and_then(|target| built_rows.iter().position(|r| r.entry.identity == target));
+        if let Some(idx) = target_idx {
+            ui_state.proc.selected = idx;
+        }
+        ui_state.proc.clamp(visible_count, proc_rows);
+    } else {
+        ui_state.proc.clamp(0, proc_rows);
+    }
+}
+
 fn build_ui_state(config: &Config, overrides: &ConfigOverrides) -> UiState {
     let mut ui_state = UiState::from_config(config);
     ui_state.tz_offset_secs = btop_sys::local_utc_offset_secs();
     if let Some(preset) = overrides.preset {
         let _ = ui_state.layout.apply_preset(preset);
+    }
+    if let Some(ref filter) = overrides.filter {
+        ui_state.proc.set_filter(filter.clone());
     }
     ui_state
 }
@@ -160,12 +181,8 @@ pub fn run_tui_loop(
                 dirty = true;
             }
 
-            let proc_count = match &current_snapshot.processes {
-                DataState::Available(list) | DataState::Stale { value: list, .. } => list.len(),
-                _ => 0,
-            };
             let proc_rows = visible_proc_rows(size, &ui_state);
-            ui_state.proc.clamp(proc_count, proc_rows);
+            sync_proc_selection(&current_snapshot, &mut ui_state, proc_rows);
 
             if dirty {
                 let encoder = DiffEncoder {
@@ -185,7 +202,10 @@ pub fn run_tui_loop(
             }
 
             match input.poll(Duration::from_millis(50))? {
-                Some(TermEvent::Key(k)) if k.is_ctrl_c() || k.code == KeyCode::Char('q') => {
+                Some(TermEvent::Key(k))
+                    if k.is_ctrl_c()
+                        || (!ui_state.proc.filter_editing && k.code == KeyCode::Char('q')) =>
+                {
                     break;
                 }
                 Some(event) => {
@@ -200,7 +220,6 @@ pub fn run_tui_loop(
                         config_path,
                         overrides,
                         &mut ui_state,
-                        proc_count,
                         proc_rows,
                         &mut prev_grid,
                     ) {
@@ -258,11 +277,13 @@ fn handle_tui_event(
     config_path: Option<&Path>,
     overrides: &ConfigOverrides,
     ui_state: &mut UiState,
-    proc_count: usize,
     proc_rows: usize,
     prev_grid: &mut Option<Grid>,
 ) -> bool {
     match event {
+        TermEvent::Key(k) if ui_state.proc.filter_editing => {
+            handle_filter_edit_key(k.code, k.ctrl, k.alt, ui_state)
+        }
         TermEvent::Key(k) if k.ctrl && matches!(k.code, KeyCode::Char('r' | 'R')) => {
             if let Ok(reloaded) = load_config(config_path, overrides) {
                 *config = reloaded;
@@ -280,16 +301,38 @@ fn handle_tui_event(
                 return true;
             }
             handle_panel_key(
-                k.code, sampler, snapshot, history, config, ui_state, proc_count, proc_rows,
+                k.code, sampler, snapshot, history, config, ui_state, proc_rows,
             )
         }
-        TermEvent::Key(k) => handle_proc_key(k.code, ui_state, proc_count, proc_rows),
+        TermEvent::Key(k) => handle_proc_key(k.code, snapshot, ui_state, proc_rows),
         TermEvent::Resize(new_size) => {
             *size = guard.size().unwrap_or(new_size);
             *prev_grid = None;
             true
         }
         TermEvent::Mouse(_) => false,
+    }
+}
+
+fn handle_filter_edit_key(code: KeyCode, ctrl: bool, alt: bool, ui_state: &mut UiState) -> bool {
+    if ctrl || alt {
+        return false;
+    }
+    match code {
+        KeyCode::Enter | KeyCode::Esc => {
+            ui_state.proc.end_filter_edit();
+            true
+        }
+        KeyCode::Backspace => {
+            ui_state.proc.pop_filter_char();
+            true
+        }
+        KeyCode::Delete => ui_state.proc.clear_filter(),
+        KeyCode::Char(ch) => {
+            ui_state.proc.push_filter_char(ch);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -309,7 +352,6 @@ fn handle_layout_key(code: KeyCode, ui_state: &mut UiState, prev_grid: &mut Opti
     changed
 }
 
-#[allow(clippy::too_many_arguments)]
 fn handle_panel_key(
     code: KeyCode,
     sampler: &Sampler,
@@ -317,15 +359,34 @@ fn handle_panel_key(
     history: &mut UiHistory,
     config: &mut Config,
     ui_state: &mut UiState,
-    proc_count: usize,
     proc_rows: usize,
 ) -> bool {
     match code {
-        KeyCode::Char('+' | '=') => {
+        KeyCode::Char('+') => {
+            if let Some(procs) = ui_state.proc.active_processes(snapshot).map(<[_]>::to_vec) {
+                let (rows, _) = build_visible_rows(&procs, &ui_state.proc);
+                if ui_state.proc.expand_selected(&rows) {
+                    return true;
+                }
+            }
             config.update_ms = sampler.adjust_update_ms(100);
             true
         }
-        KeyCode::Char('-' | '_') => {
+        KeyCode::Char('-') => {
+            if let Some(procs) = ui_state.proc.active_processes(snapshot).map(<[_]>::to_vec) {
+                let (rows, _) = build_visible_rows(&procs, &ui_state.proc);
+                if ui_state.proc.collapse_selected(&rows) {
+                    return true;
+                }
+            }
+            config.update_ms = sampler.adjust_update_ms(-100);
+            true
+        }
+        KeyCode::Char('=') => {
+            config.update_ms = sampler.adjust_update_ms(100);
+            true
+        }
+        KeyCode::Char('_') => {
             config.update_ms = sampler.adjust_update_ms(-100);
             true
         }
@@ -357,16 +418,22 @@ fn handle_panel_key(
             ui_state.net.reset_session_totals(snapshot, history);
             true
         }
-        other => handle_proc_key(other, ui_state, proc_count, proc_rows),
+        other => handle_proc_key(other, snapshot, ui_state, proc_rows),
     }
 }
 
 fn handle_proc_key(
     code: KeyCode,
+    snapshot: &btop_model::Snapshot,
     state: &mut UiState,
-    proc_count: usize,
     proc_rows: usize,
 ) -> bool {
+    let active_owned = state.proc.active_processes(snapshot).map(<[_]>::to_vec);
+    let rows_built = active_owned
+        .as_deref()
+        .map(|procs| build_visible_rows(procs, &state.proc).0);
+    let proc_count = rows_built.as_ref().map_or(0, Vec::len);
+
     match code {
         KeyCode::Up => state.proc.move_up(proc_count, proc_rows),
         KeyCode::Down => state.proc.move_down(proc_count, proc_rows),
@@ -379,6 +446,33 @@ fn handle_proc_key(
         KeyCode::Char('r') => state.proc.toggle_reverse(),
         KeyCode::Char('c') => state.proc.toggle_per_core(),
         KeyCode::Char('%') => state.proc.toggle_mem_bytes(),
+        KeyCode::Char('e') => state.proc.toggle_tree(),
+        KeyCode::Char(' ') => {
+            return rows_built
+                .as_deref()
+                .is_some_and(|rows| state.proc.toggle_collapse_selected(rows));
+        }
+        KeyCode::Char('E') => {
+            return active_owned
+                .as_deref()
+                .is_some_and(|procs| state.proc.toggle_collapse_all(procs));
+        }
+        KeyCode::Char('f' | '/') => state.proc.begin_filter_edit(),
+        KeyCode::Delete => return state.proc.clear_filter(),
+        KeyCode::Char('u') => {
+            let live = match &snapshot.processes {
+                DataState::Available(list) | DataState::Stale { value: list, .. } => {
+                    Some(list.as_slice())
+                }
+                _ => None,
+            };
+            state.proc.toggle_pause(live);
+        }
+        KeyCode::Char('F') => {
+            return rows_built
+                .as_deref()
+                .is_some_and(|rows| state.proc.toggle_follow(rows));
+        }
         _ => return false,
     }
     true
@@ -428,6 +522,7 @@ mod tests {
         let overrides = ConfigOverrides {
             update_ms: Some(500),
             preset: Some(2),
+            filter: Some("!rust".to_owned()),
             force_tty: false,
             low_color: false,
         };

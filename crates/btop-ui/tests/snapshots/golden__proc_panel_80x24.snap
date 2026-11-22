@@ -25,4 +25,4 @@ expression: rendered
 │ IP4: 192.168.1.42             ││    5036 conhost.exe          30.0M     3.3 ││
 │ IP6: fe80::1a2b:3c4d:5e6f:7890││    5096 conhost.exe          30.0M     3.3 ││
 │                               ││    1416 dwm.exe               144M     3.0 ││
-╰───────────────────────────────╯╰─┐↑↓ select | ←→ sort | r rev | c core | % m┌╯
+╰───────────────────────────────╯╰─┐↑↓ sel | e tree | f filter | u pause | F f┌╯

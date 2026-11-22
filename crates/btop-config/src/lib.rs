@@ -92,6 +92,8 @@ pub struct Config {
     pub proc_sorting: String,
     pub proc_reversed: bool,
     pub proc_tree: bool,
+    pub proc_aggregate: bool,
+    pub proc_cpu_graphs: bool,
     pub proc_per_core: bool,
     pub proc_mem_bytes: bool,
     pub mem_graphs: bool,
@@ -140,6 +142,8 @@ impl Default for Config {
             proc_sorting: "cpu lazy".to_owned(),
             proc_reversed: false,
             proc_tree: false,
+            proc_aggregate: false,
+            proc_cpu_graphs: true,
             proc_per_core: false,
             proc_mem_bytes: true,
             mem_graphs: true,
@@ -198,7 +202,9 @@ impl Config {
                 "#* Process sort column.\n",
                 "proc_sorting = \"{proc_sorting}\"\n",
                 "proc_reversed = {proc_reversed}\n",
-                "proc_tree = {proc_tree}\n\n",
+                "proc_tree = {proc_tree}\n",
+                "proc_aggregate = {proc_aggregate}\n",
+                "proc_cpu_graphs = {proc_cpu_graphs}\n\n",
                 "#* Show historical graphs inside the memory box (False = percentage meters).\n",
                 "mem_graphs = {mem_graphs}\n",
                 "show_swap = {show_swap}\n",
@@ -240,6 +246,8 @@ impl Config {
             proc_sorting = cfg.proc_sorting,
             proc_reversed = bool_title(cfg.proc_reversed),
             proc_tree = bool_title(cfg.proc_tree),
+            proc_aggregate = bool_title(cfg.proc_aggregate),
+            proc_cpu_graphs = bool_title(cfg.proc_cpu_graphs),
             mem_graphs = bool_title(cfg.mem_graphs),
             show_swap = bool_title(cfg.show_swap),
             base_10_sizes = bool_title(cfg.base_10_sizes),
@@ -297,6 +305,8 @@ impl Config {
                 "proc_sorting" => cfg.proc_sorting = val,
                 "proc_reversed" => cfg.proc_reversed = parse_bool(key, &val)?,
                 "proc_tree" => cfg.proc_tree = parse_bool(key, &val)?,
+                "proc_aggregate" => cfg.proc_aggregate = parse_bool(key, &val)?,
+                "proc_cpu_graphs" => cfg.proc_cpu_graphs = parse_bool(key, &val)?,
                 "proc_per_core" => cfg.proc_per_core = parse_bool(key, &val)?,
                 "proc_mem_bytes" => cfg.proc_mem_bytes = parse_bool(key, &val)?,
                 "mem_graphs" => cfg.mem_graphs = parse_bool(key, &val)?,
@@ -408,9 +418,9 @@ mod tests {
         );
 
         let custom = Config::parse(
-            "mem_graphs = False\nshow_swap = False\nbase_10_sizes = True\ndisks_filter = \"exclude=E\"\nshow_disks = False\nshow_io_stat = False\nio_mode = True\nio_graph_combined = True\nio_graph_speeds = \"C:500\"\nnet_iface = \"Ethernet\"\nnet_download = 250\nnet_upload = 75\nnet_auto = False\nnet_sync = False\nswap_upload_download = True\nbase_10_bitrate = False\npresets = \"cpu:1:block,proc:1:default\"\ndisable_presets = True\ncpu_bottom = True\nproc_left = True\nmem_below_net = True\nshow_battery = False\n",
+            "mem_graphs = False\nshow_swap = False\nbase_10_sizes = True\ndisks_filter = \"exclude=E\"\nshow_disks = False\nshow_io_stat = False\nio_mode = True\nio_graph_combined = True\nio_graph_speeds = \"C:500\"\nnet_iface = \"Ethernet\"\nnet_download = 250\nnet_upload = 75\nnet_auto = False\nnet_sync = False\nswap_upload_download = True\nbase_10_bitrate = False\npresets = \"cpu:1:block,proc:1:default\"\ndisable_presets = True\ncpu_bottom = True\nproc_left = True\nmem_below_net = True\nshow_battery = False\nproc_aggregate = True\nproc_cpu_graphs = False\n",
         )
-        .expect("parse custom mem, disk, net, and layout flags");
+        .expect("parse custom mem, disk, net, layout, and proc flags");
         assert!(!custom.mem_graphs);
         assert!(!custom.show_swap);
         assert!(custom.base_10_sizes);
@@ -433,6 +443,8 @@ mod tests {
         assert!(custom.proc_left);
         assert!(custom.mem_below_net);
         assert!(!custom.show_battery);
+        assert!(custom.proc_aggregate);
+        assert!(!custom.proc_cpu_graphs);
 
         for (raw, expected) in [
             ("Off", DisablePresets::Off),
