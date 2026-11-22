@@ -433,11 +433,12 @@ fn render_mem_footer(
 
     if fy < y_end {
         let commit_pct = ratio_percent(mem.commit_used_bytes, mem.commit_limit_bytes);
-        let right = format!(
-            "{}/{} {:>4.0}%",
-            format_mem_bytes(mem.commit_used_bytes, config.base_10_sizes),
-            format_mem_bytes(mem.commit_limit_bytes, config.base_10_sizes),
-            commit_pct
+        let right = format_ratio_footer(
+            mem.commit_used_bytes,
+            mem.commit_limit_bytes,
+            commit_pct,
+            config.base_10_sizes,
+            inner.width,
         );
         render_footer_meter_row(
             grid,
@@ -468,11 +469,12 @@ fn render_mem_footer(
             );
         } else {
             let swap_pct = ratio_percent(mem.pagefile_used_bytes, mem.pagefile_total_bytes);
-            let right = format!(
-                "{}/{} {:>4.0}%",
-                format_mem_bytes(mem.pagefile_used_bytes, config.base_10_sizes),
-                format_mem_bytes(mem.pagefile_total_bytes, config.base_10_sizes),
-                swap_pct
+            let right = format_ratio_footer(
+                mem.pagefile_used_bytes,
+                mem.pagefile_total_bytes,
+                swap_pct,
+                config.base_10_sizes,
+                inner.width,
             );
             render_footer_meter_row(
                 grid,
@@ -662,6 +664,22 @@ fn render_compact_meter_row(
             false,
         );
     }
+}
+
+fn format_ratio_footer(used: u64, total: u64, pct: f32, base_10: bool, inner_width: u16) -> String {
+    let full = format!(
+        "{}/{} {:>3.0}%",
+        format_mem_bytes(used, base_10),
+        format_mem_bytes(total, base_10),
+        pct
+    );
+    // Reserve 8 chars for " Commit " plus 2 spaces padding on the right label.
+    if usize::from(inner_width) >= full.chars().count() + 10 {
+        return full;
+    }
+    let compact_used = format_mem_bytes(used, base_10).replace(' ', "");
+    let compact_total = format_mem_bytes(total, base_10).replace(' ', "");
+    format!("{compact_used}/{compact_total} {pct:.0}%")
 }
 
 #[allow(clippy::too_many_arguments)]

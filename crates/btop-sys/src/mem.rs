@@ -121,11 +121,11 @@ mod win {
     /// Persistent English Windows 11 PDH query for memory Standby, Modified, and Free/Zero lists.
     pub struct MemPdhQuery {
         query: PDH_HQUERY,
-        standby_core: Option<PDH_HCOUNTER>,
-        standby_normal: Option<PDH_HCOUNTER>,
-        standby_reserve: Option<PDH_HCOUNTER>,
-        modified: Option<PDH_HCOUNTER>,
-        free_and_zero: Option<PDH_HCOUNTER>,
+        standby_core: PDH_HCOUNTER,
+        standby_normal: PDH_HCOUNTER,
+        standby_reserve: PDH_HCOUNTER,
+        modified: PDH_HCOUNTER,
+        free_and_zero: PDH_HCOUNTER,
     }
 
     // SAFETY: `MemPdhQuery` uniquely owns its `PDH_HQUERY` and counters and is polled from
@@ -134,18 +134,15 @@ mod win {
 
     impl fmt::Debug for MemPdhQuery {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.debug_struct("MemPdhQuery")
-                .field("has_standby_core", &self.standby_core.is_some())
-                .field("has_standby_normal", &self.standby_normal.is_some())
-                .field("has_standby_reserve", &self.standby_reserve.is_some())
-                .field("has_modified", &self.modified.is_some())
-                .field("has_free_and_zero", &self.free_and_zero.is_some())
-                .finish_non_exhaustive()
+            f.debug_struct("MemPdhQuery").finish_non_exhaustive()
         }
     }
 
     impl MemPdhQuery {
-        /// Opens one shared English `PDH_HQUERY` for the 5 memory cache list byte counters.
+        /// Opens one shared English `PDH_HQUERY` requiring all 5 memory cache list counters.
+        ///
+        /// Returns `None` if any required counter cannot be added so partial failures never
+        /// produce zeroed cache components.
         pub fn open() -> Option<Self> {
             let mut query: PDH_HQUERY = ptr::null_mut();
             // SAFETY: Opening a live PDH query with null data source.
@@ -154,26 +151,28 @@ mod win {
                 return None;
             }
 
-            let standby_core = add_english_counter(query, "\\Memory\\Standby Cache Core Bytes");
-            let standby_normal =
-                add_english_counter(query, "\\Memory\\Standby Cache Normal Priority Bytes");
-            let standby_reserve =
-                add_english_counter(query, "\\Memory\\Standby Cache Reserve Bytes");
-            let modified = add_english_counter(query, "\\Memory\\Modified Page List Bytes");
-            let free_and_zero = add_english_counter(query, "\\Memory\\Free & Zero Page List Bytes");
+            let counters = (
+                add_english_counter(query, "\\Memory\\Standby Cache Core Bytes"),
+                add_english_counter(query, "\\Memory\\Standby Cache Normal Priority Bytes"),
+                add_english_counter(query, "\\Memory\\Standby Cache Reserve Bytes"),
+                add_english_counter(query, "\\Memory\\Modified Page List Bytes"),
+                add_english_counter(query, "\\Memory\\Free & Zero Page List Bytes"),
+            );
 
-            if standby_core.is_none()
-                && standby_normal.is_none()
-                && standby_reserve.is_none()
-                && modified.is_none()
-                && free_and_zero.is_none()
-            {
-                // SAFETY: Closing opened query on failure to register any counter.
+            let (
+                Some(standby_core),
+                Some(standby_normal),
+                Some(standby_reserve),
+                Some(modified),
+                Some(free_and_zero),
+            ) = counters
+            else {
+                // SAFETY: Closing opened query when any required counter failed to register.
                 unsafe {
                     let _ = PdhCloseQuery(query);
                 }
                 return None;
-            }
+            };
 
             Some(Self {
                 query,
@@ -185,7 +184,9 @@ mod win {
             })
         }
 
-        /// Collects an instantaneous snapshot of Windows cache lists in bytes.
+        /// Collects an instantaneous snapshot of all 5 Windows cache lists in bytes.
+        ///
+        /// Returns `None` if collection fails or any individual counter does not return valid data.
         pub fn sample(&mut self) -> Option<RawMemCacheSample> {
             // SAFETY: `self.query` is a valid opened `PDH_HQUERY`.
             let status = unsafe { PdhCollectQueryData(self.query) };
@@ -193,27 +194,12 @@ mod win {
                 return None;
             }
 
-            let standby_core = self.standby_core.and_then(read_scalar_u64);
-            let standby_normal = self.standby_normal.and_then(read_scalar_u64);
-            let standby_reserve = self.standby_reserve.and_then(read_scalar_u64);
-            let modified = self.modified.and_then(read_scalar_u64);
-            let free_and_zero = self.free_and_zero.and_then(read_scalar_u64);
-
-            if standby_core.is_none()
-                && standby_normal.is_none()
-                && standby_reserve.is_none()
-                && modified.is_none()
-                && free_and_zero.is_none()
-            {
-                return None;
-            }
-
             Some(RawMemCacheSample {
-                standby_core_bytes: standby_core.unwrap_or(0),
-                standby_normal_bytes: standby_normal.unwrap_or(0),
-                standby_reserve_bytes: standby_reserve.unwrap_or(0),
-                modified_bytes: modified.unwrap_or(0),
-                free_and_zero_bytes: free_and_zero.unwrap_or(0),
+                standby_core_bytes: read_scalar_u64(self.standby_core)?,
+                standby_normal_bytes: read_scalar_u64(self.standby_normal)?,
+                standby_reserve_bytes: read_scalar_u64(self.standby_reserve)?,
+                modified_bytes: read_scalar_u64(self.modified)?,
+                free_and_zero_bytes: read_scalar_u64(self.free_and_zero)?,
             })
         }
     }

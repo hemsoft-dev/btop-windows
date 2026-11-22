@@ -22,7 +22,7 @@ expression: rendered
 │ Free          11.9 GiB  37.1% ││    4500 msedge.exe            522M     3.6 ││
 │                  ⣄⣠⣀⣄⣠⣀⣄⣠⣀⣄⣠⣀ ││    5040 svchost.exe          24.0M     3.6 ││
 │───────────────────────────────││    5100 svchost.exe          24.0M     3.6 ││
-│ Commit  17.1 GiB/37.0 GiB   46││    5036 conhost.exe          30.0M     3.3 ││
-│ Swap    512 MiB/5.00 GiB   10%││    5096 conhost.exe          30.0M     3.3 ││
+│ Commit  17.1GiB/37.0GiB 46%   ││    5036 conhost.exe          30.0M     3.3 ││
+│ Swap    512 MiB/5.00 GiB  10% ││    5096 conhost.exe          30.0M     3.3 ││
 │ Compressed: 320 MiB           ││    1416 dwm.exe               144M     3.0 ││
 ╰───────────────────────────────╯╰─┐↑↓ select | ←→ sort | r rev | c core | % m┌╯

@@ -8,8 +8,6 @@ use btop_sys::{
 
 use crate::CollectError;
 
-const DEFAULT_PAGE_SIZE_BYTES: u64 = 4096;
-
 /// Converts pagefile page counts from `EnumPageFilesW` into `(used_bytes, total_bytes)`.
 ///
 /// Uses saturating arithmetic and clamps `used_bytes <= total_bytes`.
@@ -23,7 +21,7 @@ pub fn pagefile_pages_to_bytes(
     (used_bytes, total_bytes)
 }
 
-/// Computes a consistent [`MemSnapshot`] from raw Windows 11 memory, commit, pagefile, and
+/// Computes a consistent [`MemSnapshot`] from complete Windows 11 memory, commit, pagefile, and
 /// PDH cache-list readings.
 ///
 /// Invariants:
@@ -34,47 +32,36 @@ pub fn pagefile_pages_to_bytes(
 ///   includes Standby + Free/Zero pages.
 pub fn compute_mem_snapshot(
     status: RawMemoryStatus,
-    perf: Option<RawPerformanceInfo>,
-    pagefiles: Option<RawPagefileTotals>,
-    cache: Option<RawMemCacheSample>,
-) -> MemSnapshot {
+    perf: RawPerformanceInfo,
+    pagefiles: RawPagefileTotals,
+    cache: RawMemCacheSample,
+) -> Result<MemSnapshot, CollectError> {
+    if perf.page_size_bytes == 0 {
+        return Err(CollectError::Platform(
+            "GetPerformanceInfo returned zero page size".to_owned(),
+        ));
+    }
+
     let total_bytes = status.total_phys_bytes;
     let available_bytes = status.avail_phys_bytes.min(total_bytes);
     let used_bytes = total_bytes.saturating_sub(available_bytes);
 
-    let (cached_bytes, free_bytes) = if let Some(c) = cache {
-        let standby = c
-            .standby_core_bytes
-            .saturating_add(c.standby_normal_bytes)
-            .saturating_add(c.standby_reserve_bytes);
-        let cached = standby.saturating_add(c.modified_bytes).min(total_bytes);
-        let free = c.free_and_zero_bytes.min(available_bytes);
-        (cached, free)
-    } else {
-        (0, 0)
-    };
+    let standby = cache
+        .standby_core_bytes
+        .saturating_add(cache.standby_normal_bytes)
+        .saturating_add(cache.standby_reserve_bytes);
+    let cached_bytes = standby
+        .saturating_add(cache.modified_bytes)
+        .min(total_bytes);
+    let free_bytes = cache.free_and_zero_bytes.min(available_bytes);
 
-    let page_size = perf
-        .map(|p| p.page_size_bytes)
-        .filter(|&ps| ps > 0)
-        .unwrap_or(DEFAULT_PAGE_SIZE_BYTES);
+    let page_size = perf.page_size_bytes;
+    let commit_used_bytes = perf.commit_total_pages.saturating_mul(page_size);
+    let commit_limit_bytes = perf.commit_limit_pages.saturating_mul(page_size);
+    let (pagefile_used_bytes, pagefile_total_bytes) =
+        pagefile_pages_to_bytes(pagefiles.used_pages, pagefiles.total_pages, page_size);
 
-    let (commit_used_bytes, commit_limit_bytes) = if let Some(p) = perf {
-        (
-            p.commit_total_pages.saturating_mul(page_size),
-            p.commit_limit_pages.saturating_mul(page_size),
-        )
-    } else {
-        (0, 0)
-    };
-
-    let (pagefile_used_bytes, pagefile_total_bytes) = if let Some(pf) = pagefiles {
-        pagefile_pages_to_bytes(pf.used_pages, pf.total_pages, page_size)
-    } else {
-        (0, 0)
-    };
-
-    MemSnapshot {
+    Ok(MemSnapshot {
         total_bytes,
         used_bytes,
         available_bytes,
@@ -85,7 +72,7 @@ pub fn compute_mem_snapshot(
         pagefile_used_bytes,
         pagefile_total_bytes,
         compressed_bytes: None,
-    }
+    })
 }
 
 /// Live Windows 11 memory collector combining `GlobalMemoryStatusEx`, `GetPerformanceInfo`,
@@ -110,12 +97,21 @@ impl MemoryCollector {
     }
 
     /// Samples current physical memory, cache breakdown, commit charge, and pagefile usage.
+    ///
+    /// Propagates any Windows API or PDH failure as `Err` so callers publish
+    /// `DataState::Unavailable` rather than misleading zero values.
     pub fn sample(&mut self) -> Result<MemSnapshot, CollectError> {
         let status = query_memory_status().map_err(CollectError::Platform)?;
-        let perf = query_performance_info().ok();
-        let pagefiles = query_pagefile_totals().ok();
-        let cache = self.pdh.as_mut().and_then(MemPdhQuery::sample);
-        Ok(compute_mem_snapshot(status, perf, pagefiles, cache))
+        let perf = query_performance_info().map_err(CollectError::Platform)?;
+        let pagefiles = query_pagefile_totals().map_err(CollectError::Platform)?;
+        let cache = self
+            .pdh
+            .as_mut()
+            .and_then(MemPdhQuery::sample)
+            .ok_or_else(|| {
+                CollectError::Platform("English memory cache PDH counters unavailable".to_owned())
+            })?;
+        compute_mem_snapshot(status, perf, pagefiles, cache)
     }
 }
 
@@ -133,23 +129,24 @@ mod tests {
                 total_phys_bytes: 64 * GIB,
                 avail_phys_bytes: 38 * GIB,
             },
-            Some(RawPerformanceInfo {
+            RawPerformanceInfo {
                 commit_total_pages: 8_126_464,  // 31 GiB in 4 KiB pages
                 commit_limit_pages: 18_874_368, // 72 GiB in 4 KiB pages
                 page_size_bytes: 4096,
-            }),
-            Some(RawPagefileTotals {
+            },
+            RawPagefileTotals {
                 used_pages: 262_144,    // 1 GiB
                 total_pages: 2_097_152, // 8 GiB
-            }),
-            Some(RawMemCacheSample {
+            },
+            RawMemCacheSample {
                 standby_core_bytes: 2 * GIB,
                 standby_normal_bytes: 7 * GIB,
                 standby_reserve_bytes: GIB,
                 modified_bytes: GIB,
                 free_and_zero_bytes: 28 * GIB,
-            }),
-        );
+            },
+        )
+        .expect("complete memory sample");
 
         assert_eq!(snap.total_bytes, 64 * GIB);
         assert_eq!(snap.used_bytes, 26 * GIB);
@@ -168,15 +165,38 @@ mod tests {
                 total_phys_bytes: 16 * GIB,
                 avail_phys_bytes: 20 * GIB,
             },
-            None,
-            None,
-            None,
-        );
+            RawPerformanceInfo {
+                commit_total_pages: 1024,
+                commit_limit_pages: 2048,
+                page_size_bytes: 4096,
+            },
+            RawPagefileTotals::default(),
+            RawMemCacheSample::default(),
+        )
+        .expect("clamped memory sample");
         assert_eq!(clamped.available_bytes, 16 * GIB);
         assert_eq!(clamped.used_bytes, 0);
         assert_eq!(
             clamped.used_bytes + clamped.available_bytes,
             clamped.total_bytes
+        );
+
+        // Rejects invalid zero page size instead of fabricating numbers.
+        assert!(
+            compute_mem_snapshot(
+                RawMemoryStatus {
+                    total_phys_bytes: 16 * GIB,
+                    avail_phys_bytes: 8 * GIB,
+                },
+                RawPerformanceInfo {
+                    commit_total_pages: 1024,
+                    commit_limit_pages: 2048,
+                    page_size_bytes: 0,
+                },
+                RawPagefileTotals::default(),
+                RawMemCacheSample::default(),
+            )
+            .is_err()
         );
     }
 
