@@ -13,6 +13,8 @@ pub enum TermError {
     Console(String),
     #[error("input error: {0}")]
     Input(String),
+    #[error("a terminal guard is already active")]
+    AlreadyActive,
     #[error("live terminal backend is only supported on Windows")]
     UnsupportedPlatform,
 }
@@ -145,6 +147,14 @@ mod win {
         /// Configures Windows Terminal VT output, UTF-8 codepage, raw/mouse/resize input,
         /// alternate screen, and global panic/close restore hooks.
         pub fn enter() -> Result<Self, TermError> {
+            let mut slot = match ACTIVE_STATE.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if slot.is_some() {
+                return Err(TermError::AlreadyActive);
+            }
+
             // SAFETY: Retrieving standard Win32 console handles.
             let (stdout, stdin) = unsafe {
                 (
@@ -213,19 +223,14 @@ mod win {
             }
 
             install_global_restore_hooks();
-            {
-                let mut slot = match ACTIVE_STATE.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                *slot = Some(SavedConsoleState {
-                    stdout_handle: stdout as usize,
-                    stdin_handle: stdin as usize,
-                    orig_out_mode,
-                    orig_in_mode,
-                    orig_output_cp,
-                });
-            }
+            *slot = Some(SavedConsoleState {
+                stdout_handle: stdout as usize,
+                stdin_handle: stdin as usize,
+                orig_out_mode,
+                orig_in_mode,
+                orig_output_cp,
+            });
+            drop(slot);
 
             if let Err(err) = write_wide(stdout, ENTER_SEQUENCE) {
                 restore_terminal_now();
@@ -261,6 +266,38 @@ mod win {
             restore_terminal_now();
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn second_enter_is_rejected_without_clobbering_saved_state() {
+            let sentinel = SavedConsoleState {
+                stdout_handle: 1,
+                stdin_handle: 2,
+                orig_out_mode: 0x1111,
+                orig_in_mode: 0x2222,
+                orig_output_cp: 437,
+            };
+            {
+                let mut slot = ACTIVE_STATE.lock().expect("lock active state");
+                *slot = Some(sentinel);
+            }
+
+            let err = TerminalGuard::enter().expect_err("second guard must fail");
+            assert!(matches!(err, TermError::AlreadyActive));
+
+            let saved = ACTIVE_STATE
+                .lock()
+                .expect("lock active state")
+                .take()
+                .expect("original saved state must remain intact");
+            assert_eq!(saved.orig_out_mode, 0x1111);
+            assert_eq!(saved.orig_in_mode, 0x2222);
+            assert_eq!(saved.orig_output_cp, 437);
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -284,6 +321,10 @@ mod stub {
         pub fn write_frame(&mut self, _frame: &str) -> Result<(), TermError> {
             Err(TermError::UnsupportedPlatform)
         }
+    }
+
+    impl Drop for TerminalGuard {
+        fn drop(&mut self) {}
     }
 
     pub fn restore_terminal_now() {}

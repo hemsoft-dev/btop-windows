@@ -46,8 +46,13 @@ fn render_smoke(size: Size, last_event: &str, frame_count: u64) -> Grid {
         grid.write_str(size.width - 1, y, "│", border_fg, bg, false);
     }
 
-    // Embedded btop-style title
-    grid.write_str(2, 0, "┐ btop-windows VT smoke ┌", title_fg, bg, true);
+    // Embedded btop-style title (clipped so column `width - 1` right border stays intact)
+    let max_title = usize::from(size.width.saturating_sub(3));
+    let title: String = "┐ btop-windows VT smoke ┌"
+        .chars()
+        .take(max_title)
+        .collect();
+    grid.write_str(2, 0, &title, title_fg, bg, true);
 
     let max_text = usize::from(size.width.saturating_sub(4));
     let clip = |s: &str| -> String { s.chars().take(max_text).collect() };
