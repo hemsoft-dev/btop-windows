@@ -83,6 +83,25 @@ pub struct MemSnapshot {
     pub compressed_bytes: Option<u64>,
 }
 
+/// Capacity and optional live throughput metrics for one local fixed Windows volume (`DRIVE_FIXED`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct DiskSnapshot {
+    pub mount: String,
+    pub label: String,
+    pub fs_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_drive: Option<u32>,
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub free_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_bytes_per_sec: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_bytes_per_sec: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy_pct: Option<f32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessIdentity {
     pub pid: u32,
@@ -153,6 +172,8 @@ pub struct Snapshot {
     pub total_phys_mem_bytes: Option<u64>,
     pub cpu: DataState<CpuSnapshot>,
     pub mem: DataState<MemSnapshot>,
+    #[serde(default)]
+    pub disks: DataState<Vec<DiskSnapshot>>,
     pub processes: DataState<Vec<ProcessEntry>>,
     pub services: DataState<Vec<ServiceEntry>>,
     pub gpus: Vec<DataState<GpuSnapshot>>,

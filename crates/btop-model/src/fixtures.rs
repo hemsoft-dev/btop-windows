@@ -1,8 +1,8 @@
 //! Deterministic synthetic Windows 11 x64 fixtures for `--replay` and golden tests.
 
 use crate::{
-    CoreKind, CoreSample, CpuSnapshot, DataState, GpuSnapshot, LogicalCpuId, MemSnapshot,
-    ProcessEntry, ProcessIdentity, ServiceEntry, Snapshot,
+    CoreKind, CoreSample, CpuSnapshot, DataState, DiskSnapshot, GpuSnapshot, LogicalCpuId,
+    MemSnapshot, ProcessEntry, ProcessIdentity, ServiceEntry, Snapshot,
 };
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -61,6 +61,7 @@ pub fn win11_8core_single_gpu_desktop() -> Vec<Snapshot> {
                     pagefile_total_bytes: 5 * GIB,
                     compressed_bytes: Some(320 * MIB),
                 }),
+                disks: DataState::Available(synthetic_disks(step, delta)),
                 processes: DataState::Available(synthetic_processes(50, tick, "alex")),
                 services: DataState::Available(synthetic_services()),
                 gpus: vec![DataState::Available(GpuSnapshot {
@@ -150,6 +151,7 @@ pub fn win11_16core_dual_gpu_desktop() -> Vec<Snapshot> {
                     pagefile_total_bytes: 8 * GIB,
                     compressed_bytes: Some(512 * MIB),
                 }),
+                disks: DataState::Available(synthetic_disks(step, delta)),
                 processes: DataState::Available(synthetic_processes(52, tick, "franz")),
                 services: DataState::Available(synthetic_services()),
                 gpus: dual_gpu_snapshots(step, delta),
@@ -157,6 +159,35 @@ pub fn win11_16core_dual_gpu_desktop() -> Vec<Snapshot> {
             }
         })
         .collect()
+}
+
+fn synthetic_disks(step: u64, delta: f32) -> Vec<DiskSnapshot> {
+    vec![
+        DiskSnapshot {
+            mount: "C:\\".to_owned(),
+            label: "Windows".to_owned(),
+            fs_type: "NTFS".to_owned(),
+            physical_drive: Some(0),
+            total_bytes: 1_000 * GIB,
+            used_bytes: 462 * GIB + step * 16 * MIB,
+            free_bytes: 538 * GIB - step * 16 * MIB,
+            read_bytes_per_sec: Some((85 + step * 45) * MIB),
+            write_bytes_per_sec: Some((32 + step * 28) * MIB),
+            busy_pct: Some(14.5 + delta * 12.0),
+        },
+        DiskSnapshot {
+            mount: "D:\\".to_owned(),
+            label: "Data".to_owned(),
+            fs_type: "NTFS".to_owned(),
+            physical_drive: Some(1),
+            total_bytes: 2_000 * GIB,
+            used_bytes: 1_240 * GIB + step * 32 * MIB,
+            free_bytes: 760 * GIB - step * 32 * MIB,
+            read_bytes_per_sec: Some((210 + step * 60) * MIB),
+            write_bytes_per_sec: Some((140 + step * 50) * MIB),
+            busy_pct: Some(36.0 + delta * 15.0),
+        },
+    ]
 }
 
 fn dual_gpu_snapshots(step: u64, delta: f32) -> Vec<DataState<GpuSnapshot>> {

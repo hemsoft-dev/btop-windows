@@ -56,6 +56,12 @@ pub struct Config {
     pub mem_graphs: bool,
     pub show_swap: bool,
     pub base_10_sizes: bool,
+    pub disks_filter: String,
+    pub show_disks: bool,
+    pub show_io_stat: bool,
+    pub io_mode: bool,
+    pub io_graph_combined: bool,
+    pub io_graph_speeds: String,
     pub cpu_util_mode: String,
     pub freq_mode: String,
     /// Unknown or deferred upstream keys preserved verbatim when saving `btop.conf`.
@@ -85,6 +91,12 @@ impl Default for Config {
             mem_graphs: true,
             show_swap: true,
             base_10_sizes: false,
+            disks_filter: String::new(),
+            show_disks: true,
+            show_io_stat: true,
+            io_mode: false,
+            io_graph_combined: false,
+            io_graph_speeds: String::new(),
             cpu_util_mode: "time".to_owned(),
             freq_mode: "average".to_owned(),
             preserved_unknown: BTreeMap::new(),
@@ -123,6 +135,13 @@ impl Config {
                 "mem_graphs = {mem_graphs}\n",
                 "show_swap = {show_swap}\n",
                 "base_10_sizes = {base_10_sizes}\n\n",
+                "#* Local fixed drive filter (e.g. \"C D\" or \"exclude=E F\").\n",
+                "disks_filter = \"{disks_filter}\"\n",
+                "show_disks = {show_disks}\n",
+                "show_io_stat = {show_io_stat}\n",
+                "io_mode = {io_mode}\n",
+                "io_graph_combined = {io_graph_combined}\n",
+                "io_graph_speeds = \"{io_graph_speeds}\"\n\n",
                 "#* Windows CPU utilization mode: \"time\" or \"utility\" (Task Manager).\n",
                 "cpu_util_mode = \"{cpu_util_mode}\"\n\n",
                 "#* CPU frequency aggregation: \"first\", \"range\", \"lowest\", \"highest\", or \"average\".\n",
@@ -142,6 +161,12 @@ impl Config {
             mem_graphs = bool_title(cfg.mem_graphs),
             show_swap = bool_title(cfg.show_swap),
             base_10_sizes = bool_title(cfg.base_10_sizes),
+            disks_filter = cfg.disks_filter,
+            show_disks = bool_title(cfg.show_disks),
+            show_io_stat = bool_title(cfg.show_io_stat),
+            io_mode = bool_title(cfg.io_mode),
+            io_graph_combined = bool_title(cfg.io_graph_combined),
+            io_graph_speeds = cfg.io_graph_speeds,
             cpu_util_mode = cfg.cpu_util_mode,
             freq_mode = cfg.freq_mode,
         )
@@ -182,6 +207,12 @@ impl Config {
                 "mem_graphs" => cfg.mem_graphs = parse_bool(key, &val)?,
                 "show_swap" => cfg.show_swap = parse_bool(key, &val)?,
                 "base_10_sizes" => cfg.base_10_sizes = parse_bool(key, &val)?,
+                "disks_filter" => cfg.disks_filter = val,
+                "show_disks" => cfg.show_disks = parse_bool(key, &val)?,
+                "show_io_stat" => cfg.show_io_stat = parse_bool(key, &val)?,
+                "io_mode" => cfg.io_mode = parse_bool(key, &val)?,
+                "io_graph_combined" => cfg.io_graph_combined = parse_bool(key, &val)?,
+                "io_graph_speeds" => cfg.io_graph_speeds = val,
                 "cpu_util_mode" => cfg.cpu_util_mode = val,
                 "freq_mode" => cfg.freq_mode = val,
                 "graph_symbol" => {
@@ -258,11 +289,19 @@ mod tests {
             Some("True")
         );
 
-        let custom = Config::parse("mem_graphs = False\nshow_swap = False\nbase_10_sizes = True\n")
-            .expect("parse custom mem flags");
+        let custom = Config::parse(
+            "mem_graphs = False\nshow_swap = False\nbase_10_sizes = True\ndisks_filter = \"exclude=E\"\nshow_disks = False\nshow_io_stat = False\nio_mode = True\nio_graph_combined = True\nio_graph_speeds = \"C:500\"\n",
+        )
+        .expect("parse custom mem and disk flags");
         assert!(!custom.mem_graphs);
         assert!(!custom.show_swap);
         assert!(custom.base_10_sizes);
+        assert_eq!(custom.disks_filter, "exclude=E");
+        assert!(!custom.show_disks);
+        assert!(!custom.show_io_stat);
+        assert!(custom.io_mode);
+        assert!(custom.io_graph_combined);
+        assert_eq!(custom.io_graph_speeds, "C:500");
     }
 
     #[test]

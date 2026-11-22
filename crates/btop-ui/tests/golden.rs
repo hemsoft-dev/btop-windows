@@ -135,6 +135,7 @@ fn mem_only_config(mem_graphs: bool) -> Config {
     Config {
         shown_boxes: "mem".to_owned(),
         mem_graphs,
+        show_disks: false,
         ..Config::default()
     }
 }
@@ -203,4 +204,48 @@ fn golden_mem_meter_200x60() {
         60,
     );
     insta::assert_snapshot!("mem_meter_200x60", rendered);
+}
+
+#[test]
+fn golden_disks_split_120x40() {
+    let cfg = Config {
+        show_disks: true,
+        io_mode: false,
+        ..Config::default()
+    };
+    let rendered = render_fixture_with_config("win11-16core-dual-gpu-desktop.jsonl", &cfg, 120, 40);
+    insta::assert_snapshot!("disks_split_120x40", rendered);
+}
+
+#[test]
+fn golden_disks_split_200x60() {
+    let cfg = Config {
+        show_disks: true,
+        io_mode: false,
+        ..Config::default()
+    };
+    let rendered = render_fixture_with_config("win11-16core-dual-gpu-desktop.jsonl", &cfg, 200, 60);
+    insta::assert_snapshot!("disks_split_200x60", rendered);
+}
+
+#[test]
+fn golden_disk_io_mode_120x40() {
+    let cfg = Config {
+        show_disks: true,
+        io_mode: true,
+        ..Config::default()
+    };
+    let rendered = render_fixture_with_config("win11-16core-dual-gpu-desktop.jsonl", &cfg, 120, 40);
+    insta::assert_snapshot!("disk_io_mode_120x40", rendered);
+}
+
+#[test]
+fn golden_disk_io_mode_200x60() {
+    let cfg = Config {
+        show_disks: true,
+        io_mode: true,
+        ..Config::default()
+    };
+    let rendered = render_fixture_with_config("win11-16core-dual-gpu-desktop.jsonl", &cfg, 200, 60);
+    insta::assert_snapshot!("disk_io_mode_200x60", rendered);
 }

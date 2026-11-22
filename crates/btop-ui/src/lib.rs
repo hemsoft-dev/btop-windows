@@ -3,17 +3,19 @@
 #![forbid(unsafe_code)]
 
 pub mod cpu_box;
+pub mod disk_view;
 pub mod mem_box;
 pub mod proc_box;
 pub mod theme;
 pub mod widgets;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use btop_config::Config;
 use btop_model::{DataState, Snapshot};
 use btop_term::{Grid, Rect, Size};
 
+pub use disk_view::{format_rate_bytes_per_sec, parse_io_graph_speeds};
 pub use mem_box::{format_mem_bytes, stacked_physical_segments};
 pub use proc_box::{ProcSort, ProcViewState};
 
@@ -23,16 +25,58 @@ use crate::theme::ThemePalette;
 const DEFAULT_HISTORY_CAPACITY: usize = 512;
 
 /// Pure UI interaction state passed into [`render_frame`].
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UiState {
     pub proc: ProcViewState,
+    pub show_disks: bool,
+    pub io_mode: bool,
+}
+
+impl Default for UiState {
+    fn default() -> Self {
+        Self {
+            proc: ProcViewState::default(),
+            show_disks: true,
+            io_mode: false,
+        }
+    }
 }
 
 impl UiState {
     pub fn from_config(config: &Config) -> Self {
         Self {
             proc: ProcViewState::from_config(config),
+            show_disks: config.show_disks,
+            io_mode: config.io_mode,
         }
+    }
+
+    pub fn toggle_disks(&mut self) {
+        self.show_disks = !self.show_disks;
+        if !self.show_disks {
+            self.io_mode = false;
+        }
+    }
+
+    pub fn toggle_io_mode(&mut self) {
+        self.io_mode = !self.io_mode;
+    }
+}
+
+/// Per-drive bounded read/write throughput history in bytes/sec.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DiskIoSeries {
+    read_bps: VecDeque<u64>,
+    write_bps: VecDeque<u64>,
+}
+
+impl DiskIoSeries {
+    pub fn read_slice(&self) -> &[u64] {
+        self.read_bps.as_slices().0
+    }
+
+    pub fn write_slice(&self) -> &[u64] {
+        self.write_bps.as_slices().0
     }
 }
 
@@ -46,6 +90,7 @@ pub struct UiHistory {
     mem_available: VecDeque<f32>,
     mem_cached: VecDeque<f32>,
     mem_free: VecDeque<f32>,
+    disks: BTreeMap<String, DiskIoSeries>,
 }
 
 impl Default for UiHistory {
@@ -65,6 +110,7 @@ impl UiHistory {
             mem_available: VecDeque::with_capacity(cap),
             mem_cached: VecDeque::with_capacity(cap),
             mem_free: VecDeque::with_capacity(cap),
+            disks: BTreeMap::new(),
         }
     }
 
@@ -85,12 +131,12 @@ impl UiHistory {
         history
     }
 
-    /// Appends the CPU and memory totals from `snapshot` into the bounded history series.
+    /// Appends the CPU, memory, and disk I/O totals from `snapshot` into the bounded history.
     pub fn push(&mut self, snapshot: &Snapshot) {
         self.push_with_util_mode(snapshot, false);
     }
 
-    /// Appends CPU totals (time-based or `% Processor Utility`) and memory percentages.
+    /// Appends CPU totals (time-based or `% Processor Utility`), memory %, and disk I/O rates.
     pub fn push_with_util_mode(&mut self, snapshot: &Snapshot, use_utility: bool) {
         if let DataState::Available(cpu) | DataState::Stale { value: cpu, .. } = &snapshot.cpu {
             let total = if use_utility {
@@ -131,6 +177,19 @@ impl UiHistory {
                 self.capacity,
             );
         }
+
+        if let DataState::Available(disks) | DataState::Stale { value: disks, .. } = &snapshot.disks
+        {
+            for disk in disks {
+                if let (Some(read_bps), Some(write_bps)) =
+                    (disk.read_bytes_per_sec, disk.write_bytes_per_sec)
+                {
+                    let entry = self.disks.entry(disk.mount.clone()).or_default();
+                    push_bounded_u64(&mut entry.read_bps, read_bps, self.capacity);
+                    push_bounded_u64(&mut entry.write_bps, write_bps, self.capacity);
+                }
+            }
+        }
     }
 
     pub fn cpu_total_slice(&self) -> &[f32] {
@@ -156,9 +215,21 @@ impl UiHistory {
     pub fn mem_free_slice(&self) -> &[f32] {
         self.mem_free.as_slices().0
     }
+
+    pub fn disk_series(&self, mount: &str) -> Option<&DiskIoSeries> {
+        self.disks.get(mount)
+    }
 }
 
 fn push_bounded(buf: &mut VecDeque<f32>, value: f32, capacity: usize) {
+    if buf.len() >= capacity {
+        buf.pop_front();
+    }
+    buf.push_back(value);
+    buf.make_contiguous();
+}
+
+fn push_bounded_u64(buf: &mut VecDeque<u64>, value: u64, capacity: usize) {
     if buf.len() >= capacity {
         buf.pop_front();
     }
@@ -173,7 +244,7 @@ pub fn visible_proc_rows(size: Size, config: &Config) -> usize {
 }
 
 fn split_top_bottom(area: Rect) -> (Rect, Rect) {
-    let top_h = ((area.height * 2) / 5).clamp(8, 22);
+    let top_h = u16::try_from((u32::from(area.height) * 2 / 5).clamp(8, 22)).unwrap_or(22);
     let bottom_h = area.height.saturating_sub(top_h);
     (
         Rect {
@@ -189,7 +260,7 @@ fn split_top_bottom(area: Rect) -> (Rect, Rect) {
 }
 
 fn split_mem_proc(area: Rect) -> (Rect, Rect) {
-    let mem_w = ((area.width * 42) / 100).clamp(32, 80);
+    let mem_w = u16::try_from((u32::from(area.width) * 42 / 100).clamp(32, 80)).unwrap_or(80);
     let proc_w = area.width.saturating_sub(mem_w);
     (
         Rect {
@@ -285,7 +356,7 @@ pub fn render_frame(
         cpu_box::render_cpu_box(&mut grid, rect, snapshot, history, config, &theme);
     }
     if let Some(rect) = mem_rect {
-        mem_box::render_mem_box(&mut grid, rect, snapshot, history, config, &theme);
+        mem_box::render_mem_box(&mut grid, rect, snapshot, history, state, config, &theme);
     }
     if let Some(rect) = proc_rect {
         proc_box::render_proc_box(&mut grid, rect, snapshot, &state.proc, config, &theme);

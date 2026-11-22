@@ -1,6 +1,7 @@
 //! System telemetry collectors, waitable-timer sampler, and pure delta mathematics.
 
 pub mod cpu;
+pub mod disk;
 pub mod mem;
 pub mod proc;
 pub mod replay;
@@ -12,6 +13,10 @@ use thiserror::Error;
 pub use cpu::{
     CpuCollector, FreqMode, LiveCollector, RunQueueEwma, classify_core_kinds, compute_cpu_deltas,
     compute_cpu_deltas_with_kinds, compute_frequency_mhz,
+};
+pub use disk::{
+    DiskCollector, build_disk_snapshots, compute_disk_busy_pct, compute_disk_io_rates,
+    extract_drive_letter, matches_disks_filter,
 };
 pub use mem::{MemoryCollector, compute_mem_snapshot, pagefile_pages_to_bytes};
 pub use proc::{ProcessCollector, ProcessDeltaTracker};

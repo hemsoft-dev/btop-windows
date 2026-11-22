@@ -4,11 +4,12 @@ use btop_config::Config;
 use btop_model::{DataState, MemSnapshot, Snapshot};
 use btop_term::{Cell, Grid, HitAction, Rect};
 
-use crate::UiHistory;
+use crate::disk_view::{render_disk_io_mode, render_disks_subpanel};
 use crate::theme::{GradientStops, ThemePalette};
 use crate::widgets::{
     draw_border_tag, draw_box_frame, draw_graph_with_gradient, draw_meter_with_gradient, fill_rect,
 };
+use crate::{UiHistory, UiState};
 
 /// Formats a byte count using either binary IEC units (`base_10 = false`: KiB/MiB/GiB/TiB)
 /// or decimal SI units (`base_10 = true`: KB/MB/GB/TB).
@@ -69,12 +70,13 @@ pub fn ratio_percent(part: u64, total: u64) -> f32 {
     ((part as f64 / total as f64) * 100.0).clamp(0.0, 100.0) as f32
 }
 
-/// Renders the full memory box (`2` / `mem`) into `rect`.
+/// Renders the full memory box (`2` / `mem`) with optional Disks split (`d`) or Disk I/O mode (`i`).
 pub fn render_mem_box(
     grid: &mut Grid,
     rect: Rect,
     snapshot: &Snapshot,
     history: &UiHistory,
+    state: &UiState,
     config: &Config,
     theme: &ThemePalette,
 ) {
@@ -90,7 +92,7 @@ pub fn render_mem_box(
         theme.main_bg,
         config.rounded_corners,
     );
-    render_mem_chrome(grid, rect, snapshot, config, theme);
+    render_mem_chrome(grid, rect, snapshot, state, config, theme);
 
     let inner = Rect {
         x: rect.x.saturating_add(1),
@@ -99,18 +101,25 @@ pub fn render_mem_box(
         height: rect.height.saturating_sub(2),
     };
 
+    if state.io_mode {
+        render_disk_io_mode(grid, inner, snapshot, history, config, theme);
+        return;
+    }
+
+    let (mem_area, disks_area) = split_mem_and_disks(inner, state.show_disks);
+
     match &snapshot.mem {
         DataState::Available(mem) => {
-            render_mem_body(grid, inner, mem, history, config, theme, None);
+            render_mem_body(grid, mem_area, mem, history, config, theme, None);
         }
         DataState::Stale { value, age_ms } => {
             let note = format!("stale {age_ms}ms");
-            render_mem_body(grid, inner, value, history, config, theme, Some(&note));
+            render_mem_body(grid, mem_area, value, history, config, theme, Some(&note));
         }
         DataState::WarmingUp => {
             grid.write_str(
-                inner.x + 1,
-                inner.y + 1,
+                mem_area.x + 1,
+                mem_area.y + 1,
                 "Memory warming up...",
                 theme.inactive_fg,
                 theme.main_bg,
@@ -119,8 +128,8 @@ pub fn render_mem_box(
         }
         DataState::Denied => {
             grid.write_str(
-                inner.x + 1,
-                inner.y + 1,
+                mem_area.x + 1,
+                mem_area.y + 1,
                 "Memory telemetry access denied",
                 theme.hi_fg,
                 theme.main_bg,
@@ -131,11 +140,11 @@ pub fn render_mem_box(
             let msg = format!("Memory unavailable: {reason}");
             let clipped: String = msg
                 .chars()
-                .take(usize::from(inner.width.saturating_sub(2)))
+                .take(usize::from(mem_area.width.saturating_sub(2)))
                 .collect();
             grid.write_str(
-                inner.x + 1,
-                inner.y + 1,
+                mem_area.x + 1,
+                mem_area.y + 1,
                 &clipped,
                 theme.inactive_fg,
                 theme.main_bg,
@@ -143,19 +152,119 @@ pub fn render_mem_box(
             );
         }
     }
+
+    if let Some((div_rect, horizontal_div, disk_rect)) = disks_area {
+        if horizontal_div {
+            for dx in 0..div_rect.width {
+                grid.set(
+                    div_rect.x.saturating_add(dx),
+                    div_rect.y,
+                    Cell {
+                        ch: '─',
+                        fg: theme.div_line,
+                        bg: theme.main_bg,
+                        bold: false,
+                        continuation: false,
+                    },
+                );
+            }
+        } else {
+            for dy in 0..div_rect.height {
+                grid.set(
+                    div_rect.x,
+                    div_rect.y.saturating_add(dy),
+                    Cell {
+                        ch: '│',
+                        fg: theme.div_line,
+                        bg: theme.main_bg,
+                        bold: false,
+                        continuation: false,
+                    },
+                );
+            }
+        }
+        render_disks_subpanel(grid, disk_rect, snapshot, config, theme);
+    }
+}
+
+/// Splits `inner` between memory stats and local fixed disks when `show_disks` is enabled.
+/// Returns `(mem_rect, Option<(divider_rect, is_horizontal_divider, disks_rect)>)`.
+fn split_mem_and_disks(inner: Rect, show_disks: bool) -> (Rect, Option<(Rect, bool, Rect)>) {
+    if !show_disks {
+        return (inner, None);
+    }
+    if inner.width >= 58 {
+        let mem_w = u16::try_from((u32::from(inner.width) * 52) / 100).unwrap_or(inner.width / 2);
+        let div_x = inner.x.saturating_add(mem_w);
+        let disk_w = inner.width.saturating_sub(mem_w).saturating_sub(1);
+        if disk_w >= 22 {
+            return (
+                Rect {
+                    width: mem_w,
+                    ..inner
+                },
+                Some((
+                    Rect {
+                        x: div_x,
+                        y: inner.y,
+                        width: 1,
+                        height: inner.height,
+                    },
+                    false,
+                    Rect {
+                        x: div_x.saturating_add(1),
+                        y: inner.y,
+                        width: disk_w,
+                        height: inner.height,
+                    },
+                )),
+            );
+        }
+    }
+    if inner.height >= 16 {
+        let disk_h = (inner.height / 3).clamp(5, 10);
+        let mem_h = inner.height.saturating_sub(disk_h).saturating_sub(1);
+        if mem_h >= 8 {
+            let div_y = inner.y.saturating_add(mem_h);
+            return (
+                Rect {
+                    height: mem_h,
+                    ..inner
+                },
+                Some((
+                    Rect {
+                        x: inner.x,
+                        y: div_y,
+                        width: inner.width,
+                        height: 1,
+                    },
+                    true,
+                    Rect {
+                        x: inner.x,
+                        y: div_y.saturating_add(1),
+                        width: inner.width,
+                        height: disk_h,
+                    },
+                )),
+            );
+        }
+    }
+    (inner, None)
 }
 
 fn render_mem_chrome(
     grid: &mut Grid,
     rect: Rect,
     snapshot: &Snapshot,
+    state: &UiState,
     config: &Config,
     theme: &ThemePalette,
 ) {
     let right_limit = rect.x.saturating_add(rect.width.saturating_sub(1));
+    let mut cursor = rect.x.saturating_add(2);
     if let Some(tag_rect) = draw_border_tag(
         grid,
-        rect.x.saturating_add(2),
+        cursor,
         rect.y,
         right_limit,
         Some('²'),
@@ -167,26 +276,77 @@ fn render_mem_chrome(
     ) {
         grid.hit_map
             .push(tag_rect, HitAction::ToggleBox("mem".to_owned()));
+        cursor = tag_rect.x.saturating_add(tag_rect.width).saturating_add(1);
     }
 
-    let total_label = match &snapshot.mem {
-        DataState::Available(mem) => {
-            format!(
-                "Total: {}",
-                format_mem_bytes(mem.total_bytes, config.base_10_sizes)
-            )
+    let total_label = if state.io_mode {
+        "Disk I/O".to_owned()
+    } else {
+        match &snapshot.mem {
+            DataState::Available(mem) => {
+                format!(
+                    "Total: {}",
+                    format_mem_bytes(mem.total_bytes, config.base_10_sizes)
+                )
+            }
+            DataState::Stale { value, age_ms } => format!(
+                "Total: {} [stale {}ms]",
+                format_mem_bytes(value.total_bytes, config.base_10_sizes),
+                age_ms
+            ),
+            _ => String::new(),
         }
-        DataState::Stale { value, age_ms } => format!(
-            "Total: {} [stale {}ms]",
-            format_mem_bytes(value.total_bytes, config.base_10_sizes),
-            age_ms
-        ),
-        _ => String::new(),
     };
+    let right_reserved = if total_label.is_empty() {
+        0
+    } else {
+        u16::try_from(total_label.chars().count() + 3).unwrap_or(0)
+    };
+    let mid_limit = right_limit.saturating_sub(right_reserved);
+
+    // Compact `[d]isks` and `[i]o` mode indicators in top chrome when space permits.
+    let disks_fg = if state.show_disks && !state.io_mode {
+        theme.hi_fg
+    } else {
+        theme.inactive_fg
+    };
+    if let Some(d_rect) = draw_border_tag(
+        grid,
+        cursor,
+        rect.y,
+        mid_limit,
+        Some('d'),
+        "isks",
+        theme.mem_box,
+        disks_fg,
+        theme.hi_fg,
+        theme.main_bg,
+    ) {
+        cursor = d_rect.x.saturating_add(d_rect.width).saturating_add(1);
+    }
+    let io_fg = if state.io_mode {
+        theme.hi_fg
+    } else {
+        theme.inactive_fg
+    };
+    if let Some(i_rect) = draw_border_tag(
+        grid,
+        cursor,
+        rect.y,
+        mid_limit,
+        Some('i'),
+        "o",
+        theme.mem_box,
+        io_fg,
+        theme.hi_fg,
+        theme.main_bg,
+    ) {
+        cursor = i_rect.x.saturating_add(i_rect.width).saturating_add(1);
+    }
+
     if !total_label.is_empty() {
         let tag_width = u16::try_from(total_label.chars().count() + 2).unwrap_or(0);
-        let min_x = rect.x.saturating_add(9);
-        if right_limit > min_x.saturating_add(tag_width) {
+        if right_limit > cursor.saturating_add(tag_width) {
             let tag_x = right_limit.saturating_sub(tag_width);
             let _ = draw_border_tag(
                 grid,
@@ -799,6 +959,7 @@ mod tests {
             shown_boxes: "mem".to_owned(),
             mem_graphs: true,
             show_swap: true,
+            show_disks: false,
             base_10_sizes: false,
             ..Config::default()
         };
@@ -821,6 +982,7 @@ mod tests {
             shown_boxes: "mem".to_owned(),
             mem_graphs: false,
             show_swap: false,
+            show_disks: false,
             base_10_sizes: true,
             ..Config::default()
         };

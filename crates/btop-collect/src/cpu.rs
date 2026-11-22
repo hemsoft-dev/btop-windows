@@ -12,6 +12,7 @@ use btop_sys::{
     total_physical_memory_bytes,
 };
 
+use crate::disk::DiskCollector;
 use crate::math::cpu_busy_percent;
 use crate::mem::MemoryCollector;
 use crate::proc::ProcessCollector;
@@ -302,7 +303,7 @@ impl CpuCollector {
 }
 
 /// Live Windows 11 snapshot source producing CPU (with P/E topology, PDH frequency/utility,
-/// and `RunQ` EWMA), memory/commit/pagefile/cache, and read-only process snapshots on each tick.
+/// and `RunQ` EWMA), memory/commit/pagefile/cache, local fixed disks/I/O, and process snapshots.
 #[derive(Debug)]
 pub struct LiveCollector {
     hostname: String,
@@ -310,6 +311,7 @@ pub struct LiveCollector {
     total_phys_mem: Option<u64>,
     cpu: CpuCollector,
     mem: MemoryCollector,
+    disks: DiskCollector,
     procs: ProcessCollector,
     runq: RunQueueEwma,
     last_runq_instant: Option<Instant>,
@@ -329,6 +331,9 @@ impl LiveCollector {
             .unwrap_or_else(|_| "user".to_owned());
         let cpu = CpuCollector::with_freq_mode(freq_mode)?;
         let mem = MemoryCollector::new();
+        let mut disks = DiskCollector::new();
+        // Prime physical disk I/O baseline so the first displayed tick has live rates.
+        let _ = disks.sample();
         let mut procs = ProcessCollector::new();
         // Prime baseline process CPU timestamps so the first displayed tick has real deltas.
         let _ = procs.sample_with_runnable(cpu.prev.len().max(1));
@@ -338,6 +343,7 @@ impl LiveCollector {
             total_phys_mem: total_physical_memory_bytes(),
             cpu,
             mem,
+            disks,
             procs,
             runq: RunQueueEwma::default(),
             last_runq_instant: None,
@@ -362,6 +368,11 @@ impl SnapshotSource for LiveCollector {
                 self.total_phys_mem = Some(mem_snap.total_bytes);
                 DataState::Available(mem_snap)
             }
+            Err(err) => DataState::Unavailable(err.to_string()),
+        };
+
+        let disks = match self.disks.sample() {
+            Ok(list) => DataState::Available(list),
             Err(err) => DataState::Unavailable(err.to_string()),
         };
 
@@ -391,6 +402,7 @@ impl SnapshotSource for LiveCollector {
             total_phys_mem_bytes: self.total_phys_mem,
             cpu: DataState::Available(cpu_snapshot),
             mem,
+            disks,
             processes,
             ..Snapshot::default()
         })
