@@ -29,6 +29,9 @@ pub enum CollectError {
 /// Trait implemented by live Windows collectors and deterministic replay fixtures.
 pub trait SnapshotSource: Send {
     fn next_snapshot(&mut self) -> Result<Snapshot, CollectError>;
+
+    /// Updates the live frequency aggregation mode (e.g., on `Ctrl+R` config reload).
+    fn set_freq_mode(&mut self, _mode: FreqMode) {}
 }
 
 /// Pure, platform-independent delta math tested on every CI target.

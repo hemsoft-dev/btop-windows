@@ -37,6 +37,26 @@ impl FreqMode {
             _ => Self::Average,
         }
     }
+
+    pub const fn to_u8(self) -> u8 {
+        match self {
+            Self::First => 0,
+            Self::Range => 1,
+            Self::Lowest => 2,
+            Self::Highest => 3,
+            Self::Average => 4,
+        }
+    }
+
+    pub const fn from_u8(raw: u8) -> Self {
+        match raw {
+            0 => Self::First,
+            1 => Self::Range,
+            2 => Self::Lowest,
+            3 => Self::Highest,
+            _ => Self::Average,
+        }
+    }
 }
 
 /// Maps Windows `EfficiencyClass` bytes to [`CoreKind`].
@@ -137,6 +157,16 @@ impl RunQueueEwma {
             self.values[2] as f32,
         ]
     }
+
+    /// Returns the last computed EWMA values, if at least one sample has succeeded.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn current(&self) -> Option<[f32; 3]> {
+        self.initialized.then_some([
+            self.values[0] as f32,
+            self.values[1] as f32,
+            self.values[2] as f32,
+        ])
+    }
 }
 
 /// Computes per-core and aggregate CPU percentages from two consecutive
@@ -225,6 +255,11 @@ impl CpuCollector {
             pdh,
             prev,
         })
+    }
+
+    /// Updates the frequency aggregation mode used on subsequent samples.
+    pub fn set_freq_mode(&mut self, mode: FreqMode) {
+        self.freq_mode = mode;
     }
 
     /// Queries the next CPU delta snapshot (falling back cleanly to `None` if PDH is unavailable).
@@ -318,17 +353,23 @@ impl SnapshotSource for LiveCollector {
         let mut cpu_snapshot = self.cpu.sample()?;
         let logical_cpus = cpu_snapshot.cores.len().max(1);
 
-        let dt_secs = self.last_runq_instant.map_or(0.0, |prev| {
-            now.saturating_duration_since(prev).as_secs_f64()
-        });
-        self.last_runq_instant = Some(now);
-
         let processes = match self.procs.sample_with_runnable(logical_cpus) {
             Ok((list, runnable)) => {
+                let dt_secs = self.last_runq_instant.map_or(0.0, |prev| {
+                    now.saturating_duration_since(prev).as_secs_f64()
+                });
+                self.last_runq_instant = Some(now);
                 cpu_snapshot.run_queue_ewma = self.runq.update(runnable, dt_secs);
                 DataState::Available(list)
             }
-            Err(err) => DataState::Unavailable(err.to_string()),
+            Err(err) => {
+                // Preserve retained RunQ EWMA across transient process-query failures and do not
+                // advance `last_runq_instant`, so recovery measures true elapsed time since last update.
+                if let Some(retained) = self.runq.current() {
+                    cpu_snapshot.run_queue_ewma = retained;
+                }
+                DataState::Unavailable(err.to_string())
+            }
         };
 
         Ok(Snapshot {
@@ -340,6 +381,10 @@ impl SnapshotSource for LiveCollector {
             processes,
             ..Snapshot::default()
         })
+    }
+
+    fn set_freq_mode(&mut self, mode: FreqMode) {
+        self.cpu.set_freq_mode(mode);
     }
 }
 
@@ -472,5 +517,12 @@ mod tests {
         if let Some(mhz) = snap.freq_mhz {
             assert!(mhz > 100, "unexpectedly low live freq_mhz: {mhz}");
         }
+        // Verify variable-sized RelationProcessorCore records actually populated every logical processor.
+        let classes = query_core_efficiency_classes();
+        assert_eq!(
+            classes.len(),
+            snap.cores.len(),
+            "RelationProcessorCore must cover all logical processors"
+        );
     }
 }

@@ -383,7 +383,7 @@ mod win {
     };
     use windows_sys::Win32::System::SystemInformation::{
         GetLogicalProcessorInformationEx, GetSystemInfo, GetTickCount64, GlobalMemoryStatusEx,
-        MEMORYSTATUSEX, RelationProcessorCore, SYSTEM_INFO,
+        MEMORYSTATUSEX, PROCESSOR_RELATIONSHIP, RelationProcessorCore, SYSTEM_INFO,
         SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
     };
     use windows_sys::Win32::System::Threading::{
@@ -653,25 +653,33 @@ mod win {
 
         let total_len = (actual_bytes as usize).min(raw.len() * size_of::<u64>());
         let base_ptr = raw.as_ptr().cast::<u8>();
-        let min_record_size = size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>();
+        // `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX` records are variable-sized:
+        // an 8-byte header (`Relationship: i32`, `Size: u32`) followed by the active union payload.
+        // Single-group `RelationProcessorCore` records are 48 bytes on x64 (smaller than the 80-byte union).
+        let header_size = size_of::<i32>() + size_of::<u32>();
+        let min_proc_record_size = header_size + size_of::<PROCESSOR_RELATIONSHIP>();
         let mut classes = Vec::new();
         let mut offset = 0usize;
 
-        while offset.saturating_add(min_record_size) <= total_len {
-            // SAFETY: `offset + min_record_size <= total_len` and unaligned read handles any record stride.
-            let rec = unsafe {
-                base_ptr
-                    .add(offset)
-                    .cast::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>()
-                    .read_unaligned()
-            };
-            let rec_size = rec.Size as usize;
-            if rec_size < min_record_size || offset.saturating_add(rec_size) > total_len {
+        while offset.saturating_add(header_size) <= total_len {
+            // SAFETY: `offset + 8 <= total_len`; unaligned reads handle any record stride.
+            #[allow(clippy::cast_ptr_alignment)]
+            let relationship = unsafe { base_ptr.add(offset).cast::<i32>().read_unaligned() };
+            #[allow(clippy::cast_ptr_alignment)]
+            let rec_size =
+                unsafe { base_ptr.add(offset + 4).cast::<u32>().read_unaligned() } as usize;
+            if rec_size < header_size || offset.saturating_add(rec_size) > total_len {
                 break;
             }
-            if rec.Relationship == RelationProcessorCore {
-                // SAFETY: `Relationship == RelationProcessorCore` activates the `Processor` union arm.
-                let proc_rel = unsafe { rec.Anonymous.Processor };
+            if relationship == RelationProcessorCore && rec_size >= min_proc_record_size {
+                // SAFETY: `offset + header_size + size_of::<PROCESSOR_RELATIONSHIP>() <= offset + rec_size <= total_len`.
+                #[allow(clippy::cast_ptr_alignment)]
+                let proc_rel = unsafe {
+                    base_ptr
+                        .add(offset + header_size)
+                        .cast::<PROCESSOR_RELATIONSHIP>()
+                        .read_unaligned()
+                };
                 let eff_class = proc_rel.EfficiencyClass;
                 if proc_rel.GroupCount > 0 {
                     let group = proc_rel.GroupMask[0];

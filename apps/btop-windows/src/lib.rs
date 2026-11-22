@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use btop_collect::{CollectError, Sampler, SnapshotSource};
+use btop_collect::{CollectError, FreqMode, Sampler, SnapshotSource};
 use btop_config::{Config, ConfigError};
 use btop_model::{DataState, RecordStats, SnapshotRecorder};
 use btop_term::{
@@ -250,6 +250,7 @@ fn handle_tui_event(
             if let Ok(reloaded) = load_config(config_path, overrides) {
                 *config = reloaded;
                 config.update_ms = sampler.set_update_ms(config.update_ms);
+                sampler.set_freq_mode(FreqMode::from_config_str(&config.freq_mode));
                 *ui_state = UiState::from_config(config);
                 *prev_grid = None;
                 return true;

@@ -26,6 +26,10 @@ mod win {
     use super::CpuPdhSample;
 
     const ERROR_SUCCESS_U32: u32 = 0;
+    /// From Windows SDK `pdh.h` (`#define PDH_FMT_NOCAP100 ((DWORD) 0x00008000)`):
+    /// allows percentage counters like `% Processor Performance` and `% Processor Utility`
+    /// to exceed 100% during turbo boost.
+    const PDH_FMT_NOCAP100: u32 = 0x0000_8000;
 
     /// Single shared `PDH_HQUERY` collecting `% Processor Performance` and `% Processor Utility`.
     ///
@@ -135,7 +139,12 @@ mod win {
         // SAFETY: `PDH_FMT_COUNTERVALUE` is plain-old-data filled by PDH.
         let mut val: PDH_FMT_COUNTERVALUE = unsafe { core::mem::zeroed() };
         let status = unsafe {
-            PdhGetFormattedCounterValue(counter, PDH_FMT_DOUBLE, ptr::null_mut(), &raw mut val)
+            PdhGetFormattedCounterValue(
+                counter,
+                PDH_FMT_DOUBLE | PDH_FMT_NOCAP100,
+                ptr::null_mut(),
+                &raw mut val,
+            )
         };
         if status != ERROR_SUCCESS_U32 {
             return None;
@@ -149,13 +158,15 @@ mod win {
     }
 
     fn read_perf_array(counter: PDH_HCOUNTER) -> Vec<f64> {
+        let fmt = PDH_FMT_DOUBLE | PDH_FMT_NOCAP100;
         let mut buf_size = 0u32;
         let mut item_count = 0u32;
-        // SAFETY: Querying required byte size for formatted counter array.
+        // SAFETY: Querying required byte size for formatted counter array with `PDH_FMT_NOCAP100`
+        // so turbo frequencies above 100% nominal performance are preserved.
         let first = unsafe {
             PdhGetFormattedCounterArrayW(
                 counter,
-                PDH_FMT_DOUBLE,
+                fmt,
                 &raw mut buf_size,
                 &raw mut item_count,
                 ptr::null_mut(),
@@ -174,7 +185,7 @@ mod win {
         let status = unsafe {
             PdhGetFormattedCounterArrayW(
                 counter,
-                PDH_FMT_DOUBLE,
+                fmt,
                 &raw mut actual_bytes,
                 &raw mut count,
                 raw.as_mut_ptr().cast::<PDH_FMT_COUNTERVALUE_ITEM_W>(),
