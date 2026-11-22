@@ -20,12 +20,12 @@ expression: rendered
 ╰─┐WIN11-HYBRID16 | +/- cadence | Ctrl+R reload | q quit┌──────────────────────────────────────────────────────────────╯
 ╭─┐²mem┌─┐disks┌─┐io┌───────────┐Total: 64.0 GiB┌╮╭─┐⁴svc┌─┐S:proc┌───────────────────────────────┐< state ↓ >┌──┐1/5┌─╮
 │ RAM ■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■ ││ SCM Controls: [s] Start [x] Stop ENABLED (Administrator)           │
-│ Used  ■■■■■■■■■■■■■■■■■■■■■■■■■■ 26.2 GiB  41% ││ Service              State          Start       PID      Mem   CPU%│
-│ Avail ■■■■■■■■■■■■■■■■■■■■■■■■■■ 37.8 GiB  59% ││ Spooler              ~Start Pending Auto       4216 1.42 GiB   12.8│
-│ Cache ■■■■■■■■■■■■■■■■■■■■■■■■■■ 11.0 GiB  17% ││ wuauserv             ~Stop Pending  Manual     4216 1.42 GiB   12.8│
-│ Free  ■■■■■■■■■■■■■■■■■■■■■■■■■■ 26.8 GiB  42% ││ EventLog             Running        Auto        720 8.00 MiB    0.6│
-│                                                ││ W32Time              Running        Auto        720 8.00 MiB    0.6│
-│                                                ││ Fax                  Stopped        Disabled      -        -      -│
+│ Used  ■■■■■■■■■■■■■■■■■■■■■■■■■■ 26.2 GiB  41% ││ Service             State          Start       PID      Mem   CPU% │
+│ Avail ■■■■■■■■■■■■■■■■■■■■■■■■■■ 37.8 GiB  59% ││ Spooler             ~Start Pending Auto       4216 1.42 GiB   12.8 │
+│ Cache ■■■■■■■■■■■■■■■■■■■■■■■■■■ 11.0 GiB  17% ││ wuauserv            ~Stop Pending  Manual     4216 1.42 GiB   12.8 │
+│ Free  ■■■■■■■■■■■■■■■■■■■■■■■■■■ 26.8 GiB  42% ││ EventLog            Running        Auto        720 8.00 MiB    0.6 │
+│                                                ││ W32Time             Running        Auto        720 8.00 MiB    0.6 │
+│                                                ││ Fax                 Stopped        Disabled      -        -      - │
 │────────────────────────────────────────────────││                                                                    │
 │ Commit ■■■■■■■■■■■■■■■■ 31.2 GiB/72.0 GiB  43% ││                                                                    │
 │ Swap   ■■■■■■■■■■■■■■■■ 1.00 GiB/8.00 GiB  12% ││                                                                    │

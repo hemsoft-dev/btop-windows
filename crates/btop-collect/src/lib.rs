@@ -55,6 +55,14 @@ pub trait SnapshotSource: Send {
     /// Requests an immediate SCM re-poll on the next tick (e.g., after Start or Stop).
     fn request_services_refresh(&mut self) {}
 
+    /// Polls Windows Services on demand without running a full telemetry tick so the Services
+    /// view stays on its 2.5s cadence regardless of `update_ms`.
+    fn poll_services_only(
+        &mut self,
+    ) -> Option<btop_model::DataState<Vec<btop_model::ServiceEntry>>> {
+        None
+    }
+
     /// Returns `true` only for live host telemetry sources where mutating OS process actions
     /// (`WM_CLOSE`, `TerminateProcess`, `SetPriorityClass`) are authorized. Replay and stub
     /// sources default to `false` (fail-closed).

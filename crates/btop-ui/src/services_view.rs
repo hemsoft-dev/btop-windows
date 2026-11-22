@@ -608,7 +608,7 @@ fn render_services_table(
     }
 
     let cols = ServiceColumns::for_width(usize::from(inner.width));
-    render_header_row(grid, inner.x, cur_y, cols, view, theme);
+    render_header_row(grid, inner.x, cur_y, inner.width, cols, view, theme);
     cur_y = cur_y.saturating_add(1);
 
     let body_rows = usize::from(inner.y.saturating_add(inner.height).saturating_sub(cur_y));
@@ -659,14 +659,27 @@ struct ServiceColumns {
 
 impl ServiceColumns {
     fn for_width(total_w: usize) -> Self {
-        let state = 14;
-        let start = 8;
-        let pid = 6;
-        let cpu = 6;
-        let mem = if total_w >= 58 { 8 } else { 0 };
+        // Reserve 1 cell padding on left and right; visible columns + separators never exceed `usable`.
+        let usable = total_w.saturating_sub(2);
+        let state = if usable >= 24 { 14 } else { 9.min(usable / 2) };
+        let mut used = state;
+        let min_name = 8usize;
 
-        let fixed = state + 1 + start + 1 + pid + 1 + if mem > 0 { mem + 1 } else { 0 } + cpu + 2; // leading + trailing padding
-        let flex = total_w.saturating_sub(fixed);
+        let take_col = |used: &mut usize, width: usize, min_remaining: usize| -> usize {
+            if usable >= *used + 1 + width + min_remaining {
+                *used += 1 + width;
+                width
+            } else {
+                0
+            }
+        };
+
+        let cpu = take_col(&mut used, 6, min_name);
+        let pid = take_col(&mut used, 6, min_name);
+        let start = take_col(&mut used, 8, min_name);
+        let mem = take_col(&mut used, 8, 10);
+
+        let flex = usable.saturating_sub(used + 1);
         if flex >= 28 {
             let name = (flex * 38 / 100).clamp(12, 24);
             let display = flex.saturating_sub(name + 1);
@@ -681,7 +694,7 @@ impl ServiceColumns {
             }
         } else {
             Self {
-                name: flex.max(8),
+                name: flex.max(1),
                 display: 0,
                 state,
                 start,
@@ -693,14 +706,43 @@ impl ServiceColumns {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn write_panel_col(
+    grid: &mut Grid,
+    cx: &mut u16,
+    y: u16,
+    panel_right: u16,
+    col_w: usize,
+    text: &str,
+    right_align: bool,
+    fg: Color,
+    bg: Color,
+    bold: bool,
+) {
+    if col_w == 0 || *cx >= panel_right {
+        return;
+    }
+    let avail = usize::from(panel_right - *cx).min(col_w);
+    let clipped = clip_text(text, avail);
+    let formatted = if right_align {
+        format!("{clipped:>avail$}")
+    } else {
+        format!("{clipped:<avail$}")
+    };
+    grid.write_str(*cx, y, &formatted, fg, bg, bold);
+    *cx = cx.saturating_add(u16::try_from(col_w + 1).unwrap_or(0));
+}
+
 fn render_header_row(
     grid: &mut Grid,
     x: u16,
     y: u16,
+    width: u16,
     cols: ServiceColumns,
     view: &ServiceViewState,
     theme: &ThemePalette,
 ) {
+    let panel_right = x.saturating_add(width);
     let mut cx = x.saturating_add(1);
     let col_fg = |sort: ServiceSort| {
         if view.sort == sort {
@@ -709,88 +751,89 @@ fn render_header_row(
             theme.title
         }
     };
-
-    let name_hdr = format!("{:<w$}", clip_text("Service", cols.name), w = cols.name);
-    grid.write_str(
-        cx,
+    let bg = theme.main_bg;
+    write_panel_col(
+        grid,
+        &mut cx,
         y,
-        &name_hdr,
+        panel_right,
+        cols.name,
+        "Service",
+        false,
         col_fg(ServiceSort::Name),
-        theme.main_bg,
+        bg,
         true,
     );
-    cx = cx.saturating_add(u16::try_from(cols.name + 1).unwrap_or(0));
-
-    if cols.display > 0 {
-        let disp_hdr = format!(
-            "{:<w$}",
-            clip_text("Display Name", cols.display),
-            w = cols.display
-        );
-        grid.write_str(
-            cx,
-            y,
-            &disp_hdr,
-            col_fg(ServiceSort::DisplayName),
-            theme.main_bg,
-            true,
-        );
-        cx = cx.saturating_add(u16::try_from(cols.display + 1).unwrap_or(0));
-    }
-
-    let state_hdr = format!("{:<w$}", "State", w = cols.state);
-    grid.write_str(
-        cx,
+    write_panel_col(
+        grid,
+        &mut cx,
         y,
-        &state_hdr,
+        panel_right,
+        cols.display,
+        "Display Name",
+        false,
+        col_fg(ServiceSort::DisplayName),
+        bg,
+        true,
+    );
+    write_panel_col(
+        grid,
+        &mut cx,
+        y,
+        panel_right,
+        cols.state,
+        "State",
+        false,
         col_fg(ServiceSort::State),
-        theme.main_bg,
+        bg,
         true,
     );
-    cx = cx.saturating_add(u16::try_from(cols.state + 1).unwrap_or(0));
-
-    let start_hdr = format!("{:<w$}", "Start", w = cols.start);
-    grid.write_str(
-        cx,
+    write_panel_col(
+        grid,
+        &mut cx,
         y,
-        &start_hdr,
+        panel_right,
+        cols.start,
+        "Start",
+        false,
         col_fg(ServiceSort::StartType),
-        theme.main_bg,
+        bg,
         true,
     );
-    cx = cx.saturating_add(u16::try_from(cols.start + 1).unwrap_or(0));
-
-    let pid_hdr = format!("{:>w$}", "PID", w = cols.pid);
-    grid.write_str(
-        cx,
+    write_panel_col(
+        grid,
+        &mut cx,
         y,
-        &pid_hdr,
+        panel_right,
+        cols.pid,
+        "PID",
+        true,
         col_fg(ServiceSort::Pid),
-        theme.main_bg,
+        bg,
         true,
     );
-    cx = cx.saturating_add(u16::try_from(cols.pid + 1).unwrap_or(0));
-
-    if cols.mem > 0 {
-        let mem_hdr = format!("{:>w$}", "Mem", w = cols.mem);
-        grid.write_str(
-            cx,
-            y,
-            &mem_hdr,
-            col_fg(ServiceSort::Memory),
-            theme.main_bg,
-            true,
-        );
-        cx = cx.saturating_add(u16::try_from(cols.mem + 1).unwrap_or(0));
-    }
-
-    let cpu_hdr = format!("{:>w$}", "CPU%", w = cols.cpu);
-    grid.write_str(
-        cx,
+    write_panel_col(
+        grid,
+        &mut cx,
         y,
-        &cpu_hdr,
+        panel_right,
+        cols.mem,
+        "Mem",
+        true,
+        col_fg(ServiceSort::Memory),
+        bg,
+        true,
+    );
+    write_panel_col(
+        grid,
+        &mut cx,
+        y,
+        panel_right,
+        cols.cpu,
+        "CPU%",
+        true,
         col_fg(ServiceSort::Cpu),
-        theme.main_bg,
+        bg,
         true,
     );
 }
@@ -861,68 +904,49 @@ fn render_service_row(
         .cpu_pct
         .map_or_else(|| "-".to_owned(), |c| format!("{c:.1}"));
 
+    let panel_right = x.saturating_add(width);
     let mut cx = x.saturating_add(1);
-    let name_cell = format!(
-        "{:<w$}",
-        clip_text(&row.entry.name, cols.name),
-        w = cols.name
-    );
-    grid.write_str(
-        cx,
-        y,
-        &name_cell,
-        base_fg,
-        row_bg,
-        is_selected || row.is_pending,
-    );
-    cx = cx.saturating_add(u16::try_from(cols.name + 1).unwrap_or(0));
-
-    if cols.display > 0 {
-        let disp_cell = format!(
-            "{:<w$}",
-            clip_text(&row.entry.display_name, cols.display),
-            w = cols.display
+    let disp_fg = if is_selected {
+        theme.selected_fg
+    } else {
+        theme.inactive_fg
+    };
+    let emph = is_selected || row.is_pending;
+    let cells = [
+        (cols.name, row.entry.name.as_str(), false, base_fg, emph),
+        (
+            cols.display,
+            row.entry.display_name.as_str(),
+            false,
+            disp_fg,
+            is_selected,
+        ),
+        (cols.state, state_text.as_str(), false, state_fg, emph),
+        (
+            cols.start,
+            row.entry.start_type.as_str(),
+            false,
+            base_fg,
+            is_selected,
+        ),
+        (cols.pid, pid_str.as_str(), true, base_fg, is_selected),
+        (cols.mem, mem_str.as_str(), true, base_fg, is_selected),
+        (cols.cpu, cpu_str.as_str(), true, base_fg, is_selected),
+    ];
+    for (col_w, text, right_align, fg, bold) in cells {
+        write_panel_col(
+            grid,
+            &mut cx,
+            y,
+            panel_right,
+            col_w,
+            text,
+            right_align,
+            fg,
+            row_bg,
+            bold,
         );
-        let disp_fg = if is_selected {
-            theme.selected_fg
-        } else {
-            theme.inactive_fg
-        };
-        grid.write_str(cx, y, &disp_cell, disp_fg, row_bg, is_selected);
-        cx = cx.saturating_add(u16::try_from(cols.display + 1).unwrap_or(0));
     }
-
-    let state_cell = format!("{:<w$}", clip_text(&state_text, cols.state), w = cols.state);
-    grid.write_str(
-        cx,
-        y,
-        &state_cell,
-        state_fg,
-        row_bg,
-        is_selected || row.is_pending,
-    );
-    cx = cx.saturating_add(u16::try_from(cols.state + 1).unwrap_or(0));
-
-    let start_cell = format!(
-        "{:<w$}",
-        clip_text(&row.entry.start_type, cols.start),
-        w = cols.start
-    );
-    grid.write_str(cx, y, &start_cell, base_fg, row_bg, is_selected);
-    cx = cx.saturating_add(u16::try_from(cols.start + 1).unwrap_or(0));
-
-    let pid_cell = format!("{:>w$}", clip_text(&pid_str, cols.pid), w = cols.pid);
-    grid.write_str(cx, y, &pid_cell, base_fg, row_bg, is_selected);
-    cx = cx.saturating_add(u16::try_from(cols.pid + 1).unwrap_or(0));
-
-    if cols.mem > 0 {
-        let mem_cell = format!("{:>w$}", clip_text(&mem_str, cols.mem), w = cols.mem);
-        grid.write_str(cx, y, &mem_cell, base_fg, row_bg, is_selected);
-        cx = cx.saturating_add(u16::try_from(cols.mem + 1).unwrap_or(0));
-    }
-
-    let cpu_cell = format!("{:>w$}", clip_text(&cpu_str, cols.cpu), w = cols.cpu);
-    grid.write_str(cx, y, &cpu_cell, base_fg, row_bg, is_selected);
 }
 
 #[cfg(test)]
@@ -1120,5 +1144,55 @@ mod tests {
         let plain_enabled = elevated.to_plain_text();
         assert!(plain_enabled.contains("ENABLED (Administrator)"));
         assert!(plain_enabled.contains("s start | x stop"));
+    }
+
+    #[test]
+    fn narrow_service_panels_never_overwrite_right_border_or_adjacent_panels() {
+        let (services, procs) = sample_services_and_procs();
+        let snap = Snapshot {
+            processes: DataState::Available(procs),
+            services: DataState::Available(services),
+            ..Snapshot::default()
+        };
+        let cfg = Config::default();
+        let theme = ThemePalette::default_dark(true);
+        let view = ServiceViewState {
+            active: true,
+            is_elevated: false,
+            ..ServiceViewState::default()
+        };
+
+        for width in [24u16, 36, 48, 60, 110] {
+            let mut grid = Grid::new(Size {
+                width: 120,
+                height: 20,
+            });
+            let rect = Rect {
+                x: 4,
+                y: 2,
+                width,
+                height: 12,
+            };
+            let right_border_x = rect.x + rect.width - 1;
+            let outside_x = rect.x + rect.width;
+            for y in rect.y..rect.y + rect.height {
+                grid.write_str(outside_x, y, "#", theme.main_fg, theme.main_bg, false);
+            }
+
+            render_services_view(&mut grid, rect, &snap, &view, &cfg, &theme);
+
+            for y in (rect.y + 1)..(rect.y + rect.height - 1) {
+                assert_eq!(
+                    grid.get(right_border_x, y).map(|c| c.ch),
+                    Some('│'),
+                    "right border corrupted at panel width={width}, row={y}"
+                );
+                assert_eq!(
+                    grid.get(outside_x, y).map(|c| c.ch),
+                    Some('#'),
+                    "adjacent panel corrupted at panel width={width}, row={y}"
+                );
+            }
+        }
     }
 }

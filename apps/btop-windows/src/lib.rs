@@ -440,6 +440,9 @@ fn toggle_services_view(
     if !has_proc_panel(size, ui_state) {
         return false;
     }
+    // Always exit any active filter editor on either side so a hidden panel never traps keys.
+    ui_state.proc.end_filter_edit();
+    ui_state.services.end_filter_edit();
     let active = ui_state.services.toggle_active();
     if let Some(s) = sampler {
         s.set_services_active(active && has_proc_panel(size, ui_state));
@@ -1556,6 +1559,10 @@ mod tests {
             .expect("proc panel must render clickable S:svc tab");
         let mut prev_grid = Some(grid);
 
+        // Start editing process filter before clicking S:svc; tab switch must exit the hidden editor.
+        state.proc.begin_filter_edit();
+        assert!(state.proc.filter_editing);
+
         assert!(handle_mouse_event(
             btop_term::MouseEvent {
                 col,
@@ -1568,6 +1575,10 @@ mod tests {
             &mut prev_grid,
         ));
         assert!(state.services.active);
+        assert!(
+            !state.proc.filter_editing,
+            "switching to Services must exit hidden process filter editing"
+        );
 
         // Typing into Services filter updates `state.services.filter`, not `state.proc.filter`.
         state.services.begin_filter_edit();

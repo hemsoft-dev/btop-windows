@@ -443,6 +443,10 @@ impl SnapshotSource for LiveCollector {
         self.services.request_refresh();
     }
 
+    fn poll_services_only(&mut self) -> Option<DataState<Vec<btop_model::ServiceEntry>>> {
+        Some(self.services.sample())
+    }
+
     fn allows_live_actions(&self) -> bool {
         true
     }
