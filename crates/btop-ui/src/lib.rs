@@ -66,8 +66,19 @@ impl UiHistory {
 
     /// Appends the CPU totals from `snapshot` into the bounded history series.
     pub fn push(&mut self, snapshot: &Snapshot) {
+        self.push_with_util_mode(snapshot, false);
+    }
+
+    /// Appends CPU totals using either time-based busy % (`use_utility = false`) or
+    /// Task Manager `% Processor Utility` (`use_utility = true`).
+    pub fn push_with_util_mode(&mut self, snapshot: &Snapshot, use_utility: bool) {
         if let DataState::Available(cpu) | DataState::Stale { value: cpu, .. } = &snapshot.cpu {
-            let total = cpu.total_busy_pct.clamp(0.0, 100.0);
+            let total = if use_utility {
+                cpu.utility_pct.unwrap_or(cpu.total_busy_pct)
+            } else {
+                cpu.total_busy_pct
+            }
+            .clamp(0.0, 100.0);
             let peak = cpu
                 .cores
                 .iter()

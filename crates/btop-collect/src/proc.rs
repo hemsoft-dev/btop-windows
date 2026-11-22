@@ -89,15 +89,29 @@ impl ProcessCollector {
 
     /// Collects all running processes via a single non-elevated `NtQuerySystemInformation` call.
     pub fn sample(&mut self, logical_cpus: usize) -> Result<Vec<ProcessEntry>, CollectError> {
+        let (entries, _) = self.sample_with_runnable(logical_cpus)?;
+        Ok(entries)
+    }
+
+    /// Collects all running processes and the aggregate count of Ready/Running threads
+    /// across non-idle processes for `RunQ` EWMA computation.
+    pub fn sample_with_runnable(
+        &mut self,
+        logical_cpus: usize,
+    ) -> Result<(Vec<ProcessEntry>, u32), CollectError> {
         let now = Instant::now();
         let raw = query_process_information(&mut self.scratch).map_err(CollectError::Platform)?;
         let elapsed_100ns = self.last_sample.map_or(0, |prev| {
             u64::try_from(now.saturating_duration_since(prev).as_nanos() / 100).unwrap_or(u64::MAX)
         });
         self.last_sample = Some(now);
-        Ok(self
+        let runnable_threads = raw
+            .iter()
+            .fold(0u32, |acc, r| acc.saturating_add(r.runnable_threads));
+        let entries = self
             .tracker
-            .compute_entries(&raw, elapsed_100ns, logical_cpus))
+            .compute_entries(&raw, elapsed_100ns, logical_cpus);
+        Ok((entries, runnable_threads))
     }
 }
 
@@ -113,6 +127,7 @@ mod tests {
             kernel_time_100ns: kernel,
             user_time_100ns: user,
             threads: 4,
+            runnable_threads: 1,
             name: name.to_owned(),
             working_set_private_bytes: 8 * 1024 * 1024,
             io_read_bytes: 1024,

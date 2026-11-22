@@ -5,7 +5,11 @@
 
 #![allow(non_camel_case_types, non_snake_case)]
 
+pub mod pdh;
+
 use core::mem::{offset_of, size_of};
+
+pub use pdh::{CpuPdhQuery, CpuPdhSample};
 
 /// Matches `UNICODE_STRING` in `winternl.h` (16 bytes on 64-bit targets).
 #[repr(C)]
@@ -86,6 +90,33 @@ const _: () = {
     assert!(offset_of!(SystemProcessInformation, write_transfer_count) == 240);
 };
 
+/// Matches `SYSTEM_THREAD_INFORMATION` in `winternl.h` / `phnt` on `x86_64` Windows 11.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemThreadInformation {
+    pub kernel_time: i64,
+    pub user_time: i64,
+    pub create_time: i64,
+    pub wait_time: u32,
+    pub reserved0: u32,
+    pub start_address: usize,
+    pub client_id_unique_process: usize,
+    pub client_id_unique_thread: usize,
+    pub priority: i32,
+    pub base_priority: i32,
+    pub context_switches: u32,
+    pub thread_state: u32,
+    pub wait_reason: u32,
+    pub reserved1: u32,
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(size_of::<SystemThreadInformation>() == 80);
+    assert!(offset_of!(SystemThreadInformation, thread_state) == 68);
+    assert!(offset_of!(SystemThreadInformation, wait_reason) == 72);
+};
+
 /// Safe, owned process row decoded from a raw `SYSTEM_PROCESS_INFORMATION` buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawProcessInfo {
@@ -95,6 +126,8 @@ pub struct RawProcessInfo {
     pub kernel_time_100ns: u64,
     pub user_time_100ns: u64,
     pub threads: u32,
+    /// Number of threads in Ready (1), Running (2), or `DeferredReady` (7) state (0 for Idle PID 0).
+    pub runnable_threads: u32,
     pub name: String,
     pub working_set_private_bytes: u64,
     pub io_read_bytes: u64,
@@ -152,6 +185,34 @@ pub fn parse_process_information_buffer(raw: &[u8]) -> Result<Vec<RawProcessInfo
         let parent_pid = u32::try_from(entry.inherited_from_unique_process_id).unwrap_or(0);
         let name = decode_bounded_image_name(entry.image_name, pid, buf_start, buf_end)?;
 
+        let entry_end = if entry.next_entry_offset == 0 {
+            raw.len()
+        } else {
+            let step = usize::try_from(entry.next_entry_offset)
+                .map_err(|_| "NextEntryOffset conversion overflow".to_owned())?;
+            if step < entry_size {
+                return Err(format!(
+                    "invalid NextEntryOffset {step} smaller than entry size {entry_size}"
+                ));
+            }
+            let Some(next) = offset.checked_add(step) else {
+                return Err("NextEntryOffset addition overflow".to_owned());
+            };
+            if next >= raw.len() {
+                return Err(format!(
+                    "NextEntryOffset points outside buffer: {next} >= {}",
+                    raw.len()
+                ));
+            }
+            next
+        };
+
+        let runnable_threads = if pid == 0 {
+            0
+        } else {
+            count_runnable_threads(raw, end, entry_end, entry.number_of_threads)
+        };
+
         results.push(RawProcessInfo {
             pid,
             parent_pid,
@@ -159,6 +220,7 @@ pub fn parse_process_information_buffer(raw: &[u8]) -> Result<Vec<RawProcessInfo
             kernel_time_100ns: u64::try_from(entry.kernel_time).unwrap_or(0),
             user_time_100ns: u64::try_from(entry.user_time).unwrap_or(0),
             threads: entry.number_of_threads,
+            runnable_threads,
             name,
             working_set_private_bytes: u64::try_from(entry.working_set_private_size).unwrap_or(0),
             io_read_bytes: u64::try_from(entry.read_transfer_count).unwrap_or(0),
@@ -168,26 +230,42 @@ pub fn parse_process_information_buffer(raw: &[u8]) -> Result<Vec<RawProcessInfo
         if entry.next_entry_offset == 0 {
             break;
         }
-        let step = usize::try_from(entry.next_entry_offset)
-            .map_err(|_| "NextEntryOffset conversion overflow".to_owned())?;
-        if step < entry_size {
-            return Err(format!(
-                "invalid NextEntryOffset {step} smaller than entry size {entry_size}"
-            ));
-        }
-        let Some(next) = offset.checked_add(step) else {
-            return Err("NextEntryOffset addition overflow".to_owned());
-        };
-        if next >= raw.len() {
-            return Err(format!(
-                "NextEntryOffset points outside buffer: {next} >= {}",
-                raw.len()
-            ));
-        }
-        offset = next;
+        offset = entry_end;
     }
 
     Ok(results)
+}
+
+fn count_runnable_threads(
+    raw: &[u8],
+    threads_start: usize,
+    entry_end: usize,
+    declared_threads: u32,
+) -> u32 {
+    let thread_size = size_of::<SystemThreadInformation>();
+    if entry_end <= threads_start {
+        return 0;
+    }
+    let available = (entry_end - threads_start) / thread_size;
+    let count = usize::try_from(declared_threads)
+        .unwrap_or(0)
+        .min(available);
+    let mut runnable = 0u32;
+    for idx in 0..count {
+        let pos = threads_start + idx * thread_size;
+        // SAFETY: `pos + thread_size <= entry_end <= raw.len()`.
+        let thread = unsafe {
+            raw.as_ptr()
+                .add(pos)
+                .cast::<SystemThreadInformation>()
+                .read_unaligned()
+        };
+        // KTHREAD_STATE: 1 = Ready, 2 = Running, 7 = DeferredReady.
+        if matches!(thread.thread_state, 1 | 2 | 7) {
+            runnable = runnable.saturating_add(1);
+        }
+    }
+    runnable
 }
 
 fn decode_bounded_image_name(
@@ -297,11 +375,16 @@ mod win {
     use std::time::Duration;
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_SUCCESS, HANDLE, STATUS_INFO_LENGTH_MISMATCH, WAIT_OBJECT_0,
+        CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, GetLastError, HANDLE,
+        STATUS_INFO_LENGTH_MISMATCH, WAIT_OBJECT_0,
     };
-    use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
+    use windows_sys::Win32::System::Registry::{
+        HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegGetValueW,
+    };
     use windows_sys::Win32::System::SystemInformation::{
-        GetSystemInfo, GetTickCount64, GlobalMemoryStatusEx, MEMORYSTATUSEX, SYSTEM_INFO,
+        GetLogicalProcessorInformationEx, GetSystemInfo, GetTickCount64, GlobalMemoryStatusEx,
+        MEMORYSTATUSEX, RelationProcessorCore, SYSTEM_INFO,
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
     };
     use windows_sys::Win32::System::Threading::{
         CreateEventW, CreateWaitableTimerW, INFINITE, ResetEvent, SetEvent, SetWaitableTimer,
@@ -504,6 +587,113 @@ mod win {
         unsafe { GetTickCount64() / 1000 }
     }
 
+    /// Reads the CPU nominal base frequency in MHz from Registry `~MHz`.
+    pub fn read_cpu_nominal_mhz() -> Option<u32> {
+        let subkey: Vec<u16> = "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0\0"
+            .encode_utf16()
+            .collect();
+        let value: Vec<u16> = "~MHz\0".encode_utf16().collect();
+        let mut mhz = 0u32;
+        let mut size = u32::try_from(size_of::<u32>()).ok()?;
+        // SAFETY: Reading a 4-byte REG_DWORD into `mhz`.
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                subkey.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_DWORD,
+                ptr::null_mut(),
+                (&raw mut mhz).cast::<c_void>(),
+                &raw mut size,
+            )
+        };
+        if status == ERROR_SUCCESS && mhz > 0 {
+            Some(mhz)
+        } else {
+            None
+        }
+    }
+
+    /// Queries per-logical-processor `EfficiencyClass` via
+    /// `GetLogicalProcessorInformationEx(RelationProcessorCore)` for single-group Windows 11 CPUs (`<= 64` LPs).
+    pub fn query_core_efficiency_classes() -> Vec<u8> {
+        let mut required_bytes = 0u32;
+        // SAFETY: Querying required buffer length for `RelationProcessorCore`.
+        let first_ok = unsafe {
+            GetLogicalProcessorInformationEx(
+                RelationProcessorCore,
+                ptr::null_mut(),
+                &raw mut required_bytes,
+            )
+        };
+        if first_ok != 0 || required_bytes == 0 {
+            return Vec::new();
+        }
+        // SAFETY: Reading thread-local Win32 error code immediately after failed call.
+        if unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
+            return Vec::new();
+        }
+
+        let u64_len = (required_bytes as usize).div_ceil(size_of::<u64>());
+        let mut raw = vec![0u64; u64_len];
+        let mut actual_bytes =
+            u32::try_from(raw.len() * size_of::<u64>()).unwrap_or(required_bytes);
+        // SAFETY: `raw` is 8-byte aligned and sized for `actual_bytes`.
+        let ok = unsafe {
+            GetLogicalProcessorInformationEx(
+                RelationProcessorCore,
+                raw.as_mut_ptr()
+                    .cast::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(),
+                &raw mut actual_bytes,
+            )
+        };
+        if ok == 0 {
+            return Vec::new();
+        }
+
+        let total_len = (actual_bytes as usize).min(raw.len() * size_of::<u64>());
+        let base_ptr = raw.as_ptr().cast::<u8>();
+        let min_record_size = size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>();
+        let mut classes = Vec::new();
+        let mut offset = 0usize;
+
+        while offset.saturating_add(min_record_size) <= total_len {
+            // SAFETY: `offset + min_record_size <= total_len` and unaligned read handles any record stride.
+            let rec = unsafe {
+                base_ptr
+                    .add(offset)
+                    .cast::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>()
+                    .read_unaligned()
+            };
+            let rec_size = rec.Size as usize;
+            if rec_size < min_record_size || offset.saturating_add(rec_size) > total_len {
+                break;
+            }
+            if rec.Relationship == RelationProcessorCore {
+                // SAFETY: `Relationship == RelationProcessorCore` activates the `Processor` union arm.
+                let proc_rel = unsafe { rec.Anonymous.Processor };
+                let eff_class = proc_rel.EfficiencyClass;
+                if proc_rel.GroupCount > 0 {
+                    let group = proc_rel.GroupMask[0];
+                    if group.Group == 0 {
+                        let mask = group.Mask;
+                        for lp in 0..usize::BITS as usize {
+                            if (mask & (1usize << lp)) != 0 {
+                                if classes.len() <= lp {
+                                    classes.resize(lp + 1, 0);
+                                }
+                                classes[lp] = eff_class;
+                            }
+                        }
+                    }
+                }
+            }
+            offset = offset.saturating_add(rec_size);
+        }
+
+        classes
+    }
+
     /// Result of waiting on [`WaitableWakeTimer`].
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum TimerWake {
@@ -635,6 +825,14 @@ mod stub {
         0
     }
 
+    pub fn read_cpu_nominal_mhz() -> Option<u32> {
+        None
+    }
+
+    pub fn query_core_efficiency_classes() -> Vec<u8> {
+        Vec::new()
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum TimerWake {
         Elapsed,
@@ -702,15 +900,15 @@ mod stub {
 
 #[cfg(not(windows))]
 pub use stub::{
-    TimerWake, TimerWaker, WaitableWakeTimer, query_process_information,
-    query_processor_performance, read_cpu_model_name, system_uptime_secs,
-    total_physical_memory_bytes,
+    TimerWake, TimerWaker, WaitableWakeTimer, query_core_efficiency_classes,
+    query_process_information, query_processor_performance, read_cpu_model_name,
+    read_cpu_nominal_mhz, system_uptime_secs, total_physical_memory_bytes,
 };
 #[cfg(windows)]
 pub use win::{
-    TimerWake, TimerWaker, WaitableWakeTimer, query_process_information,
-    query_processor_performance, read_cpu_model_name, system_uptime_secs,
-    total_physical_memory_bytes,
+    TimerWake, TimerWaker, WaitableWakeTimer, query_core_efficiency_classes,
+    query_process_information, query_processor_performance, read_cpu_model_name,
+    read_cpu_nominal_mhz, system_uptime_secs, total_physical_memory_bytes,
 };
 
 #[cfg(test)]
