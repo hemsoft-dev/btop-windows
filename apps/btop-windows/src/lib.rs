@@ -6,10 +6,17 @@ use std::time::Duration;
 use btop_collect::{CollectError, FreqMode, Sampler, SnapshotSource};
 use btop_config::{Config, ConfigError};
 use btop_model::{DataState, RecordStats, SnapshotRecorder};
+use btop_sys::{
+    PriorityClass, graceful_close_process, query_process_priority, set_process_priority,
+    terminate_process,
+};
 use btop_term::{
     DiffEncoder, Grid, InputSource, KeyCode, Size, TermError, TermEvent, TerminalGuard,
 };
-use btop_ui::{BoxId, UiHistory, UiState, build_visible_rows, visible_proc_rows};
+use btop_ui::{
+    BoxId, ProcActionModal, UiHistory, UiPriorityClass, UiState, build_visible_rows,
+    is_modal_visible, modal_rect, visible_proc_rows,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -144,6 +151,7 @@ pub fn run_tui_loop(
     config_path: Option<&Path>,
     overrides: &ConfigOverrides,
 ) -> Result<u64, AppError> {
+    let allow_live_actions = source.allows_live_actions();
     let sampler = Sampler::spawn(source, config.update_ms, recorder)?;
     config.update_ms = sampler.update_ms();
     let mut guard = TerminalGuard::enter()?;
@@ -177,16 +185,20 @@ pub fn run_tui_loop(
 
             let proc_rows = visible_proc_rows(size, &ui_state);
             sync_proc_selection(&current_snapshot, &mut ui_state, proc_rows);
+            if cancel_invisible_modal(size, &mut ui_state, &mut prev_grid) {
+                dirty = true;
+            }
 
             if dirty {
-                let encoder = DiffEncoder {
-                    sync_output: config.terminal_sync,
-                };
-                let next_grid =
-                    btop_ui::render_frame(&current_snapshot, &history, &ui_state, &config, size);
-                let payload = encoder.encode(prev_grid.as_ref(), &next_grid);
-                guard.write_frame(&payload)?;
-                prev_grid = Some(next_grid);
+                render_dirty_frame(
+                    &mut guard,
+                    &current_snapshot,
+                    &history,
+                    &ui_state,
+                    &config,
+                    size,
+                    &mut prev_grid,
+                )?;
                 frames_rendered += 1;
                 dirty = false;
             }
@@ -198,7 +210,9 @@ pub fn run_tui_loop(
             match input.poll(Duration::from_millis(50))? {
                 Some(TermEvent::Key(k))
                     if k.is_ctrl_c()
-                        || (!ui_state.proc.filter_editing && k.code == KeyCode::Char('q')) =>
+                        || (!ui_state.proc.filter_editing
+                            && ui_state.modal.is_none()
+                            && k.code == KeyCode::Char('q')) =>
                 {
                     break;
                 }
@@ -215,6 +229,7 @@ pub fn run_tui_loop(
                         overrides,
                         &mut ui_state,
                         proc_rows,
+                        allow_live_actions,
                         &mut prev_grid,
                     ) {
                         dirty = true;
@@ -235,9 +250,15 @@ pub fn run_tui_loop(
     })();
 
     drop(guard);
+    finish_sampler_and_recording(sampler, run_result)?;
+    Ok(frames_rendered)
+}
 
-    let stop_result = sampler.stop();
-    let finish_result = match stop_result {
+fn finish_sampler_and_recording(
+    sampler: Sampler,
+    run_result: Result<(), AppError>,
+) -> Result<(), AppError> {
+    let finish_result = match sampler.stop() {
         Ok(Some(rec)) => Some(rec.finish()),
         Ok(None) => None,
         Err(err) => {
@@ -245,14 +266,31 @@ pub fn run_tui_loop(
             return Err(AppError::Collect(err));
         }
     };
-
     run_result?;
     if let Some(res) = finish_result {
         let stats = res?;
         check_record_stats(stats)?;
     }
+    Ok(())
+}
 
-    Ok(frames_rendered)
+fn render_dirty_frame(
+    guard: &mut TerminalGuard,
+    snapshot: &btop_model::Snapshot,
+    history: &UiHistory,
+    ui_state: &UiState,
+    config: &Config,
+    size: Size,
+    prev_grid: &mut Option<Grid>,
+) -> Result<(), AppError> {
+    let encoder = DiffEncoder {
+        sync_output: config.terminal_sync,
+    };
+    let next_grid = btop_ui::render_frame(snapshot, history, ui_state, config, size);
+    let payload = encoder.encode(prev_grid.as_ref(), &next_grid);
+    guard.write_frame(&payload)?;
+    *prev_grid = Some(next_grid);
+    Ok(())
 }
 
 fn is_utility_mode(config: &Config) -> bool {
@@ -272,9 +310,19 @@ fn handle_tui_event(
     overrides: &ConfigOverrides,
     ui_state: &mut UiState,
     proc_rows: usize,
+    allow_live_actions: bool,
     prev_grid: &mut Option<Grid>,
 ) -> bool {
     match event {
+        TermEvent::Key(k) if ui_state.modal.is_some() => handle_modal_key(
+            k.code,
+            k.ctrl,
+            k.alt,
+            *size,
+            allow_live_actions,
+            ui_state,
+            prev_grid,
+        ),
         TermEvent::Key(k) if ui_state.proc.filter_editing => {
             handle_filter_edit_key(k.code, k.ctrl, k.alt, ui_state)
         }
@@ -295,16 +343,218 @@ fn handle_tui_event(
                 return true;
             }
             handle_panel_key(
-                k.code, sampler, snapshot, history, config, ui_state, proc_rows,
+                k.code,
+                sampler,
+                snapshot,
+                history,
+                config,
+                *size,
+                ui_state,
+                proc_rows,
+                allow_live_actions,
             )
         }
-        TermEvent::Key(k) => handle_proc_key(k.code, snapshot, history, ui_state, proc_rows),
+        TermEvent::Key(k) => handle_unmodified_proc_key(
+            k.code,
+            k.ctrl,
+            k.alt,
+            snapshot,
+            history,
+            *size,
+            ui_state,
+            proc_rows,
+            allow_live_actions,
+        ),
         TermEvent::Resize(new_size) => {
             *size = guard.size().unwrap_or(new_size);
+            let _ = cancel_invisible_modal(*size, ui_state, prev_grid);
             *prev_grid = None;
             true
         }
         TermEvent::Mouse(_) => false,
+    }
+}
+
+fn cancel_invisible_modal(
+    size: Size,
+    ui_state: &mut UiState,
+    prev_grid: &mut Option<Grid>,
+) -> bool {
+    if ui_state.modal.is_some() && !is_modal_visible(size, ui_state) {
+        ui_state.modal = None;
+        *prev_grid = None;
+        return true;
+    }
+    false
+}
+
+fn try_open_modal(size: Size, ui_state: &mut UiState, modal: ProcActionModal) -> bool {
+    if modal_rect(size, &modal).is_some() {
+        let mut probe = ui_state.clone();
+        probe.modal = Some(modal.clone());
+        if is_modal_visible(size, &probe) {
+            ui_state.modal = Some(modal);
+            return true;
+        }
+    }
+    ui_state.proc.action_status =
+        Some("Terminal too small to display action dialog; resize larger".to_owned());
+    false
+}
+
+fn handle_modal_key(
+    code: KeyCode,
+    ctrl: bool,
+    alt: bool,
+    size: Size,
+    allow_live_actions: bool,
+    ui_state: &mut UiState,
+    prev_grid: &mut Option<Grid>,
+) -> bool {
+    if cancel_invisible_modal(size, ui_state, prev_grid) {
+        return true;
+    }
+    if ctrl || alt {
+        return false;
+    }
+    let Some(modal) = ui_state.modal.clone() else {
+        return false;
+    };
+    match modal {
+        ProcActionModal::ConfirmTerminate { target, name } => match code {
+            KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
+                if !allow_live_actions {
+                    ui_state.modal = None;
+                    ui_state.proc.action_status =
+                        Some("Process actions are disabled in replay mode".to_owned());
+                    *prev_grid = None;
+                    return true;
+                }
+                match terminate_process(target.pid, target.create_time_100ns) {
+                    Ok(()) => {
+                        ui_state.modal = None;
+                        ui_state.proc.action_status =
+                            Some(format!("Terminated {name} (PID {})", target.pid));
+                    }
+                    Err(err) => {
+                        ui_state.modal = Some(ProcActionModal::ActionNotice {
+                            title: "Terminate Refused".to_owned(),
+                            message: err.to_string(),
+                            is_error: true,
+                        });
+                    }
+                }
+                *prev_grid = None;
+                true
+            }
+            KeyCode::Esc | KeyCode::Char('n' | 'N') => {
+                ui_state.modal = None;
+                *prev_grid = None;
+                true
+            }
+            _ => false,
+        },
+        ProcActionModal::PrioritySelector { .. } => match code {
+            KeyCode::Up => {
+                if let Some(ref mut m) = ui_state.modal {
+                    m.move_priority_up();
+                }
+                true
+            }
+            KeyCode::Down => {
+                if let Some(ref mut m) = ui_state.modal {
+                    m.move_priority_down();
+                }
+                true
+            }
+            KeyCode::Enter => {
+                apply_priority_modal_selection(&modal, allow_live_actions, ui_state, prev_grid)
+            }
+            KeyCode::Esc => {
+                ui_state.modal = None;
+                *prev_grid = None;
+                true
+            }
+            _ => false,
+        },
+        ProcActionModal::ActionNotice { .. } => match code {
+            KeyCode::Enter | KeyCode::Esc | KeyCode::Char(' ') => {
+                ui_state.modal = None;
+                *prev_grid = None;
+                true
+            }
+            _ => false,
+        },
+    }
+}
+
+fn apply_priority_modal_selection(
+    modal: &ProcActionModal,
+    allow_live_actions: bool,
+    ui_state: &mut UiState,
+    prev_grid: &mut Option<Grid>,
+) -> bool {
+    if !allow_live_actions {
+        ui_state.modal = None;
+        ui_state.proc.action_status =
+            Some("Process actions are disabled in replay mode".to_owned());
+        *prev_grid = None;
+        return true;
+    }
+    let Some((target, name, ui_class)) = modal.selected_priority() else {
+        return false;
+    };
+    let sys_class = ui_to_sys_priority(ui_class);
+    match set_process_priority(target.pid, target.create_time_100ns, sys_class) {
+        Ok(outcome) => {
+            ui_state.modal = None;
+            let status = if outcome.applied == outcome.requested {
+                format!(
+                    "Set priority for {name} (PID {}) to {}",
+                    target.pid,
+                    outcome.applied.label()
+                )
+            } else {
+                format!(
+                    "Priority for {name} (PID {}) clamped to {} ({} requires Administrator)",
+                    target.pid,
+                    outcome.applied.label(),
+                    outcome.requested.label()
+                )
+            };
+            ui_state.proc.action_status = Some(status);
+        }
+        Err(err) => {
+            ui_state.modal = Some(ProcActionModal::ActionNotice {
+                title: "Priority Change Refused".to_owned(),
+                message: err.to_string(),
+                is_error: true,
+            });
+        }
+    }
+    *prev_grid = None;
+    true
+}
+
+const fn ui_to_sys_priority(class: UiPriorityClass) -> PriorityClass {
+    match class {
+        UiPriorityClass::Idle => PriorityClass::Idle,
+        UiPriorityClass::BelowNormal => PriorityClass::BelowNormal,
+        UiPriorityClass::Normal => PriorityClass::Normal,
+        UiPriorityClass::AboveNormal => PriorityClass::AboveNormal,
+        UiPriorityClass::High => PriorityClass::High,
+        UiPriorityClass::Realtime => PriorityClass::Realtime,
+    }
+}
+
+const fn sys_to_ui_priority(class: PriorityClass) -> UiPriorityClass {
+    match class {
+        PriorityClass::Idle => UiPriorityClass::Idle,
+        PriorityClass::BelowNormal => UiPriorityClass::BelowNormal,
+        PriorityClass::Normal => UiPriorityClass::Normal,
+        PriorityClass::AboveNormal => UiPriorityClass::AboveNormal,
+        PriorityClass::High => UiPriorityClass::High,
+        PriorityClass::Realtime => UiPriorityClass::Realtime,
     }
 }
 
@@ -346,14 +596,17 @@ fn handle_layout_key(code: KeyCode, ui_state: &mut UiState, prev_grid: &mut Opti
     changed
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_panel_key(
     code: KeyCode,
     sampler: &Sampler,
     snapshot: &btop_model::Snapshot,
     history: &mut UiHistory,
     config: &mut Config,
+    size: Size,
     ui_state: &mut UiState,
     proc_rows: usize,
+    allow_live_actions: bool,
 ) -> bool {
     match code {
         KeyCode::Char('+') => {
@@ -412,16 +665,52 @@ fn handle_panel_key(
             ui_state.net.reset_session_totals(snapshot, history);
             true
         }
-        other => handle_proc_key(other, snapshot, history, ui_state, proc_rows),
+        other => handle_proc_key(
+            other,
+            snapshot,
+            history,
+            size,
+            ui_state,
+            proc_rows,
+            allow_live_actions,
+        ),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_unmodified_proc_key(
+    code: KeyCode,
+    ctrl: bool,
+    alt: bool,
+    snapshot: &btop_model::Snapshot,
+    history: &UiHistory,
+    size: Size,
+    state: &mut UiState,
+    proc_rows: usize,
+    allow_live_actions: bool,
+) -> bool {
+    if ctrl || alt {
+        return false;
+    }
+    handle_proc_key(
+        code,
+        snapshot,
+        history,
+        size,
+        state,
+        proc_rows,
+        allow_live_actions,
+    )
 }
 
 fn handle_proc_key(
     code: KeyCode,
     snapshot: &btop_model::Snapshot,
     history: &UiHistory,
+    size: Size,
     state: &mut UiState,
     proc_rows: usize,
+    allow_live_actions: bool,
 ) -> bool {
     let active_owned = state.proc.active_processes(snapshot).map(<[_]>::to_vec);
     let rows_built = active_owned
@@ -429,52 +718,33 @@ fn handle_proc_key(
         .map(|procs| build_visible_rows(procs, &state.proc).0);
     let proc_count = rows_built.as_ref().map_or(0, Vec::len);
 
+    if handle_proc_nav_key(code, rows_built.as_deref(), proc_count, proc_rows, state) {
+        return true;
+    }
     match code {
-        KeyCode::Up => {
-            state.proc.move_up(proc_count, proc_rows);
-            if let Some(rows) = rows_built.as_deref() {
-                state.proc.sync_detail_after_navigation(rows);
-            }
-        }
-        KeyCode::Down => {
-            state.proc.move_down(proc_count, proc_rows);
-            if let Some(rows) = rows_built.as_deref() {
-                state.proc.sync_detail_after_navigation(rows);
-            }
-        }
-        KeyCode::PageUp => {
-            state.proc.page_up(proc_count, proc_rows);
-            if let Some(rows) = rows_built.as_deref() {
-                state.proc.sync_detail_after_navigation(rows);
-            }
-        }
-        KeyCode::PageDown => {
-            state.proc.page_down(proc_count, proc_rows);
-            if let Some(rows) = rows_built.as_deref() {
-                state.proc.sync_detail_after_navigation(rows);
-            }
-        }
-        KeyCode::Home => {
-            state.proc.home(proc_count, proc_rows);
-            if let Some(rows) = rows_built.as_deref() {
-                state.proc.sync_detail_after_navigation(rows);
-            }
-        }
-        KeyCode::End => {
-            state.proc.end(proc_count, proc_rows);
-            if let Some(rows) = rows_built.as_deref() {
-                state.proc.sync_detail_after_navigation(rows);
-            }
-        }
         KeyCode::Enter => {
             return rows_built
                 .as_deref()
                 .is_some_and(|rows| state.proc.toggle_detail_selected(rows, proc_rows));
         }
         KeyCode::Esc => {
-            return rows_built
+            if rows_built
                 .as_deref()
-                .is_some_and(|rows| state.proc.close_detail(rows, proc_rows));
+                .is_some_and(|rows| state.proc.close_detail(rows, proc_rows))
+            {
+                return true;
+            }
+            return state.proc.action_status.take().is_some();
+        }
+        KeyCode::Char('t' | 'k' | 'N') => {
+            return handle_proc_action_shortcut(
+                code,
+                rows_built.as_deref(),
+                size,
+                proc_rows,
+                allow_live_actions,
+                state,
+            );
         }
         KeyCode::Left => state.proc.prev_sort(),
         KeyCode::Right => state.proc.next_sort(),
@@ -513,9 +783,310 @@ fn handle_proc_key(
     true
 }
 
+fn handle_proc_nav_key(
+    code: KeyCode,
+    rows_built: Option<&[btop_ui::DisplayProcRow<'_>]>,
+    proc_count: usize,
+    proc_rows: usize,
+    state: &mut UiState,
+) -> bool {
+    match code {
+        KeyCode::Up => state.proc.move_up(proc_count, proc_rows),
+        KeyCode::Down => state.proc.move_down(proc_count, proc_rows),
+        KeyCode::PageUp => state.proc.page_up(proc_count, proc_rows),
+        KeyCode::PageDown => state.proc.page_down(proc_count, proc_rows),
+        KeyCode::Home => state.proc.home(proc_count, proc_rows),
+        KeyCode::End => state.proc.end(proc_count, proc_rows),
+        _ => return false,
+    }
+    if let Some(rows) = rows_built {
+        state.proc.sync_detail_after_navigation(rows);
+    }
+    true
+}
+
+fn handle_proc_action_shortcut(
+    code: KeyCode,
+    rows_built: Option<&[btop_ui::DisplayProcRow<'_>]>,
+    size: Size,
+    proc_rows: usize,
+    allow_live_actions: bool,
+    state: &mut UiState,
+) -> bool {
+    // Never dispatch process actions when the `proc` panel is hidden or no rows are visible.
+    if proc_rows == 0 {
+        return false;
+    }
+    let selected = state.proc.selected;
+    let visible_end = state.proc.scroll_offset.saturating_add(proc_rows);
+    if selected < state.proc.scroll_offset || selected >= visible_end {
+        return false;
+    }
+    if !allow_live_actions {
+        let notice = ProcActionModal::ActionNotice {
+            title: "Live Actions Disabled".to_owned(),
+            message: "Process actions (t, k, N) are disabled in --replay mode.".to_owned(),
+            is_error: false,
+        };
+        if !try_open_modal(size, state, notice) {
+            state.proc.action_status =
+                Some("Process actions (t, k, N) are disabled in --replay mode".to_owned());
+        }
+        return true;
+    }
+    let Some(row) = rows_built.and_then(|rows| rows.get(selected)) else {
+        return false;
+    };
+    let id = row.entry.identity;
+    let name = row.entry.name.clone();
+    match code {
+        KeyCode::Char('t') => match graceful_close_process(id.pid, id.create_time_100ns) {
+            Ok(count) => {
+                let plural = if count == 1 { "" } else { "s" };
+                state.proc.action_status = Some(format!(
+                    "Sent WM_CLOSE to {name} (PID {}, {count} window{plural})",
+                    id.pid
+                ));
+            }
+            Err(err) => {
+                let notice = ProcActionModal::ActionNotice {
+                    title: "Graceful Close Refused".to_owned(),
+                    message: err.to_string(),
+                    is_error: true,
+                };
+                if !try_open_modal(size, state, notice) {
+                    state.proc.action_status = Some(err.to_string());
+                }
+            }
+        },
+        KeyCode::Char('k') => {
+            let _ = try_open_modal(
+                size,
+                state,
+                ProcActionModal::ConfirmTerminate { target: id, name },
+            );
+            return true;
+        }
+        KeyCode::Char('N') => match query_process_priority(id.pid, id.create_time_100ns) {
+            Ok(current) => {
+                let ui_cur = sys_to_ui_priority(current);
+                let _ = try_open_modal(
+                    size,
+                    state,
+                    ProcActionModal::PrioritySelector {
+                        target: id,
+                        name,
+                        current: Some(ui_cur),
+                        selected: ui_cur.index(),
+                    },
+                );
+                return true;
+            }
+            Err(err) => {
+                let notice = ProcActionModal::ActionNotice {
+                    title: "Priority Change Refused".to_owned(),
+                    message: err.to_string(),
+                    is_error: true,
+                };
+                if !try_open_modal(size, state, notice) {
+                    state.proc.action_status = Some(err.to_string());
+                }
+            }
+        },
+        _ => return false,
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_snapshot_with_proc() -> btop_model::Snapshot {
+        btop_model::Snapshot {
+            processes: DataState::Available(vec![btop_model::ProcessEntry {
+                identity: btop_model::ProcessIdentity {
+                    pid: 4216,
+                    create_time_100ns: 1000,
+                },
+                parent_pid: 4,
+                name: "worker.exe".to_owned(),
+                image_path: None,
+                command_line: None,
+                command_line_denied: false,
+                user: None,
+                user_denied: false,
+                threads: 4,
+                cpu_pct: 5.0,
+                working_set_private_bytes: 1024,
+                io_read_bytes: 0,
+                io_write_bytes: 0,
+                is_protected: false,
+            }]),
+            ..btop_model::Snapshot::default()
+        }
+    }
+
+    #[test]
+    fn process_actions_are_disabled_when_proc_panel_is_hidden() {
+        let snap = sample_snapshot_with_proc();
+        let history = UiHistory::default();
+        let mut state = UiState::default();
+        // Hide the `proc` panel (equivalent to pressing `4`).
+        let _ = state.layout.toggle_box(BoxId::Proc);
+        let size = Size {
+            width: 120,
+            height: 40,
+        };
+        let proc_rows = visible_proc_rows(size, &state);
+        assert_eq!(proc_rows, 0);
+
+        assert!(!handle_proc_key(
+            KeyCode::Char('t'),
+            &snap,
+            &history,
+            size,
+            &mut state,
+            proc_rows,
+            true,
+        ));
+        assert!(!handle_proc_key(
+            KeyCode::Char('k'),
+            &snap,
+            &history,
+            size,
+            &mut state,
+            proc_rows,
+            true,
+        ));
+        assert!(!handle_proc_key(
+            KeyCode::Char('N'),
+            &snap,
+            &history,
+            size,
+            &mut state,
+            proc_rows,
+            true,
+        ));
+        assert!(state.modal.is_none());
+        assert!(state.proc.action_status.is_none());
+    }
+
+    #[test]
+    fn confirm_terminate_refuses_to_arm_or_fire_when_viewport_hides_modal() {
+        let snap = sample_snapshot_with_proc();
+        let history = UiHistory::default();
+        let cfg = Config {
+            shown_boxes: "proc".to_owned(),
+            ..Config::default()
+        };
+        let mut state = UiState::from_config(&cfg);
+        let tiny = Size {
+            width: 80,
+            height: 7,
+        };
+        let tiny_rows = visible_proc_rows(tiny, &state);
+        assert!(tiny_rows > 0, "80x7 proc-only layout still renders rows");
+
+        // Pressing `k` at 80x7 must NOT arm an invisible ConfirmTerminate modal.
+        let _ = handle_proc_key(
+            KeyCode::Char('k'),
+            &snap,
+            &history,
+            tiny,
+            &mut state,
+            tiny_rows,
+            true,
+        );
+        assert!(state.modal.is_none());
+        assert!(
+            state
+                .proc
+                .action_status
+                .as_deref()
+                .is_some_and(|s| s.contains("too small"))
+        );
+
+        // If armed at 120x40 and then resized to 80x7, resizing cancels the modal before `Enter` can fire.
+        let normal = Size {
+            width: 120,
+            height: 40,
+        };
+        let normal_rows = visible_proc_rows(normal, &state);
+        let _ = handle_proc_key(
+            KeyCode::Char('k'),
+            &snap,
+            &history,
+            normal,
+            &mut state,
+            normal_rows,
+            true,
+        );
+        assert!(matches!(
+            state.modal,
+            Some(ProcActionModal::ConfirmTerminate { .. })
+        ));
+
+        let mut prev = None;
+        assert!(cancel_invisible_modal(tiny, &mut state, &mut prev));
+        assert!(state.modal.is_none());
+    }
+
+    #[test]
+    fn modified_ctrl_or_alt_shortcuts_do_not_dispatch_process_actions() {
+        let snap = sample_snapshot_with_proc();
+        let history = UiHistory::default();
+        let mut state = UiState::default();
+        let size = Size {
+            width: 120,
+            height: 40,
+        };
+        let proc_rows = visible_proc_rows(size, &state);
+        assert!(proc_rows > 0);
+
+        for (code, ctrl, alt) in [
+            (KeyCode::Char('t'), true, false),
+            (KeyCode::Char('t'), false, true),
+            (KeyCode::Char('k'), true, false),
+            (KeyCode::Char('N'), false, true),
+        ] {
+            let handled = handle_unmodified_proc_key(
+                code, ctrl, alt, &snap, &history, size, &mut state, proc_rows, true,
+            );
+            assert!(!handled);
+            assert!(state.modal.is_none());
+            assert!(state.proc.action_status.is_none());
+        }
+    }
+
+    #[test]
+    fn replay_mode_blocks_mutating_process_actions() {
+        let snap = sample_snapshot_with_proc();
+        let replay =
+            btop_collect::ReplaySource::from_snapshots(vec![snap.clone()]).expect("replay source");
+        assert!(
+            !replay.allows_live_actions(),
+            "ReplaySource must be fail-closed for live process actions"
+        );
+
+        let history = UiHistory::default();
+        let mut state = UiState::default();
+        let size = Size {
+            width: 120,
+            height: 40,
+        };
+        let proc_rows = visible_proc_rows(size, &state);
+        for key in [KeyCode::Char('t'), KeyCode::Char('k'), KeyCode::Char('N')] {
+            state.modal = None;
+            assert!(handle_proc_key(
+                key, &snap, &history, size, &mut state, proc_rows, false,
+            ));
+            assert!(matches!(
+                state.modal,
+                Some(ProcActionModal::ActionNotice { ref title, .. }) if title == "Live Actions Disabled"
+            ));
+        }
+    }
 
     #[test]
     fn check_record_stats_fails_when_snapshots_were_dropped() {

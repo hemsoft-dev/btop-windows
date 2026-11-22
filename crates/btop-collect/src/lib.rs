@@ -46,6 +46,13 @@ pub trait SnapshotSource: Send {
 
     /// Updates the live frequency aggregation mode (e.g., on `Ctrl+R` config reload).
     fn set_freq_mode(&mut self, _mode: FreqMode) {}
+
+    /// Returns `true` only for live host telemetry sources where mutating OS process actions
+    /// (`WM_CLOSE`, `TerminateProcess`, `SetPriorityClass`) are authorized. Replay and stub
+    /// sources default to `false` (fail-closed).
+    fn allows_live_actions(&self) -> bool {
+        false
+    }
 }
 
 /// Pure, platform-independent delta math tested on every CI target.

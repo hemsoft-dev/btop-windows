@@ -95,6 +95,7 @@ pub struct ProcViewState {
     pub detailed: Option<ProcessIdentity>,
     pub detailed_snapshot: Option<ProcessEntry>,
     pub follow_detailed: bool,
+    pub action_status: Option<String>,
     pub per_core_cpu: bool,
     pub mem_bytes: bool,
 }
@@ -119,6 +120,7 @@ impl Default for ProcViewState {
             detailed: None,
             detailed_snapshot: None,
             follow_detailed: true,
+            action_status: None,
             per_core_cpu: false,
             mem_bytes: true,
         }
@@ -145,6 +147,7 @@ impl ProcViewState {
             detailed: None,
             detailed_snapshot: None,
             follow_detailed: config.proc_follow_detailed,
+            action_status: None,
             per_core_cpu: config.proc_per_core,
             mem_bytes: config.proc_mem_bytes,
         }
@@ -169,7 +172,8 @@ impl ProcViewState {
     pub fn extra_header_rows(&self) -> usize {
         let has_banner = self.paused || self.followed.is_some();
         let has_regex_err = compile_proc_filter(&self.filter).error_message().is_some();
-        usize::from(has_banner) + usize::from(has_regex_err)
+        let has_action = self.action_status.is_some();
+        usize::from(has_banner) + usize::from(has_regex_err) + usize::from(has_action)
     }
 
     pub fn move_up(&mut self, total: usize, visible_rows: usize) {
@@ -842,6 +846,32 @@ fn render_status_banners(
     {
         let text = clip_text(&format!(" Regex error: {err}"), usize::from(inner.width));
         grid.write_str(inner.x, y, &text, theme.hi_fg, theme.main_bg, true);
+        y = y.saturating_add(1);
+    }
+
+    if let Some(ref status) = view.action_status
+        && y < max_y
+    {
+        fill_rect(
+            grid,
+            Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 1,
+            },
+            theme.proc_banner_fg,
+            theme.proc_follow_bg,
+        );
+        let text = clip_text(&format!(" {status}"), usize::from(inner.width));
+        grid.write_str(
+            inner.x,
+            y,
+            &text,
+            theme.proc_banner_fg,
+            theme.proc_follow_bg,
+            true,
+        );
         y = y.saturating_add(1);
     }
 

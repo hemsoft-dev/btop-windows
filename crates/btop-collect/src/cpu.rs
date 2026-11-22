@@ -429,6 +429,10 @@ impl SnapshotSource for LiveCollector {
     fn set_freq_mode(&mut self, mode: FreqMode) {
         self.cpu.set_freq_mode(mode);
     }
+
+    fn allows_live_actions(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

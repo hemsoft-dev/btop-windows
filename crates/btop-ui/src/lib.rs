@@ -8,6 +8,7 @@ pub mod header;
 pub mod layout;
 pub mod mem_box;
 pub mod net_box;
+pub mod proc_actions;
 pub mod proc_box;
 pub mod proc_detail;
 pub mod proc_tree;
@@ -29,6 +30,7 @@ pub use layout::{
 };
 pub use mem_box::{format_mem_bytes, stacked_physical_segments};
 pub use net_box::{AUTO_SCALE_FLOOR_BPS, NetViewState, compute_net_scale_ceilings, format_bitrate};
+pub use proc_actions::{ProcActionModal, UiPriorityClass, modal_rect};
 pub use proc_box::{ProcSort, ProcViewState};
 pub use proc_detail::{
     detail_overlay_height, format_detail_field, format_elapsed_uptime, format_parent_label,
@@ -54,6 +56,8 @@ pub struct UiState {
     pub io_mode: bool,
     /// Offset from UTC in seconds applied when formatting `clock_format` (`0` = deterministic UTC).
     pub tz_offset_secs: i32,
+    /// Optional centered modal dialog (terminate confirmation, priority picker, or refusal notice).
+    pub modal: Option<ProcActionModal>,
 }
 
 impl Default for UiState {
@@ -65,6 +69,7 @@ impl Default for UiState {
             show_disks: true,
             io_mode: false,
             tz_offset_secs: 0,
+            modal: None,
         }
     }
 }
@@ -78,6 +83,7 @@ impl UiState {
             show_disks: config.show_disks,
             io_mode: config.io_mode,
             tz_offset_secs: 0,
+            modal: None,
         }
     }
 
@@ -369,6 +375,15 @@ fn push_bounded_u64(buf: &mut VecDeque<u64>, value: u64, capacity: usize) {
     buf.make_contiguous();
 }
 
+/// Returns `true` iff `state.modal` is set and will be visibly drawn at `size`
+/// (layout succeeds and the modal dialog fits inside `size`).
+pub fn is_modal_visible(size: Size, state: &UiState) -> bool {
+    let Some(ref modal) = state.modal else {
+        return false;
+    };
+    compute_layout(size, &state.layout).is_ok() && modal_rect(size, modal).is_some()
+}
+
 /// Computes the number of visible process rows for a given viewport size and active UI layout state.
 pub fn visible_proc_rows(size: Size, state: &UiState) -> usize {
     let extra = state.proc.extra_header_rows();
@@ -460,6 +475,9 @@ pub fn render_frame(
     }
 
     header::render_top_header(&mut grid, &layout, snapshot, state, config, &theme);
+    if let Some(ref modal) = state.modal {
+        proc_actions::render_proc_action_modal(&mut grid, modal, config, &theme);
+    }
     grid
 }
 
