@@ -121,7 +121,7 @@ pub struct NetInterfaceSnapshot {
     pub link_speed_bps: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ProcessIdentity {
     pub pid: u32,
     /// 100-nanosecond intervals since 1601-01-01 UTC (`FILETIME`), preventing PID reuse bugs.
