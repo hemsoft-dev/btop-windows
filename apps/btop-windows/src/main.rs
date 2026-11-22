@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use btop_collect::{LiveCollector, ReplaySource, SnapshotSource};
+use btop_collect::{FreqMode, LiveCollector, ReplaySource, SnapshotSource};
 use btop_config::Config;
 use btop_model::SnapshotRecorder;
 use btop_term::CrosstermInput;
@@ -106,7 +106,8 @@ fn main() -> ExitCode {
             }
         }
     } else {
-        match LiveCollector::new() {
+        let freq_mode = FreqMode::from_config_str(&config.freq_mode);
+        match LiveCollector::with_freq_mode(freq_mode) {
             Ok(live) => Box::new(live),
             Err(err) => {
                 eprintln!("error: failed to initialize live telemetry collector: {err}");

@@ -3,7 +3,7 @@
 use std::fmt::Write as _;
 
 use btop_config::Config;
-use btop_model::{CoreSample, CpuSnapshot, DataState, Snapshot};
+use btop_model::{CoreKind, CoreSample, CpuSnapshot, DataState, Snapshot};
 use btop_term::{Cell, Grid, HitAction, Rect};
 
 use crate::UiHistory;
@@ -238,7 +238,7 @@ fn render_cpu_body(
     }
 
     render_split_graph(grid, graph_rect, history, config, theme);
-    render_stats_pane(grid, stats_rect, cpu, theme, stale_note);
+    render_stats_pane(grid, stats_rect, cpu, config, theme, stale_note);
 }
 
 fn render_split_graph(
@@ -318,10 +318,12 @@ fn render_split_graph(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_stats_pane(
     grid: &mut Grid,
     rect: Rect,
     cpu: &CpuSnapshot,
+    config: &Config,
     theme: &ThemePalette,
     stale_note: Option<&str>,
 ) {
@@ -332,21 +334,37 @@ fn render_stats_pane(
     let mut y = rect.y;
     let max_y = rect.y.saturating_add(rect.height);
 
-    // Row 0: Total CPU meter + percentage
-    let total_pct_str = format!("{:>5.1}%", cpu.total_busy_pct);
-    let label = "CPU ";
-    let reserved = u16::try_from(label.len() + total_pct_str.len() + 3).unwrap_or(13);
-    grid.write_str(rect.x + 1, y, label, theme.title, theme.main_bg, true);
+    let use_utility = config.cpu_util_mode.eq_ignore_ascii_case("utility");
+    let (headline_label, headline_pct) = match (use_utility, cpu.utility_pct) {
+        (true, Some(util)) => ("UTL ", util),
+        _ => ("CPU ", cpu.total_busy_pct),
+    };
+
+    // Row 0: Total CPU (or Task Manager Utility) meter + percentage
+    let total_pct_str = format!("{headline_pct:>5.1}%");
+    let reserved = u16::try_from(headline_label.len() + total_pct_str.len() + 3).unwrap_or(13);
+    grid.write_str(
+        rect.x + 1,
+        y,
+        headline_label,
+        if use_utility {
+            theme.hi_fg
+        } else {
+            theme.title
+        },
+        theme.main_bg,
+        true,
+    );
     let meter_w = rect.width.saturating_sub(reserved);
     let meter_x = rect
         .x
-        .saturating_add(1 + u16::try_from(label.len()).unwrap_or(4));
-    draw_meter(grid, meter_x, y, meter_w, cpu.total_busy_pct, theme);
+        .saturating_add(1 + u16::try_from(headline_label.len()).unwrap_or(4));
+    draw_meter(grid, meter_x, y, meter_w, headline_pct, theme);
     grid.write_str(
         meter_x.saturating_add(meter_w + 1),
         y,
         &total_pct_str,
-        theme.cpu_gradient(cpu.total_busy_pct),
+        theme.cpu_gradient(headline_pct),
         theme.main_bg,
         true,
     );
@@ -379,10 +397,19 @@ fn render_stats_pane(
     // Metadata footer inside right pane
     if core_area_end < max_y {
         let mut meta = format!("Up {}", format_uptime(cpu.uptime_secs));
-        if let Some(freq) = cpu.freq_mhz {
+        if config.freq_mode.eq_ignore_ascii_case("range")
+            && let Some((lo, hi)) = cpu.freq_range_mhz
+        {
+            #[allow(clippy::cast_precision_loss)]
+            let (lo_g, hi_g) = ((lo as f32) / 1000.0, (hi as f32) / 1000.0);
+            let _ = write!(meta, "  {lo_g:.2}-{hi_g:.2}G");
+        } else if let Some(freq) = cpu.freq_mhz {
             #[allow(clippy::cast_precision_loss)]
             let ghz = (freq as f32) / 1000.0;
             let _ = write!(meta, "  {ghz:.2} GHz");
+        }
+        if use_utility {
+            meta.push_str("  [util]");
         }
         if let Some(note) = stale_note {
             let _ = write!(meta, "  [{note}]");
@@ -449,7 +476,12 @@ fn render_core_meters(grid: &mut Grid, rect: Rect, cores: &[CoreSample], theme: 
             .saturating_add(u16::try_from(col).unwrap_or(0) * (col_w + col_gap));
         let cell_y = rect.y.saturating_add(u16::try_from(row).unwrap_or(0));
 
-        let label = format!("C{:02} ", core.id.number);
+        let prefix = match core.kind {
+            CoreKind::Performance => 'P',
+            CoreKind::Efficiency => 'E',
+            CoreKind::Uniform => 'C',
+        };
+        let label = format!("{prefix}{:02} ", core.id.number);
         let pct_str = format!("{:>3.0}%", core.busy_pct);
         let label_w = u16::try_from(label.len()).unwrap_or(4);
         let pct_w = u16::try_from(pct_str.len()).unwrap_or(4);
@@ -503,11 +535,45 @@ pub fn format_uptime(total_secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use btop_model::fixtures::win11_16core_dual_gpu_desktop;
+    use btop_term::Size;
+
     use super::format_uptime;
+    use crate::{Config, UiHistory};
 
     #[test]
     fn formats_uptime_below_and_above_one_day() {
         assert_eq!(format_uptime(3661), "01:01:01");
         assert_eq!(format_uptime(90_061), "1d 01:01:01");
+    }
+
+    #[test]
+    fn renders_hybrid_pe_core_labels_utility_mode_and_freq_range() {
+        let mut snap = win11_16core_dual_gpu_desktop()[0].clone();
+        if let btop_model::DataState::Available(ref mut cpu) = snap.cpu {
+            cpu.freq_range_mhz = Some((3200, 5400));
+        }
+        let cfg = Config {
+            shown_boxes: "cpu".to_owned(),
+            cpu_util_mode: "utility".to_owned(),
+            freq_mode: "range".to_owned(),
+            ..Config::default()
+        };
+        let hist = UiHistory::from_snapshot(&snap);
+        let text = crate::render_with_history(
+            &snap,
+            &hist,
+            &cfg,
+            Size {
+                width: 120,
+                height: 40,
+            },
+        )
+        .to_plain_text();
+        assert!(text.contains("P00 "), "expected P-core label in:\n{text}");
+        assert!(text.contains("E08 "), "expected E-core label in:\n{text}");
+        assert!(text.contains("UTL "), "expected utility headline label");
+        assert!(text.contains("[util]"), "expected utility badge");
+        assert!(text.contains("3.20-5.40G"), "expected frequency range");
     }
 }

@@ -59,6 +59,8 @@ pub struct CpuSnapshot {
     pub total_busy_pct: f32,
     pub utility_pct: Option<f32>,
     pub freq_mhz: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freq_range_mhz: Option<(u32, u32)>,
     pub package_temp_celsius: Option<f32>,
     pub package_watts: Option<f32>,
     /// Emulated 1/5/15m Ready/Running thread EWMA (displayed as `RunQ`).

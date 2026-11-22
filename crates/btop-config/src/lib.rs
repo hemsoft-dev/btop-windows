@@ -54,6 +54,7 @@ pub struct Config {
     pub proc_per_core: bool,
     pub proc_mem_bytes: bool,
     pub cpu_util_mode: String,
+    pub freq_mode: String,
     /// Unknown or deferred upstream keys preserved verbatim when saving `btop.conf`.
     pub preserved_unknown: BTreeMap<String, String>,
 }
@@ -79,6 +80,7 @@ impl Default for Config {
             proc_per_core: false,
             proc_mem_bytes: true,
             cpu_util_mode: "time".to_owned(),
+            freq_mode: "average".to_owned(),
             preserved_unknown: BTreeMap::new(),
         }
     }
@@ -112,7 +114,9 @@ impl Config {
                 "proc_reversed = {proc_reversed}\n",
                 "proc_tree = {proc_tree}\n\n",
                 "#* Windows CPU utilization mode: \"time\" or \"utility\" (Task Manager).\n",
-                "cpu_util_mode = \"{cpu_util_mode}\"\n",
+                "cpu_util_mode = \"{cpu_util_mode}\"\n\n",
+                "#* CPU frequency aggregation: \"first\", \"range\", \"lowest\", \"highest\", or \"average\".\n",
+                "freq_mode = \"{freq_mode}\"\n",
             ),
             color_theme = cfg.color_theme,
             theme_background = bool_title(cfg.theme_background),
@@ -126,6 +130,7 @@ impl Config {
             proc_reversed = bool_title(cfg.proc_reversed),
             proc_tree = bool_title(cfg.proc_tree),
             cpu_util_mode = cfg.cpu_util_mode,
+            freq_mode = cfg.freq_mode,
         )
     }
 
@@ -162,6 +167,7 @@ impl Config {
                 "proc_per_core" => cfg.proc_per_core = parse_bool(key, &val)?,
                 "proc_mem_bytes" => cfg.proc_mem_bytes = parse_bool(key, &val)?,
                 "cpu_util_mode" => cfg.cpu_util_mode = val,
+                "freq_mode" => cfg.freq_mode = val,
                 "graph_symbol" => {
                     cfg.graph_symbol = match val.as_str() {
                         "braille" => GraphSymbol::Braille,

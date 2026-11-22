@@ -8,7 +8,10 @@ pub mod sampler;
 use btop_model::Snapshot;
 use thiserror::Error;
 
-pub use cpu::{CpuCollector, LiveCollector, compute_cpu_deltas};
+pub use cpu::{
+    CpuCollector, FreqMode, LiveCollector, RunQueueEwma, classify_core_kinds, compute_cpu_deltas,
+    compute_cpu_deltas_with_kinds, compute_frequency_mhz,
+};
 pub use proc::{ProcessCollector, ProcessDeltaTracker};
 pub use replay::{ReplaySource, StubLiveSource};
 pub use sampler::{MAX_UPDATE_MS, MIN_UPDATE_MS, Sampler};
@@ -26,6 +29,9 @@ pub enum CollectError {
 /// Trait implemented by live Windows collectors and deterministic replay fixtures.
 pub trait SnapshotSource: Send {
     fn next_snapshot(&mut self) -> Result<Snapshot, CollectError>;
+
+    /// Updates the live frequency aggregation mode (e.g., on `Ctrl+R` config reload).
+    fn set_freq_mode(&mut self, _mode: FreqMode) {}
 }
 
 /// Pure, platform-independent delta math tested on every CI target.

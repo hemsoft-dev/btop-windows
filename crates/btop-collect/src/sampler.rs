@@ -3,7 +3,7 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -11,7 +11,7 @@ use arc_swap::ArcSwap;
 use btop_model::{Snapshot, SnapshotRecorder};
 use btop_sys::{TimerWake, TimerWaker, WaitableWakeTimer};
 
-use crate::{CollectError, SnapshotSource};
+use crate::{CollectError, FreqMode, SnapshotSource};
 
 /// Minimum allowed sampling interval in milliseconds.
 pub const MIN_UPDATE_MS: u32 = 100;
@@ -23,6 +23,8 @@ struct SamplerShared {
     latest: ArcSwap<Snapshot>,
     generation: AtomicU64,
     update_ms: AtomicU32,
+    freq_mode: AtomicU8,
+    freq_mode_dirty: AtomicBool,
     stop: AtomicBool,
     finished: AtomicBool,
     waker: TimerWaker,
@@ -62,6 +64,8 @@ impl Sampler {
             latest: ArcSwap::from_pointee(initial_snapshot),
             generation: AtomicU64::new(1),
             update_ms: AtomicU32::new(initial_update_ms.clamp(MIN_UPDATE_MS, MAX_UPDATE_MS)),
+            freq_mode: AtomicU8::new(FreqMode::Average.to_u8()),
+            freq_mode_dirty: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             finished: AtomicBool::new(false),
             waker,
@@ -101,6 +105,13 @@ impl Sampler {
         self.shared.update_ms.store(clamped, Ordering::Relaxed);
         self.shared.waker.wake();
         clamped
+    }
+
+    /// Propagates a new [`FreqMode`] to the background collector (e.g., on `Ctrl+R` reload).
+    pub fn set_freq_mode(&self, mode: FreqMode) {
+        self.shared.freq_mode.store(mode.to_u8(), Ordering::Relaxed);
+        self.shared.freq_mode_dirty.store(true, Ordering::Release);
+        self.shared.waker.wake();
     }
 
     /// Adjusts `update_ms` by `delta_ms` (e.g. `+100` or `-100`), clamping at [`MIN_UPDATE_MS`].
@@ -152,10 +163,13 @@ fn run_sampler_loop(
     let mut exit_result = Ok(());
 
     while !shared.stop.load(Ordering::Acquire) {
+        if shared.freq_mode_dirty.swap(false, Ordering::AcqRel) {
+            source.set_freq_mode(FreqMode::from_u8(shared.freq_mode.load(Ordering::Relaxed)));
+        }
         let interval = Duration::from_millis(u64::from(shared.update_ms.load(Ordering::Relaxed)));
         match timer.wait(interval) {
             Ok(TimerWake::Woken) => {
-                // Either shutdown requested or update_ms changed; loop re-checks stop & new interval.
+                // Either shutdown requested, cadence changed, or freq_mode changed.
                 continue;
             }
             Ok(TimerWake::Elapsed) => {}
@@ -167,6 +181,9 @@ fn run_sampler_loop(
 
         if shared.stop.load(Ordering::Acquire) {
             break;
+        }
+        if shared.freq_mode_dirty.swap(false, Ordering::AcqRel) {
+            source.set_freq_mode(FreqMode::from_u8(shared.freq_mode.load(Ordering::Relaxed)));
         }
 
         match source.next_snapshot() {

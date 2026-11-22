@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use btop_collect::{CollectError, Sampler, SnapshotSource};
+use btop_collect::{CollectError, FreqMode, Sampler, SnapshotSource};
 use btop_config::{Config, ConfigError};
 use btop_model::{DataState, RecordStats, SnapshotRecorder};
 use btop_term::{
@@ -131,7 +131,7 @@ pub fn run_tui_loop(
     let mut ui_state = UiState::from_config(&config);
     let mut last_generation = sampler.generation();
     let mut current_snapshot = sampler.latest();
-    history.push(&current_snapshot);
+    history.push_with_util_mode(&current_snapshot, is_utility_mode(&config));
 
     let mut prev_grid: Option<Grid> = None;
     let mut dirty = true;
@@ -143,7 +143,7 @@ pub fn run_tui_loop(
             if gen_now != last_generation {
                 last_generation = gen_now;
                 current_snapshot = sampler.latest();
-                history.push(&current_snapshot);
+                history.push_with_util_mode(&current_snapshot, is_utility_mode(&config));
                 dirty = true;
             }
 
@@ -227,6 +227,10 @@ pub fn run_tui_loop(
     Ok(frames_rendered)
 }
 
+fn is_utility_mode(config: &Config) -> bool {
+    config.cpu_util_mode.eq_ignore_ascii_case("utility")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_tui_event(
     event: TermEvent,
@@ -246,6 +250,7 @@ fn handle_tui_event(
             if let Ok(reloaded) = load_config(config_path, overrides) {
                 *config = reloaded;
                 config.update_ms = sampler.set_update_ms(config.update_ms);
+                sampler.set_freq_mode(FreqMode::from_config_str(&config.freq_mode));
                 *ui_state = UiState::from_config(config);
                 *prev_grid = None;
                 return true;
