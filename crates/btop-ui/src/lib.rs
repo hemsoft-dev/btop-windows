@@ -12,6 +12,7 @@ pub mod proc_actions;
 pub mod proc_box;
 pub mod proc_detail;
 pub mod proc_tree;
+pub mod services_view;
 pub mod theme;
 pub mod widgets;
 
@@ -39,6 +40,9 @@ pub use proc_tree::{
     CompiledFilter, DisplayProcRow, build_visible_rows, compile_proc_filter, expandable_parents,
     matches_proc_filter,
 };
+pub use services_view::{
+    ServiceRow, ServiceSort, ServiceViewState, build_visible_service_rows, is_pending_service_state,
+};
 
 use crate::mem_box::ratio_percent;
 use crate::theme::ThemePalette;
@@ -51,6 +55,7 @@ const PROC_HISTORY_CAPACITY: usize = 128;
 pub struct UiState {
     pub layout: LayoutState,
     pub proc: ProcViewState,
+    pub services: ServiceViewState,
     pub net: NetViewState,
     pub show_disks: bool,
     pub io_mode: bool,
@@ -65,6 +70,7 @@ impl Default for UiState {
         Self {
             layout: LayoutState::default(),
             proc: ProcViewState::default(),
+            services: ServiceViewState::default(),
             net: NetViewState::default(),
             show_disks: true,
             io_mode: false,
@@ -79,6 +85,7 @@ impl UiState {
         Self {
             layout: LayoutState::from_config(config),
             proc: ProcViewState::from_config(config),
+            services: ServiceViewState::default(),
             net: NetViewState::from_config(config),
             show_disks: config.show_disks,
             io_mode: config.io_mode,
@@ -397,6 +404,18 @@ pub fn visible_proc_rows(size: Size, state: &UiState) -> usize {
         })
 }
 
+/// Computes the number of visible Windows Services rows inside the `proc` panel when Services view is active.
+pub fn visible_service_rows(size: Size, state: &UiState) -> usize {
+    let extra = state.services.extra_header_rows();
+    compute_layout(size, &state.layout)
+        .ok()
+        .and_then(|layout| layout.proc())
+        .map_or(0, |r| {
+            let inner_h = r.height.saturating_sub(2);
+            usize::from(inner_h.saturating_sub(1)).saturating_sub(extra)
+        })
+}
+
 fn box_config<'a>(config: &'a Config, state: &UiState, id: BoxId) -> Cow<'a, Config> {
     let sym = state.layout.symbol_for(id, config.graph_symbol);
     if sym == config.graph_symbol {
@@ -459,15 +478,26 @@ pub fn render_frame(
     }
     if let Some(rect) = layout.proc() {
         let cfg = box_config(config, state, BoxId::Proc);
-        proc_box::render_proc_box(
-            &mut grid,
-            rect,
-            snapshot,
-            history,
-            &state.proc,
-            &cfg,
-            &theme,
-        );
+        if state.services.active {
+            services_view::render_services_view(
+                &mut grid,
+                rect,
+                snapshot,
+                &state.services,
+                &cfg,
+                &theme,
+            );
+        } else {
+            proc_box::render_proc_box(
+                &mut grid,
+                rect,
+                snapshot,
+                history,
+                &state.proc,
+                &cfg,
+                &theme,
+            );
+        }
     }
     for (gpu_idx, rect) in layout.gpus() {
         let cfg = box_config(config, state, BoxId::Gpu(gpu_idx));

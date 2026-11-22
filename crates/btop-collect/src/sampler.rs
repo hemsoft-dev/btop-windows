@@ -25,6 +25,9 @@ struct SamplerShared {
     update_ms: AtomicU32,
     freq_mode: AtomicU8,
     freq_mode_dirty: AtomicBool,
+    services_active: AtomicBool,
+    services_dirty: AtomicBool,
+    services_refresh: AtomicBool,
     stop: AtomicBool,
     finished: AtomicBool,
     waker: TimerWaker,
@@ -66,6 +69,9 @@ impl Sampler {
             update_ms: AtomicU32::new(initial_update_ms.clamp(MIN_UPDATE_MS, MAX_UPDATE_MS)),
             freq_mode: AtomicU8::new(FreqMode::Average.to_u8()),
             freq_mode_dirty: AtomicBool::new(false),
+            services_active: AtomicBool::new(false),
+            services_dirty: AtomicBool::new(false),
+            services_refresh: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             finished: AtomicBool::new(false),
             waker,
@@ -111,6 +117,23 @@ impl Sampler {
     pub fn set_freq_mode(&self, mode: FreqMode) {
         self.shared.freq_mode.store(mode.to_u8(), Ordering::Relaxed);
         self.shared.freq_mode_dirty.store(true, Ordering::Release);
+        self.shared.waker.wake();
+    }
+
+    /// Enables or disables on-demand SCM service polling; enabling wakes the sampler immediately
+    /// so the Services view populates without waiting for the next timer interval.
+    pub fn set_services_active(&self, active: bool) {
+        self.shared.services_active.store(active, Ordering::Release);
+        self.shared.services_dirty.store(true, Ordering::Release);
+        if active {
+            self.shared.services_refresh.store(true, Ordering::Release);
+        }
+        self.shared.waker.wake();
+    }
+
+    /// Requests an immediate SCM refresh on the sampler thread (e.g., right after Start or Stop).
+    pub fn refresh_services(&self) {
+        self.shared.services_refresh.store(true, Ordering::Release);
         self.shared.waker.wake();
     }
 
@@ -163,19 +186,32 @@ fn run_sampler_loop(
     let mut exit_result = Ok(());
 
     while !shared.stop.load(Ordering::Acquire) {
+        let mut immediate_sample = false;
         if shared.freq_mode_dirty.swap(false, Ordering::AcqRel) {
             source.set_freq_mode(FreqMode::from_u8(shared.freq_mode.load(Ordering::Relaxed)));
         }
-        let interval = Duration::from_millis(u64::from(shared.update_ms.load(Ordering::Relaxed)));
-        match timer.wait(interval) {
-            Ok(TimerWake::Woken) => {
-                // Either shutdown requested, cadence changed, or freq_mode changed.
-                continue;
-            }
-            Ok(TimerWake::Elapsed) => {}
-            Err(err) => {
-                exit_result = Err(CollectError::Platform(err));
-                break;
+        if shared.services_dirty.swap(false, Ordering::AcqRel) {
+            source.set_services_active(shared.services_active.load(Ordering::Acquire));
+        }
+        if shared.services_refresh.swap(false, Ordering::AcqRel) {
+            source.request_services_refresh();
+            immediate_sample = true;
+        }
+
+        if !immediate_sample {
+            let interval =
+                Duration::from_millis(u64::from(shared.update_ms.load(Ordering::Relaxed)));
+            match timer.wait(interval) {
+                Ok(TimerWake::Woken) => {
+                    // Re-check stop/dirty/refresh flags at top of loop; if a services refresh
+                    // woke us, the next iteration samples immediately without sleeping again.
+                    continue;
+                }
+                Ok(TimerWake::Elapsed) => {}
+                Err(err) => {
+                    exit_result = Err(CollectError::Platform(err));
+                    break;
+                }
             }
         }
 
@@ -184,6 +220,12 @@ fn run_sampler_loop(
         }
         if shared.freq_mode_dirty.swap(false, Ordering::AcqRel) {
             source.set_freq_mode(FreqMode::from_u8(shared.freq_mode.load(Ordering::Relaxed)));
+        }
+        if shared.services_dirty.swap(false, Ordering::AcqRel) {
+            source.set_services_active(shared.services_active.load(Ordering::Acquire));
+        }
+        if shared.services_refresh.swap(false, Ordering::AcqRel) {
+            source.request_services_refresh();
         }
 
         match source.next_snapshot() {

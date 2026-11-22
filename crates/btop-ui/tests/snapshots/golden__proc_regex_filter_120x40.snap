@@ -2,7 +2,7 @@
 source: crates/btop-ui/tests/golden.rs
 expression: rendered
 ---
-╭─┐⁴proc┌─┐p0┌─────────────────────────────────────────┐01:00:04┌─────────────┐f:!(code|rust)┌─┐< cpu lazy ↓ >┌──┐1/9┌─╮
+╭─┐⁴proc┌─┐S:svc┌─┐p0┌─────────────────────────────────┐01:00:04┌─────────────┐f:!(code|rust)┌─┐< cpu lazy ↓ >┌──┐1/9┌─╮
 │     Pid Program                                                                        Thr     MemB    Graph    Cpu% │
 │    4216 rust-analyzer.exe                                                               18     1.4G ████████    12.8 │
 │    4100 Code.exe                                                                        48     642M ▅▅▄▅▅▄▅▅     5.3 │

@@ -2,7 +2,7 @@
 source: crates/btop-ui/tests/golden.rs
 expression: rendered
 ---
-╭─┐⁴proc┌─┐p0┌─────────────────────────────────────────┐01:00:04┌──────────────────────┐tree┌─┐< cpu lazy ↓ >┌──┐1/52┌─╮
+╭─┐⁴proc┌─┐S:svc┌─┐p0┌─────────────────────────────────┐01:00:04┌──────────────────────┐tree┌─┐< cpu lazy ↓ >┌──┐1/52┌─╮
 │     Pid Program                                                                       Thr     MemB    Graph    Cpu%  │
 │       4 ▾ System                                                                      168     5.5G ▂▂▂▂▂▂▂▂   105.4 █│
 │     512 ├─▾ smss.exe                                                                    3     5.4G ▁▁ ▁▁ ▁▁   103.8 ││

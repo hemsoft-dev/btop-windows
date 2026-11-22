@@ -643,6 +643,7 @@ fn render_proc_chrome(
 ) {
     let max_top_x = rect.x.saturating_add(rect.width - 1);
 
+    let mut left_bound = rect.x.saturating_add(10);
     if let Some(tag_rect) = draw_border_tag(
         grid,
         rect.x.saturating_add(2),
@@ -657,6 +658,7 @@ fn render_proc_chrome(
     ) {
         grid.hit_map
             .push(tag_rect, HitAction::ToggleBox("proc".to_owned()));
+        left_bound = tag_rect.x.saturating_add(tag_rect.width);
     }
 
     let pos_label = if total_procs == 0 {
@@ -666,7 +668,7 @@ fn render_proc_chrome(
     };
     let pos_w = u16::try_from(pos_label.chars().count() + 2).unwrap_or(6);
     let pos_x = max_top_x.saturating_sub(pos_w + 1);
-    if pos_x > rect.x.saturating_add(12) {
+    if pos_x > left_bound.saturating_add(1) {
         let _ = draw_border_tag(
             grid,
             pos_x,
@@ -685,7 +687,7 @@ fn render_proc_chrome(
     let sort_label = format!("< {} {arrow} >", view.sort.as_str());
     let sort_w = u16::try_from(sort_label.chars().count() + 2).unwrap_or(14);
     let sort_x = pos_x.saturating_sub(sort_w + 2);
-    if sort_x > rect.x.saturating_add(11) {
+    if sort_x > left_bound.saturating_add(1) {
         let _ = draw_border_tag(
             grid,
             sort_x,
@@ -700,7 +702,27 @@ fn render_proc_chrome(
         );
     }
 
-    render_proc_filter_and_badges(grid, rect, sort_x, view, theme);
+    // Draw clickable `S:svc` tab right after `⁴proc` when there is room before the sort tag.
+    let svc_tab_x = left_bound.saturating_add(1);
+    if svc_tab_x.saturating_add(8) < sort_x
+        && let Some(tab_rect) = draw_border_tag(
+            grid,
+            svc_tab_x,
+            rect.y,
+            sort_x.saturating_sub(1),
+            None,
+            "S:svc",
+            theme.proc_box,
+            theme.inactive_fg,
+            theme.hi_fg,
+            theme.main_bg,
+        )
+    {
+        grid.hit_map.push(tab_rect, HitAction::ToggleServicesView);
+        left_bound = tab_rect.x.saturating_add(tab_rect.width);
+    }
+
+    render_proc_filter_and_badges(grid, rect, left_bound, sort_x, view, theme);
 
     let bottom_y = rect.y.saturating_add(rect.height - 1);
     let footer = if view.filter_editing {
@@ -729,6 +751,7 @@ fn render_proc_chrome(
 fn render_proc_filter_and_badges(
     grid: &mut Grid,
     rect: Rect,
+    left_bound: u16,
     sort_x: u16,
     view: &ProcViewState,
     theme: &ThemePalette,
@@ -737,12 +760,12 @@ fn render_proc_filter_and_badges(
     if view.filter_editing || !view.filter.is_empty() {
         let cursor_glyph = if view.filter_editing { "_" } else { "" };
         let filter_tag = format!("f:{}{cursor_glyph}", view.filter);
-        let max_filter_w = right_cursor.saturating_sub(rect.x.saturating_add(12));
+        let max_filter_w = right_cursor.saturating_sub(left_bound.saturating_add(2));
         if max_filter_w >= 6 {
             let clipped = clip_text(&filter_tag, usize::from(max_filter_w.saturating_sub(2)));
             let tag_w = u16::try_from(clipped.chars().count() + 2).unwrap_or(6);
             let tag_x = right_cursor.saturating_sub(tag_w + 1);
-            if tag_x > rect.x.saturating_add(10) {
+            if tag_x > left_bound {
                 let _ = draw_border_tag(
                     grid,
                     tag_x,
@@ -774,7 +797,7 @@ fn render_proc_filter_and_badges(
         let badge = badges.join(" | ");
         let badge_w = u16::try_from(badge.chars().count() + 2).unwrap_or(10);
         let badge_x = right_cursor.saturating_sub(badge_w + 1);
-        if badge_x > rect.x.saturating_add(11) {
+        if badge_x > left_bound.saturating_add(1) {
             let _ = draw_border_tag(
                 grid,
                 badge_x,

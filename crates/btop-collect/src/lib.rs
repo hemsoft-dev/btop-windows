@@ -8,6 +8,7 @@ pub mod net;
 pub mod proc;
 pub mod replay;
 pub mod sampler;
+pub mod services;
 
 use btop_model::Snapshot;
 use thiserror::Error;
@@ -29,6 +30,7 @@ pub use net::{NetCollector, compute_net_rates};
 pub use proc::{ProcessCollector, ProcessDeltaTracker};
 pub use replay::{ReplaySource, StubLiveSource};
 pub use sampler::{MAX_UPDATE_MS, MIN_UPDATE_MS, Sampler};
+pub use services::{SERVICE_POLL_INTERVAL, ServiceCollector};
 
 #[derive(Debug, Error)]
 pub enum CollectError {
@@ -46,6 +48,12 @@ pub trait SnapshotSource: Send {
 
     /// Updates the live frequency aggregation mode (e.g., on `Ctrl+R` config reload).
     fn set_freq_mode(&mut self, _mode: FreqMode) {}
+
+    /// Enables or disables on-demand Windows Services (SCM) polling while the Services view is open.
+    fn set_services_active(&mut self, _active: bool) {}
+
+    /// Requests an immediate SCM re-poll on the next tick (e.g., after Start or Stop).
+    fn request_services_refresh(&mut self) {}
 
     /// Returns `true` only for live host telemetry sources where mutating OS process actions
     /// (`WM_CLOSE`, `TerminateProcess`, `SetPriorityClass`) are authorized. Replay and stub

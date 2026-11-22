@@ -62,6 +62,12 @@ pub enum ProcActionModal {
         current: Option<UiPriorityClass>,
         selected: usize,
     },
+    /// `s` / `x` confirmation dialog before calling elevated `StartServiceW` / `ControlService(STOP)`.
+    ConfirmServiceAction {
+        service_name: String,
+        display_name: String,
+        start: bool,
+    },
     /// Explicit refusal or error notice (e.g., critical system process BSOD guard, access denied,
     /// `CreateTime` mismatch, or missing window on `WM_CLOSE`).
     ActionNotice {
@@ -108,6 +114,7 @@ pub fn modal_rect(size: Size, modal: &ProcActionModal) -> Option<Rect> {
     match modal {
         ProcActionModal::ConfirmTerminate { .. } => centered_rect_for_size(size, 62, 8, 8),
         ProcActionModal::PrioritySelector { .. } => centered_rect_for_size(size, 52, 12, 12),
+        ProcActionModal::ConfirmServiceAction { .. } => centered_rect_for_size(size, 64, 8, 8),
         ProcActionModal::ActionNotice { .. } => centered_rect_for_size(size, 66, 8, 8),
     }
 }
@@ -134,6 +141,21 @@ pub fn render_proc_action_modal(
         } => {
             render_priority_selector(
                 grid, rect, *target, name, *current, *selected, config, theme,
+            );
+        }
+        ProcActionModal::ConfirmServiceAction {
+            service_name,
+            display_name,
+            start,
+        } => {
+            render_confirm_service_action(
+                grid,
+                rect,
+                service_name,
+                display_name,
+                *start,
+                config,
+                theme,
             );
         }
         ProcActionModal::ActionNotice {
@@ -216,6 +238,78 @@ fn render_confirm_terminate(
         false,
     );
     grid.write_str(inner_x, rect.y + 5, &hint, theme.hi_fg, theme.main_bg, true);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_confirm_service_action(
+    grid: &mut Grid,
+    rect: Rect,
+    service_name: &str,
+    display_name: &str,
+    start: bool,
+    config: &Config,
+    theme: &ThemePalette,
+) {
+    let border_fg = if start {
+        btop_term::Color::Rgb(theme.cpu_mid)
+    } else {
+        theme.hi_fg
+    };
+    fill_rect(grid, rect, theme.main_fg, theme.main_bg);
+    draw_box_frame(grid, rect, border_fg, theme.main_bg, config.rounded_corners);
+    let max_x = rect.x.saturating_add(rect.width - 1);
+    let title = if start {
+        "Start Service (s)"
+    } else {
+        "Stop Service (x)"
+    };
+    let _ = draw_border_tag(
+        grid,
+        rect.x.saturating_add(2),
+        rect.y,
+        max_x,
+        None,
+        title,
+        border_fg,
+        theme.title,
+        theme.hi_fg,
+        theme.main_bg,
+    );
+
+    let inner_x = rect.x.saturating_add(2);
+    let inner_w = usize::from(rect.width.saturating_sub(4));
+    let verb = if start { "Start" } else { "Stop" };
+    let line1 = clip_text(
+        &format!("{verb} service '{service_name}' ({display_name})?"),
+        inner_w,
+    );
+    let line2 = clip_text(
+        if start {
+            "Calls StartServiceW via Windows Service Control Manager (SCM)."
+        } else {
+            "Calls ControlService(STOP) via Windows Service Control Manager (SCM)."
+        },
+        inner_w,
+    );
+    let hint = clip_text(&format!("[Enter / y] {verb}    [Esc / n] Cancel"), inner_w);
+
+    grid.write_str(
+        inner_x,
+        rect.y + 2,
+        &line1,
+        theme.title,
+        theme.main_bg,
+        true,
+    );
+    grid.write_str(
+        inner_x,
+        rect.y + 3,
+        &line2,
+        theme.inactive_fg,
+        theme.main_bg,
+        false,
+    );
+    grid.write_str(inner_x, rect.y + 5, &hint, border_fg, theme.main_bg, true);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -479,6 +573,25 @@ mod tests {
         assert!(t3.contains("Action Refused"));
         assert!(t3.contains("critical Windows system process"));
         assert!(t3.contains("[Enter / Esc] Dismiss"));
+
+        let mut g4 = Grid::new(Size {
+            width: 100,
+            height: 30,
+        });
+        render_proc_action_modal(
+            &mut g4,
+            &ProcActionModal::ConfirmServiceAction {
+                service_name: "W32Time".to_owned(),
+                display_name: "Windows Time".to_owned(),
+                start: false,
+            },
+            &cfg,
+            &theme,
+        );
+        let t4 = g4.to_plain_text();
+        assert!(t4.contains("Stop Service (x)"));
+        assert!(t4.contains("Stop service 'W32Time' (Windows Time)?"));
+        assert!(t4.contains("[Enter / y] Stop"));
     }
 
     #[test]
