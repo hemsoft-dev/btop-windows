@@ -374,7 +374,7 @@ fn golden_size_error_40x12() {
 }
 
 fn render_proc_mode(
-    configure: impl FnOnce(&mut btop_ui::UiState, &btop_model::Snapshot),
+    configure: impl FnOnce(&mut btop_ui::UiState, &btop_model::Snapshot, &UiHistory),
 ) -> String {
     let snapshots =
         parse_jsonl_file(&fixture_path("win11-16core-dual-gpu-desktop.jsonl")).expect("fixture");
@@ -390,7 +390,7 @@ fn render_proc_mode(
         ..Config::default()
     };
     let mut state = btop_ui::UiState::from_config(&config);
-    configure(&mut state, latest);
+    configure(&mut state, latest, &history);
     btop_ui::render_frame(
         latest,
         &history,
@@ -406,7 +406,7 @@ fn render_proc_mode(
 
 #[test]
 fn golden_proc_tree_120x40() {
-    let rendered = render_proc_mode(|state, _| {
+    let rendered = render_proc_mode(|state, _, _| {
         state.proc.tree_mode = true;
         state.proc.aggregate = true;
     });
@@ -415,7 +415,7 @@ fn golden_proc_tree_120x40() {
 
 #[test]
 fn golden_proc_regex_filter_120x40() {
-    let rendered = render_proc_mode(|state, _| {
+    let rendered = render_proc_mode(|state, _, _| {
         state.proc.set_filter("!(code|rust)");
     });
     insta::assert_snapshot!("proc_regex_filter_120x40", rendered);
@@ -423,9 +423,9 @@ fn golden_proc_regex_filter_120x40() {
 
 #[test]
 fn golden_proc_paused_120x40() {
-    let rendered = render_proc_mode(|state, snap| {
+    let rendered = render_proc_mode(|state, snap, history| {
         if let btop_model::DataState::Available(ref list) = snap.processes {
-            state.proc.toggle_pause(Some(list));
+            state.proc.toggle_pause(Some(list), Some(history));
         }
     });
     insta::assert_snapshot!("proc_paused_120x40", rendered);
@@ -433,12 +433,12 @@ fn golden_proc_paused_120x40() {
 
 #[test]
 fn golden_proc_followed_120x40() {
-    let rendered = render_proc_mode(|state, snap| {
+    let rendered = render_proc_mode(|state, snap, history| {
         if let btop_model::DataState::Available(ref list) = snap.processes {
             let (rows, _) = btop_ui::build_visible_rows(list, &state.proc);
             state.proc.selected = 1;
             let _ = state.proc.toggle_follow(&rows);
-            state.proc.toggle_pause(Some(list));
+            state.proc.toggle_pause(Some(list), Some(history));
         }
     });
     insta::assert_snapshot!("proc_followed_120x40", rendered);

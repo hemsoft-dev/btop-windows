@@ -318,6 +318,14 @@ impl UiHistory {
     pub fn proc_cpu_slice(&self, id: ProcessIdentity) -> &[f32] {
         self.proc_cpu.get(&id).map_or(&[], |buf| buf.as_slices().0)
     }
+
+    /// Clones per-process CPU sparkline buffers for pausing the process panel cleanly.
+    pub fn snapshot_proc_cpu_map(&self) -> BTreeMap<ProcessIdentity, Vec<f32>> {
+        self.proc_cpu
+            .iter()
+            .map(|(&id, buf)| (id, buf.iter().copied().collect()))
+            .collect()
+    }
 }
 
 fn push_bounded(buf: &mut VecDeque<f32>, value: f32, capacity: usize) {

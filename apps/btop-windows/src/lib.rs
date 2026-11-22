@@ -304,7 +304,7 @@ fn handle_tui_event(
                 k.code, sampler, snapshot, history, config, ui_state, proc_rows,
             )
         }
-        TermEvent::Key(k) => handle_proc_key(k.code, snapshot, ui_state, proc_rows),
+        TermEvent::Key(k) => handle_proc_key(k.code, snapshot, history, ui_state, proc_rows),
         TermEvent::Resize(new_size) => {
             *size = guard.size().unwrap_or(new_size);
             *prev_grid = None;
@@ -418,13 +418,14 @@ fn handle_panel_key(
             ui_state.net.reset_session_totals(snapshot, history);
             true
         }
-        other => handle_proc_key(other, snapshot, ui_state, proc_rows),
+        other => handle_proc_key(other, snapshot, history, ui_state, proc_rows),
     }
 }
 
 fn handle_proc_key(
     code: KeyCode,
     snapshot: &btop_model::Snapshot,
+    history: &UiHistory,
     state: &mut UiState,
     proc_rows: usize,
 ) -> bool {
@@ -466,7 +467,7 @@ fn handle_proc_key(
                 }
                 _ => None,
             };
-            state.proc.toggle_pause(live);
+            state.proc.toggle_pause(live, Some(history));
         }
         KeyCode::Char('F') => {
             return rows_built

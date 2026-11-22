@@ -1,10 +1,10 @@
 //! Read-only Windows process collector backed by `NtQuerySystemInformation(SystemProcessInformation)`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use btop_model::{ProcessEntry, ProcessIdentity};
-use btop_sys::{RawProcessInfo, query_process_information};
+use btop_sys::{RawProcessInfo, query_process_command_line, query_process_information};
 
 use crate::CollectError;
 
@@ -70,11 +70,13 @@ impl ProcessDeltaTracker {
     }
 }
 
-/// Stateful Windows 11 read-only process collector reusing its NT query buffer across ticks.
+/// Stateful Windows 11 read-only process collector reusing its NT query buffer across ticks
+/// and caching immutable per-process command lines keyed by `(pid, create_time_100ns)`.
 #[derive(Debug, Default)]
 pub struct ProcessCollector {
     scratch: Vec<u8>,
     tracker: ProcessDeltaTracker,
+    cmdline_cache: HashMap<ProcessIdentity, Option<String>>,
     last_sample: Option<Instant>,
 }
 
@@ -83,6 +85,7 @@ impl ProcessCollector {
         Self {
             scratch: Vec::with_capacity(256 * 1024),
             tracker: ProcessDeltaTracker::default(),
+            cmdline_cache: HashMap::new(),
             last_sample: None,
         }
     }
@@ -108,9 +111,22 @@ impl ProcessCollector {
         let runnable_threads = raw
             .iter()
             .fold(0u32, |acc, r| acc.saturating_add(r.runnable_threads));
-        let entries = self
+        let mut entries = self
             .tracker
             .compute_entries(&raw, elapsed_100ns, logical_cpus);
+
+        let mut live_ids = HashSet::with_capacity(entries.len());
+        for entry in &mut entries {
+            let id = entry.identity;
+            live_ids.insert(id);
+            let cmdline = self
+                .cmdline_cache
+                .entry(id)
+                .or_insert_with(|| query_process_command_line(id.pid, id.create_time_100ns));
+            entry.command_line.clone_from(cmdline);
+        }
+        self.cmdline_cache.retain(|id, _| live_ids.contains(id));
+
         Ok((entries, runnable_threads))
     }
 }
@@ -181,6 +197,10 @@ mod tests {
         assert!(
             !me.name.is_empty(),
             "current process name must be non-empty"
+        );
+        assert!(
+            me.command_line.as_deref().is_some_and(|c| !c.is_empty()),
+            "current process command_line must be populated for live argument filtering"
         );
 
         // Verify kernel entries render cleanly with non-empty names when present.

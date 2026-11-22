@@ -2,7 +2,7 @@
 //! live substring/`!regex` filtering (`f`/`/`/`Delete`), pause (`u`), follow (`F`), and
 //! per-row CPU sparklines (`proc_cpu_graphs`).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use btop_config::Config;
 use btop_model::{DataState, ProcessEntry, ProcessIdentity, Snapshot};
@@ -89,6 +89,7 @@ pub struct ProcViewState {
     pub filter_editing: bool,
     pub paused: bool,
     pub frozen_processes: Option<Vec<ProcessEntry>>,
+    pub frozen_cpu_history: Option<BTreeMap<ProcessIdentity, Vec<f32>>>,
     pub followed: Option<ProcessIdentity>,
     pub per_core_cpu: bool,
     pub mem_bytes: bool,
@@ -108,6 +109,7 @@ impl Default for ProcViewState {
             filter_editing: false,
             paused: false,
             frozen_processes: None,
+            frozen_cpu_history: None,
             followed: None,
             per_core_cpu: false,
             mem_bytes: true,
@@ -129,6 +131,7 @@ impl ProcViewState {
             filter_editing: false,
             paused: false,
             frozen_processes: None,
+            frozen_cpu_history: None,
             followed: None,
             per_core_cpu: config.proc_per_core,
             mem_bytes: config.proc_mem_bytes,
@@ -325,15 +328,37 @@ impl ProcViewState {
         true
     }
 
-    /// Toggles pause (`u`), freezing the current process list so live ticks don't shift rows.
-    pub fn toggle_pause(&mut self, live_procs: Option<&[ProcessEntry]>) {
+    /// Toggles pause (`u`), freezing both the process list and per-process sparkline history
+    /// so live ticks neither shift rows nor mutate/evict paused sparklines.
+    pub fn toggle_pause(
+        &mut self,
+        live_procs: Option<&[ProcessEntry]>,
+        history: Option<&UiHistory>,
+    ) {
         if self.paused {
             self.paused = false;
             self.frozen_processes = None;
+            self.frozen_cpu_history = None;
         } else if let Some(procs) = live_procs {
             self.paused = true;
             self.frozen_processes = Some(procs.to_vec());
+            self.frozen_cpu_history = history.map(UiHistory::snapshot_proc_cpu_map);
         }
+    }
+
+    /// Returns the per-process sparkline series for `id`, reading from `frozen_cpu_history`
+    /// while paused so live history updates or process exits cannot alter paused sparklines.
+    pub fn cpu_sparkline_series<'a>(
+        &'a self,
+        id: ProcessIdentity,
+        live_history: &'a UiHistory,
+    ) -> &'a [f32] {
+        if self.paused
+            && let Some(ref frozen) = self.frozen_cpu_history
+        {
+            return frozen.get(&id).map_or(&[], Vec::as_slice);
+        }
+        live_history.proc_cpu_slice(id)
     }
 
     /// Toggles process following (`F`) on the currently selected row by exact `(PID, CreateTime)`.
@@ -430,12 +455,13 @@ pub fn render_proc_box(
         height: rect.height.saturating_sub(2),
     };
 
-    if let Some((rows, filter_error)) = built {
+    if let (Some(active_procs), Some((rows, filter_error))) = (active, built) {
         render_proc_table(
             grid,
             inner,
             snapshot,
             history,
+            active_procs,
             &rows,
             filter_error.as_deref(),
             view,
@@ -650,6 +676,7 @@ fn render_proc_filter_and_badges(
 fn render_status_banners(
     grid: &mut Grid,
     inner: Rect,
+    active_procs: &[ProcessEntry],
     rows: &[DisplayProcRow<'_>],
     filter_error: Option<&str>,
     view: &ProcViewState,
@@ -661,7 +688,7 @@ fn render_status_banners(
     if (view.paused || view.followed.is_some()) && y < max_y {
         let (bg, text) = match (view.paused, view.followed) {
             (true, Some(target)) => {
-                let label = format_follow_target(target, rows);
+                let label = format_follow_target(target, active_procs, rows);
                 (
                     theme.proc_banner_bg,
                     format!(" PAUSED | FOLLOWING {label} (u resume, F unfollow)"),
@@ -672,7 +699,7 @@ fn render_status_banners(
                 " PAUSED - process list frozen (press u to resume)".to_owned(),
             ),
             (false, Some(target)) => {
-                let label = format_follow_target(target, rows);
+                let label = format_follow_target(target, active_procs, rows);
                 (
                     theme.proc_follow_bg,
                     format!(" FOLLOWING {label} (press F to stop)"),
@@ -707,9 +734,15 @@ fn render_status_banners(
     y.saturating_sub(inner.y)
 }
 
-fn format_follow_target(target: ProcessIdentity, rows: &[DisplayProcRow<'_>]) -> String {
-    if let Some(row) = rows.iter().find(|r| r.entry.identity == target) {
+fn format_follow_target(
+    target: ProcessIdentity,
+    active_procs: &[ProcessEntry],
+    visible_rows: &[DisplayProcRow<'_>],
+) -> String {
+    if let Some(row) = visible_rows.iter().find(|r| r.entry.identity == target) {
         format!("{} (PID {})", row.entry.name, target.pid)
+    } else if let Some(entry) = active_procs.iter().find(|p| p.identity == target) {
+        format!("{} (PID {}, hidden)", entry.name, target.pid)
     } else {
         format!("PID {} (exited)", target.pid)
     }
@@ -855,6 +888,7 @@ fn render_proc_table(
     inner: Rect,
     snapshot: &Snapshot,
     history: &UiHistory,
+    active_procs: &[ProcessEntry],
     rows: &[DisplayProcRow<'_>],
     filter_error: Option<&str>,
     view: &ProcViewState,
@@ -874,7 +908,8 @@ fn render_proc_table(
         return;
     }
 
-    let banner_rows = render_status_banners(grid, inner, rows, filter_error, view, theme);
+    let banner_rows =
+        render_status_banners(grid, inner, active_procs, rows, filter_error, view, theme);
     let header_y = inner.y.saturating_add(banner_rows);
     let table_h = inner.height.saturating_sub(banner_rows);
     if table_h < 2 {
@@ -1015,7 +1050,7 @@ fn render_proc_row(
     grid.write_str(cols.col_mem, y, &mem_str, base_fg, row_bg, highlighted);
 
     if cols.spark_w > 0 {
-        let series = history.proc_cpu_slice(entry.identity);
+        let series = view.cpu_sparkline_series(entry.identity, history);
         draw_proc_sparkline(
             grid,
             cols.col_spark,
@@ -1296,13 +1331,60 @@ mod tests {
         assert_eq!(view.selected, 1);
         assert_eq!(rows2[view.selected].entry.identity.pid, 20);
 
-        // Pausing captures tick2; unpausing drops the frozen copy.
-        view.toggle_pause(Some(&tick2));
+        // Pausing captures tick2 and its sparkline history; later live mutations/exits do not alter it.
+        let mut hist = UiHistory::default();
+        hist.push(&Snapshot {
+            processes: DataState::Available(tick1.clone()),
+            ..Snapshot::default()
+        });
+        hist.push(&Snapshot {
+            processes: DataState::Available(tick2.clone()),
+            ..Snapshot::default()
+        });
+        view.toggle_pause(Some(&tick2), Some(&hist));
         assert!(view.paused);
         assert_eq!(view.frozen_processes.as_ref().map(Vec::len), Some(2));
-        view.toggle_pause(Some(&tick2));
+        assert_eq!(
+            view.cpu_sparkline_series(tick2[1].identity, &hist),
+            &[10.0, 2.0]
+        );
+
+        // Live snapshot where PID 20 exited and PID 10 jumped to 99% leaves paused sparklines frozen.
+        hist.push(&Snapshot {
+            processes: DataState::Available(vec![entry(10, "a.exe", 4, 10_000, 99.0)]),
+            ..Snapshot::default()
+        });
+        assert_eq!(
+            view.cpu_sparkline_series(tick2[1].identity, &hist),
+            &[10.0, 2.0]
+        );
+        assert_eq!(
+            view.cpu_sparkline_series(tick2[0].identity, &hist),
+            &[5.0, 40.0]
+        );
+
+        // Hidden-by-filter followed process reports `hidden`, not `exited`.
+        let empty_rows: Vec<DisplayProcRow<'_>> = Vec::new();
+        assert_eq!(
+            format_follow_target(tick2[1].identity, &tick2, &empty_rows),
+            "target.exe (PID 20, hidden)"
+        );
+        assert_eq!(
+            format_follow_target(
+                ProcessIdentity {
+                    pid: 9999,
+                    create_time_100ns: 1
+                },
+                &tick2,
+                &empty_rows
+            ),
+            "PID 9999 (exited)"
+        );
+
+        view.toggle_pause(Some(&tick2), Some(&hist));
         assert!(!view.paused);
         assert!(view.frozen_processes.is_none());
+        assert!(view.frozen_cpu_history.is_none());
 
         // Second `F` clears follow.
         assert!(view.toggle_follow(&rows2));

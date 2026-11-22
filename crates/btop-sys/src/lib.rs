@@ -10,6 +10,7 @@ pub mod mem;
 pub mod net;
 pub mod pdh;
 pub mod power;
+pub mod proc_info;
 
 use core::mem::{offset_of, size_of};
 
@@ -25,6 +26,7 @@ pub use net::{
 };
 pub use pdh::{CpuPdhQuery, CpuPdhSample};
 pub use power::{RawPowerStatus, local_utc_offset_secs, query_system_power_status};
+pub use proc_info::query_process_command_line;
 
 /// Matches `UNICODE_STRING` in `winternl.h` (16 bytes on 64-bit targets).
 #[repr(C)]
