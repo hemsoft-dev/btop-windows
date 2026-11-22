@@ -3,9 +3,18 @@
 //! and `\GPU Adapter Memory(*)`), matching ADR-0002.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 /// Maximum number of dedicated hardware GPUs tracked (`gpu0..gpu5`).
 pub const MAX_GPUS: usize = 6;
+
+/// Minimum interval between retrying missing WDDM PDH counters after partial initialization.
+pub const PDH_COUNTER_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Returns `true` when a partial WDDM PDH query should retry registering missing counters.
+pub fn should_retry_missing_counters(has_missing: bool, elapsed: Duration) -> bool {
+    has_missing && elapsed >= PDH_COUNTER_RETRY_INTERVAL
+}
 
 const DXGI_SOFTWARE_FLAG_BIT: u32 = 2;
 const MICROSOFT_VENDOR_ID: u32 = 0x1414;
@@ -159,6 +168,7 @@ mod win {
     use core::ptr;
     use std::collections::BTreeMap;
     use std::fmt;
+    use std::time::Instant;
 
     use windows::Win32::Graphics::Dxgi::{
         CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS,
@@ -173,7 +183,7 @@ mod win {
     use super::{
         GpuPdhMetrics, GpuPdhSample, RawGpuAdapter, aggregate_gpu_engine_utilization,
         aggregate_gpu_memory_bytes, encode_luid, filter_hardware_adapters, is_software_adapter,
-        vendor_name_from_id,
+        should_retry_missing_counters, vendor_name_from_id,
     };
 
     const ERROR_SUCCESS_U32: u32 = 0;
@@ -248,6 +258,7 @@ mod win {
         dedicated_counter: Option<PDH_HCOUNTER>,
         shared_counter: Option<PDH_HCOUNTER>,
         primed: bool,
+        last_retry: Instant,
     }
 
     // SAFETY: `GpuPdhQuery` owns its `PDH_HQUERY` and counter handles exclusively and is
@@ -298,14 +309,47 @@ mod win {
                 dedicated_counter,
                 shared_counter,
                 primed: false,
+                last_retry: Instant::now(),
             })
+        }
+
+        /// Returns `true` when any of the three WDDM PDH counters failed initial registration.
+        pub const fn has_missing_counters(&self) -> bool {
+            self.engine_counter.is_none()
+                || self.dedicated_counter.is_none()
+                || self.shared_counter.is_none()
+        }
+
+        fn retry_missing_counters_if_due(&mut self) {
+            let now = Instant::now();
+            if !should_retry_missing_counters(
+                self.has_missing_counters(),
+                now.saturating_duration_since(self.last_retry),
+            ) {
+                return;
+            }
+            self.last_retry = now;
+            if self.engine_counter.is_none() {
+                self.engine_counter =
+                    add_english_counter(self.query, "\\GPU Engine(*)\\Utilization Percentage");
+            }
+            if self.dedicated_counter.is_none() {
+                self.dedicated_counter =
+                    add_english_counter(self.query, "\\GPU Adapter Memory(*)\\Dedicated Usage");
+            }
+            if self.shared_counter.is_none() {
+                self.shared_counter =
+                    add_english_counter(self.query, "\\GPU Adapter Memory(*)\\Shared Usage");
+            }
         }
 
         /// Collects one WDDM PDH tick.
         ///
         /// Returns `Ok(None)` on the initial baseline call while rate counters warm up, and
-        /// `Ok(Some(sample))` on subsequent ticks.
+        /// `Ok(Some(sample))` on subsequent ticks. Periodically retries any counter that failed
+        /// initial registration so transient partial initialization self-heals.
         pub fn sample(&mut self) -> Result<Option<GpuPdhSample>, String> {
+            self.retry_missing_counters_if_due();
             // SAFETY: `self.query` is a valid opened `PDH_HQUERY`.
             let collect_status = unsafe { PdhCollectQueryData(self.query) };
             if collect_status != ERROR_SUCCESS_U32 {
@@ -630,6 +674,19 @@ mod tests {
         assert_eq!(mem[&luid_amd], 58_000_000);
     }
 
+    #[test]
+    fn partial_pdh_counter_retry_gate_triggers_only_when_missing_and_due() {
+        assert!(!should_retry_missing_counters(
+            false,
+            PDH_COUNTER_RETRY_INTERVAL
+        ));
+        assert!(!should_retry_missing_counters(true, Duration::from_secs(5)));
+        assert!(should_retry_missing_counters(
+            true,
+            PDH_COUNTER_RETRY_INTERVAL
+        ));
+    }
+
     #[cfg(windows)]
     #[test]
     fn live_windows_dxgi_and_wddm_pdh_baseline_runs_cleanly() {
@@ -641,7 +698,7 @@ mod tests {
         if let Some(mut pdh) = GpuPdhQuery::open() {
             // Initial tick warms up rate counters cleanly.
             assert_eq!(pdh.sample().expect("prime WDDM PDH"), None);
-            std::thread::sleep(std::time::Duration::from_millis(80));
+            std::thread::sleep(Duration::from_millis(80));
             let sample = pdh
                 .sample()
                 .expect("collect WDDM PDH sample")

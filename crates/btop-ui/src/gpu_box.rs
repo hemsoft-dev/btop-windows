@@ -339,7 +339,7 @@ fn render_gpu_body(
         );
     }
 
-    render_gpu_graph(grid, graph_rect, gpu_idx, history, config, theme);
+    render_gpu_graph(grid, graph_rect, gpu_idx, gpu, history, config, theme);
     render_gpu_stats_pane(grid, stats_rect, gpu, config, theme, stale_note);
 }
 
@@ -347,6 +347,7 @@ fn render_gpu_graph(
     grid: &mut Grid,
     rect: Rect,
     gpu_idx: u8,
+    gpu: &GpuSnapshot,
     history: &UiHistory,
     config: &Config,
     theme: &ThemePalette,
@@ -354,7 +355,7 @@ fn render_gpu_graph(
     if rect.width < 4 || rect.height < 2 {
         return;
     }
-    let series = history.gpu_util_slice(gpu_idx);
+    let series = history.gpu_util_slice_for(gpu_idx, gpu);
     if config.gpu_mirror_graph && rect.height >= 4 {
         let upper_h = rect.height.div_ceil(2);
         let lower_h = rect.height.saturating_sub(upper_h);
