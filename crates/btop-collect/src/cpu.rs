@@ -3,13 +3,16 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use btop_model::{CoreKind, CoreSample, CpuSnapshot, DataState, LogicalCpuId, Snapshot};
+use btop_model::{
+    CoreKind, CoreSample, CpuSnapshot, DataState, LogicalCpuId, MemSnapshot, Snapshot,
+};
 use btop_sys::{
     SystemProcessorPerformanceInformation, query_processor_performance, read_cpu_model_name,
-    system_uptime_secs,
+    system_uptime_secs, total_physical_memory_bytes,
 };
 
 use crate::math::cpu_busy_percent;
+use crate::proc::ProcessCollector;
 use crate::{CollectError, SnapshotSource};
 
 /// Computes per-core and aggregate CPU percentages from two consecutive
@@ -95,12 +98,14 @@ impl CpuCollector {
     }
 }
 
-/// Live Windows 11 snapshot source producing CPU snapshots on each tick.
+/// Live Windows 11 snapshot source producing CPU and read-only process snapshots on each tick.
 #[derive(Debug)]
 pub struct LiveCollector {
     hostname: String,
     username: String,
+    total_phys_mem: Option<u64>,
     cpu: CpuCollector,
+    procs: ProcessCollector,
 }
 
 impl LiveCollector {
@@ -112,10 +117,15 @@ impl LiveCollector {
             .or_else(|_| std::env::var("USER"))
             .unwrap_or_else(|_| "user".to_owned());
         let cpu = CpuCollector::new()?;
+        let mut procs = ProcessCollector::new();
+        // Prime the baseline process CPU timestamps so the first displayed tick has real deltas.
+        let _ = procs.sample(cpu.prev.len().max(1));
         Ok(Self {
             hostname,
             username,
+            total_phys_mem: total_physical_memory_bytes(),
             cpu,
+            procs,
         })
     }
 }
@@ -129,12 +139,26 @@ impl SnapshotSource for LiveCollector {
         )
         .unwrap_or(u64::MAX);
         let cpu_snapshot = self.cpu.sample()?;
+        let logical_cpus = cpu_snapshot.cores.len().max(1);
+        let processes = match self.procs.sample(logical_cpus) {
+            Ok(list) => DataState::Available(list),
+            Err(err) => DataState::Unavailable(err.to_string()),
+        };
+        let mem = match self.total_phys_mem {
+            Some(total_bytes) => DataState::Available(MemSnapshot {
+                total_bytes,
+                ..MemSnapshot::default()
+            }),
+            None => DataState::WarmingUp,
+        };
 
         Ok(Snapshot {
             timestamp_ms,
             hostname: self.hostname.clone(),
             username: self.username.clone(),
             cpu: DataState::Available(cpu_snapshot),
+            mem,
+            processes,
             ..Snapshot::default()
         })
     }

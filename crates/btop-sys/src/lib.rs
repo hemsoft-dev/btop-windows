@@ -5,8 +5,242 @@
 
 #![allow(non_camel_case_types, non_snake_case)]
 
-#[cfg(windows)]
 use core::mem::{offset_of, size_of};
+
+/// Matches `UNICODE_STRING` in `winternl.h` (16 bytes on 64-bit targets).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct UnicodeString {
+    pub length: u16,
+    pub maximum_length: u16,
+    pub buffer: *const u16,
+}
+
+impl Default for UnicodeString {
+    fn default() -> Self {
+        Self {
+            length: 0,
+            maximum_length: 0,
+            buffer: core::ptr::null(),
+        }
+    }
+}
+
+/// Matches `SYSTEM_PROCESS_INFORMATION` in `winternl.h` / `phnt` on `x86_64` Windows 11.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemProcessInformation {
+    pub next_entry_offset: u32,
+    pub number_of_threads: u32,
+    pub working_set_private_size: i64,
+    pub hard_fault_count: u32,
+    pub number_of_threads_high_watermark: u32,
+    pub cycle_time: u64,
+    pub create_time: i64,
+    pub user_time: i64,
+    pub kernel_time: i64,
+    pub image_name: UnicodeString,
+    pub base_priority: i32,
+    pub unique_process_id: usize,
+    pub inherited_from_unique_process_id: usize,
+    pub handle_count: u32,
+    pub session_id: u32,
+    pub unique_process_key: usize,
+    pub peak_virtual_size: usize,
+    pub virtual_size: usize,
+    pub page_fault_count: u32,
+    pub peak_working_set_size: usize,
+    pub working_set_size: usize,
+    pub quota_peak_paged_pool_usage: usize,
+    pub quota_paged_pool_usage: usize,
+    pub quota_peak_non_paged_pool_usage: usize,
+    pub quota_non_paged_pool_usage: usize,
+    pub pagefile_usage: usize,
+    pub peak_pagefile_usage: usize,
+    pub private_page_count: usize,
+    pub read_operation_count: i64,
+    pub write_operation_count: i64,
+    pub other_operation_count: i64,
+    pub read_transfer_count: i64,
+    pub write_transfer_count: i64,
+    pub other_transfer_count: i64,
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(size_of::<UnicodeString>() == 16);
+    assert!(size_of::<SystemProcessInformation>() == 256);
+    assert!(offset_of!(SystemProcessInformation, next_entry_offset) == 0);
+    assert!(offset_of!(SystemProcessInformation, number_of_threads) == 4);
+    assert!(offset_of!(SystemProcessInformation, working_set_private_size) == 8);
+    assert!(offset_of!(SystemProcessInformation, create_time) == 32);
+    assert!(offset_of!(SystemProcessInformation, user_time) == 40);
+    assert!(offset_of!(SystemProcessInformation, kernel_time) == 48);
+    assert!(offset_of!(SystemProcessInformation, image_name) == 56);
+    assert!(offset_of!(SystemProcessInformation, base_priority) == 72);
+    assert!(offset_of!(SystemProcessInformation, unique_process_id) == 80);
+    assert!(offset_of!(SystemProcessInformation, inherited_from_unique_process_id) == 88);
+    assert!(offset_of!(SystemProcessInformation, working_set_size) == 144);
+    assert!(offset_of!(SystemProcessInformation, private_page_count) == 200);
+    assert!(offset_of!(SystemProcessInformation, read_transfer_count) == 232);
+    assert!(offset_of!(SystemProcessInformation, write_transfer_count) == 240);
+};
+
+/// Safe, owned process row decoded from a raw `SYSTEM_PROCESS_INFORMATION` buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawProcessInfo {
+    pub pid: u32,
+    pub parent_pid: u32,
+    pub create_time_100ns: u64,
+    pub kernel_time_100ns: u64,
+    pub user_time_100ns: u64,
+    pub threads: u32,
+    pub name: String,
+    pub working_set_private_bytes: u64,
+    pub io_read_bytes: u64,
+    pub io_write_bytes: u64,
+}
+
+/// Safely walks a `NextEntryOffset`-linked buffer of `SYSTEM_PROCESS_INFORMATION` records.
+///
+/// Rejects truncated headers, backward/cyclic offsets, and out-of-bounds `UNICODE_STRING`
+/// image-name pointers without panicking or reading outside `raw`.
+pub fn parse_process_information_buffer(raw: &[u8]) -> Result<Vec<RawProcessInfo>, String> {
+    let entry_size = size_of::<SystemProcessInformation>();
+    if raw.len() < entry_size {
+        return Err(format!(
+            "process information buffer truncated: {} bytes < {entry_size}",
+            raw.len()
+        ));
+    }
+
+    let buf_start = raw.as_ptr() as usize;
+    let buf_end = buf_start
+        .checked_add(raw.len())
+        .ok_or_else(|| "process buffer address overflow".to_owned())?;
+
+    let mut results = Vec::new();
+    let mut offset = 0usize;
+    let mut visited = 0usize;
+    let max_entries = raw.len() / entry_size + 1;
+
+    loop {
+        if visited > max_entries {
+            return Err("cyclic NextEntryOffset detected in process buffer".to_owned());
+        }
+        visited += 1;
+
+        let Some(end) = offset.checked_add(entry_size) else {
+            return Err("process entry offset overflow".to_owned());
+        };
+        if end > raw.len() {
+            return Err(format!(
+                "truncated SYSTEM_PROCESS_INFORMATION entry at offset {offset} (len {})",
+                raw.len()
+            ));
+        }
+
+        // SAFETY: `offset + entry_size <= raw.len()`, and `read_unaligned` handles any alignment.
+        let entry = unsafe {
+            raw.as_ptr()
+                .add(offset)
+                .cast::<SystemProcessInformation>()
+                .read_unaligned()
+        };
+
+        let pid = u32::try_from(entry.unique_process_id).unwrap_or(u32::MAX);
+        let parent_pid = u32::try_from(entry.inherited_from_unique_process_id).unwrap_or(0);
+        let name = decode_bounded_image_name(entry.image_name, pid, buf_start, buf_end)?;
+
+        results.push(RawProcessInfo {
+            pid,
+            parent_pid,
+            create_time_100ns: u64::try_from(entry.create_time).unwrap_or(0),
+            kernel_time_100ns: u64::try_from(entry.kernel_time).unwrap_or(0),
+            user_time_100ns: u64::try_from(entry.user_time).unwrap_or(0),
+            threads: entry.number_of_threads,
+            name,
+            working_set_private_bytes: u64::try_from(entry.working_set_private_size).unwrap_or(0),
+            io_read_bytes: u64::try_from(entry.read_transfer_count).unwrap_or(0),
+            io_write_bytes: u64::try_from(entry.write_transfer_count).unwrap_or(0),
+        });
+
+        if entry.next_entry_offset == 0 {
+            break;
+        }
+        let step = usize::try_from(entry.next_entry_offset)
+            .map_err(|_| "NextEntryOffset conversion overflow".to_owned())?;
+        if step < entry_size {
+            return Err(format!(
+                "invalid NextEntryOffset {step} smaller than entry size {entry_size}"
+            ));
+        }
+        let Some(next) = offset.checked_add(step) else {
+            return Err("NextEntryOffset addition overflow".to_owned());
+        };
+        if next >= raw.len() {
+            return Err(format!(
+                "NextEntryOffset points outside buffer: {next} >= {}",
+                raw.len()
+            ));
+        }
+        offset = next;
+    }
+
+    Ok(results)
+}
+
+fn decode_bounded_image_name(
+    unicode: UnicodeString,
+    pid: u32,
+    buf_start: usize,
+    buf_end: usize,
+) -> Result<String, String> {
+    if unicode.length == 0 || unicode.buffer.is_null() {
+        return Ok(default_kernel_process_name(pid));
+    }
+    if !unicode.length.is_multiple_of(2) {
+        return Err(format!(
+            "odd UNICODE_STRING byte length {} for PID {pid}",
+            unicode.length
+        ));
+    }
+    let ptr_addr = unicode.buffer as usize;
+    let byte_len = usize::from(unicode.length);
+    let Some(ptr_end) = ptr_addr.checked_add(byte_len) else {
+        return Err(format!("UNICODE_STRING address overflow for PID {pid}"));
+    };
+    if ptr_addr < buf_start || ptr_end > buf_end {
+        return Err(format!(
+            "UNICODE_STRING pointer out of buffer bounds for PID {pid}"
+        ));
+    }
+
+    let unit_count = byte_len / 2;
+    let mut units = Vec::with_capacity(unit_count);
+    for idx in 0..unit_count {
+        // SAFETY: `[ptr_addr, ptr_end)` is verified strictly inside `[buf_start, buf_end)`.
+        let code_unit = unsafe { unicode.buffer.add(idx).read_unaligned() };
+        units.push(code_unit);
+    }
+    let decoded = String::from_utf16_lossy(&units)
+        .trim_matches('\0')
+        .trim()
+        .to_owned();
+    if decoded.is_empty() {
+        Ok(default_kernel_process_name(pid))
+    } else {
+        Ok(decoded)
+    }
+}
+
+fn default_kernel_process_name(pid: u32) -> String {
+    match pid {
+        0 => "System Idle Process".to_owned(),
+        4 => "System".to_owned(),
+        other => format!("pid:{other}"),
+    }
+}
 
 /// Matches `SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION` in `winternl.h` / `phnt`.
 ///
@@ -67,16 +301,21 @@ mod win {
     };
     use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
     use windows_sys::Win32::System::SystemInformation::{
-        GetSystemInfo, GetTickCount64, SYSTEM_INFO,
+        GetSystemInfo, GetTickCount64, GlobalMemoryStatusEx, MEMORYSTATUSEX, SYSTEM_INFO,
     };
     use windows_sys::Win32::System::Threading::{
         CreateEventW, CreateWaitableTimerW, INFINITE, ResetEvent, SetEvent, SetWaitableTimer,
         WaitForMultipleObjects,
     };
 
-    use super::SystemProcessorPerformanceInformation;
+    use super::{
+        RawProcessInfo, SystemProcessorPerformanceInformation, parse_process_information_buffer,
+    };
 
+    const SYSTEM_PROCESS_INFORMATION_CLASS: u32 = 5;
     const SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION_CLASS: u32 = 8;
+    const INITIAL_PROC_BUF_BYTES: usize = 256 * 1024;
+    const MAX_PROC_BUF_BYTES: usize = 128 * 1024 * 1024;
 
     #[link(name = "ntdll")]
     unsafe extern "system" {
@@ -86,6 +325,68 @@ mod win {
             system_information_length: u32,
             return_length: *mut u32,
         ) -> i32;
+    }
+
+    /// Queries all running Windows processes via a single `NtQuerySystemInformation(5)` call,
+    /// reusing `scratch` across ticks and retrying `STATUS_INFO_LENGTH_MISMATCH` with 25% headroom.
+    pub fn query_process_information(scratch: &mut Vec<u8>) -> Result<Vec<RawProcessInfo>, String> {
+        if scratch.len() < INITIAL_PROC_BUF_BYTES {
+            scratch.resize(INITIAL_PROC_BUF_BYTES, 0);
+        }
+
+        for _ in 0..8 {
+            let buf_len = u32::try_from(scratch.len())
+                .map_err(|_| "process query buffer exceeds u32 length".to_owned())?;
+            let mut returned_len = 0u32;
+
+            // SAFETY: `scratch` provides `buf_len` writable bytes for NT to fill.
+            let status = unsafe {
+                NtQuerySystemInformation(
+                    SYSTEM_PROCESS_INFORMATION_CLASS,
+                    scratch.as_mut_ptr().cast::<c_void>(),
+                    buf_len,
+                    &raw mut returned_len,
+                )
+            };
+
+            if status >= 0 {
+                let valid_len = (returned_len as usize).min(scratch.len());
+                return parse_process_information_buffer(&scratch[..valid_len]);
+            }
+
+            if status == STATUS_INFO_LENGTH_MISMATCH {
+                let needed = (returned_len as usize).max(scratch.len());
+                let grown = needed
+                    .saturating_add(needed / 4)
+                    .max(scratch.len().saturating_add(64 * 1024));
+                if grown > MAX_PROC_BUF_BYTES {
+                    return Err(format!(
+                        "process query buffer limit exceeded ({grown} bytes > {MAX_PROC_BUF_BYTES})"
+                    ));
+                }
+                scratch.resize(grown, 0);
+                continue;
+            }
+
+            return Err(format!(
+                "NtQuerySystemInformation(SystemProcessInformation) failed with NTSTATUS 0x{status:08X}"
+            ));
+        }
+
+        Err("NtQuerySystemInformation(SystemProcessInformation) did not converge".to_owned())
+    }
+
+    /// Returns total physical memory in bytes via `GlobalMemoryStatusEx`.
+    pub fn total_physical_memory_bytes() -> Option<u64> {
+        // SAFETY: `MEMORYSTATUSEX` is POD; `dwLength` must be initialized before calling Win32.
+        let mut status: MEMORYSTATUSEX = unsafe { core::mem::zeroed() };
+        status.dwLength = u32::try_from(size_of::<MEMORYSTATUSEX>()).ok()?;
+        let ok = unsafe { GlobalMemoryStatusEx(&raw mut status) };
+        if ok == 0 || status.ullTotalPhys == 0 {
+            None
+        } else {
+            Some(status.ullTotalPhys)
+        }
     }
 
     /// Queries per-logical-processor kernel/user/idle times for the active processor group
@@ -309,7 +610,17 @@ mod stub {
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
 
-    use super::SystemProcessorPerformanceInformation;
+    use super::{RawProcessInfo, SystemProcessorPerformanceInformation};
+
+    pub fn query_process_information(
+        _scratch: &mut Vec<u8>,
+    ) -> Result<Vec<RawProcessInfo>, String> {
+        Err("Windows process telemetry is only available on Windows".to_owned())
+    }
+
+    pub fn total_physical_memory_bytes() -> Option<u64> {
+        None
+    }
 
     pub fn query_processor_performance()
     -> Result<Vec<SystemProcessorPerformanceInformation>, String> {
@@ -391,11 +702,119 @@ mod stub {
 
 #[cfg(not(windows))]
 pub use stub::{
-    TimerWake, TimerWaker, WaitableWakeTimer, query_processor_performance, read_cpu_model_name,
-    system_uptime_secs,
+    TimerWake, TimerWaker, WaitableWakeTimer, query_process_information,
+    query_processor_performance, read_cpu_model_name, system_uptime_secs,
+    total_physical_memory_bytes,
 };
 #[cfg(windows)]
 pub use win::{
-    TimerWake, TimerWaker, WaitableWakeTimer, query_processor_performance, read_cpu_model_name,
-    system_uptime_secs,
+    TimerWake, TimerWaker, WaitableWakeTimer, query_process_information,
+    query_processor_performance, read_cpu_model_name, system_uptime_secs,
+    total_physical_memory_bytes,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parser_rejects_truncated_and_corrupted_process_buffers() {
+        // Too small to hold even one header.
+        let tiny = vec![0u8; 64];
+        assert!(parse_process_information_buffer(&tiny).is_err());
+
+        // Header with NextEntryOffset pointing past buffer end.
+        let mut bad_next = vec![0u8; size_of::<SystemProcessInformation>()];
+        let mut header = SystemProcessInformation {
+            next_entry_offset: 512,
+            unique_process_id: 42,
+            ..Default::default()
+        };
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (&raw const header).cast::<u8>(),
+                bad_next.as_mut_ptr(),
+                size_of::<SystemProcessInformation>(),
+            );
+        }
+        assert!(parse_process_information_buffer(&bad_next).is_err());
+
+        // Header with NextEntryOffset smaller than entry size (cycle / overlap risk).
+        header.next_entry_offset = 16;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (&raw const header).cast::<u8>(),
+                bad_next.as_mut_ptr(),
+                size_of::<SystemProcessInformation>(),
+            );
+        }
+        assert!(parse_process_information_buffer(&bad_next).is_err());
+    }
+
+    #[test]
+    fn parser_decodes_valid_chain_and_kernel_pid_names() {
+        let entry_size = size_of::<SystemProcessInformation>();
+        let name_utf16: Vec<u16> = "notepad.exe".encode_utf16().collect();
+        let name_bytes = name_utf16.len() * 2;
+        let stride = entry_size + name_bytes;
+        let mut buf = vec![0u8; stride + entry_size];
+
+        // Entry 0: PID 0 with empty image name -> "System Idle Process"
+        let e0 = SystemProcessInformation {
+            next_entry_offset: u32::try_from(stride).expect("stride fits u32"),
+            number_of_threads: 16,
+            unique_process_id: 0,
+            ..Default::default()
+        };
+        // Entry 1: PID 1234 with image_name pointing into trailing bytes of Entry 0's slot.
+        #[allow(clippy::cast_ptr_alignment)]
+        let name_ptr = unsafe { buf.as_ptr().add(entry_size).cast::<u16>() };
+        let e1 = SystemProcessInformation {
+            next_entry_offset: 0,
+            number_of_threads: 4,
+            working_set_private_size: 4_194_304,
+            create_time: 133_801_632_000_000_000,
+            user_time: 200,
+            kernel_time: 300,
+            image_name: UnicodeString {
+                length: u16::try_from(name_bytes).expect("len"),
+                maximum_length: u16::try_from(name_bytes).expect("len"),
+                buffer: name_ptr,
+            },
+            unique_process_id: 1234,
+            inherited_from_unique_process_id: 4,
+            read_transfer_count: 1024,
+            write_transfer_count: 512,
+            ..Default::default()
+        };
+
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (&raw const e0).cast::<u8>(),
+                buf.as_mut_ptr(),
+                entry_size,
+            );
+            core::ptr::copy_nonoverlapping(
+                name_utf16.as_ptr().cast::<u8>(),
+                buf.as_mut_ptr().add(entry_size),
+                name_bytes,
+            );
+            core::ptr::copy_nonoverlapping(
+                (&raw const e1).cast::<u8>(),
+                buf.as_mut_ptr().add(stride),
+                entry_size,
+            );
+        }
+
+        let parsed = parse_process_information_buffer(&buf).expect("parse valid chain");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].pid, 0);
+        assert_eq!(parsed[0].name, "System Idle Process");
+        assert_eq!(parsed[1].pid, 1234);
+        assert_eq!(parsed[1].parent_pid, 4);
+        assert_eq!(parsed[1].name, "notepad.exe");
+        assert_eq!(parsed[1].working_set_private_bytes, 4_194_304);
+        assert_eq!(parsed[1].io_read_bytes, 1024);
+        assert_eq!(parsed[1].io_write_bytes, 512);
+    }
+}

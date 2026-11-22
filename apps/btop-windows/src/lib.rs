@@ -5,11 +5,11 @@ use std::time::Duration;
 
 use btop_collect::{CollectError, Sampler, SnapshotSource};
 use btop_config::{Config, ConfigError};
-use btop_model::{RecordStats, SnapshotRecorder};
+use btop_model::{DataState, RecordStats, SnapshotRecorder};
 use btop_term::{
     DiffEncoder, Grid, InputSource, KeyCode, Size, TermError, TermEvent, TerminalGuard,
 };
-use btop_ui::UiHistory;
+use btop_ui::{UiHistory, UiState, visible_proc_rows};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -120,6 +120,7 @@ pub fn run_tui_loop(
     overrides: &ConfigOverrides,
 ) -> Result<u64, AppError> {
     let sampler = Sampler::spawn(source, config.update_ms, recorder)?;
+    config.update_ms = sampler.update_ms();
     let mut guard = TerminalGuard::enter()?;
 
     let mut size = guard.size().unwrap_or(Size {
@@ -127,6 +128,7 @@ pub fn run_tui_loop(
         height: 24,
     });
     let mut history = UiHistory::default();
+    let mut ui_state = UiState::from_config(&config);
     let mut last_generation = sampler.generation();
     let mut current_snapshot = sampler.latest();
     history.push(&current_snapshot);
@@ -145,12 +147,19 @@ pub fn run_tui_loop(
                 dirty = true;
             }
 
+            let proc_count = match &current_snapshot.processes {
+                DataState::Available(list) | DataState::Stale { value: list, .. } => list.len(),
+                _ => 0,
+            };
+            let proc_rows = visible_proc_rows(size, &config);
+            ui_state.proc.clamp(proc_count, proc_rows);
+
             if dirty {
                 let encoder = DiffEncoder {
                     sync_output: config.terminal_sync,
                 };
                 let next_grid =
-                    btop_ui::render_with_history(&current_snapshot, &history, &config, size);
+                    btop_ui::render_frame(&current_snapshot, &history, &ui_state, &config, size);
                 let payload = encoder.encode(prev_grid.as_ref(), &next_grid);
                 guard.write_frame(&payload)?;
                 prev_grid = Some(next_grid);
@@ -166,28 +175,23 @@ pub fn run_tui_loop(
                 Some(TermEvent::Key(k)) if k.is_ctrl_c() || k.code == KeyCode::Char('q') => {
                     break;
                 }
-                Some(TermEvent::Key(k)) if k.ctrl && matches!(k.code, KeyCode::Char('r' | 'R')) => {
-                    if let Ok(reloaded) = load_config(config_path, overrides) {
-                        config = reloaded;
-                        config.update_ms = sampler.set_update_ms(config.update_ms);
-                        prev_grid = None;
+                Some(event) => {
+                    if handle_tui_event(
+                        event,
+                        &sampler,
+                        &guard,
+                        &mut size,
+                        &mut config,
+                        config_path,
+                        overrides,
+                        &mut ui_state,
+                        proc_count,
+                        proc_rows,
+                        &mut prev_grid,
+                    ) {
                         dirty = true;
                     }
                 }
-                Some(TermEvent::Key(k)) if matches!(k.code, KeyCode::Char('+' | '=')) => {
-                    config.update_ms = sampler.adjust_update_ms(100);
-                    dirty = true;
-                }
-                Some(TermEvent::Key(k)) if matches!(k.code, KeyCode::Char('-' | '_')) => {
-                    config.update_ms = sampler.adjust_update_ms(-100);
-                    dirty = true;
-                }
-                Some(TermEvent::Resize(new_size)) => {
-                    size = guard.size().unwrap_or(new_size);
-                    prev_grid = None;
-                    dirty = true;
-                }
-                Some(TermEvent::Key(_) | TermEvent::Mouse(_)) => {}
                 None => {
                     if let Ok(live) = guard.size()
                         && live != size
@@ -221,6 +225,72 @@ pub fn run_tui_loop(
     }
 
     Ok(frames_rendered)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_tui_event(
+    event: TermEvent,
+    sampler: &Sampler,
+    guard: &TerminalGuard,
+    size: &mut Size,
+    config: &mut Config,
+    config_path: Option<&Path>,
+    overrides: &ConfigOverrides,
+    ui_state: &mut UiState,
+    proc_count: usize,
+    proc_rows: usize,
+    prev_grid: &mut Option<Grid>,
+) -> bool {
+    match event {
+        TermEvent::Key(k) if k.ctrl && matches!(k.code, KeyCode::Char('r' | 'R')) => {
+            if let Ok(reloaded) = load_config(config_path, overrides) {
+                *config = reloaded;
+                config.update_ms = sampler.set_update_ms(config.update_ms);
+                *ui_state = UiState::from_config(config);
+                *prev_grid = None;
+                return true;
+            }
+            false
+        }
+        TermEvent::Key(k) if matches!(k.code, KeyCode::Char('+' | '=')) => {
+            config.update_ms = sampler.adjust_update_ms(100);
+            true
+        }
+        TermEvent::Key(k) if matches!(k.code, KeyCode::Char('-' | '_')) => {
+            config.update_ms = sampler.adjust_update_ms(-100);
+            true
+        }
+        TermEvent::Key(k) => handle_proc_key(k.code, ui_state, proc_count, proc_rows),
+        TermEvent::Resize(new_size) => {
+            *size = guard.size().unwrap_or(new_size);
+            *prev_grid = None;
+            true
+        }
+        TermEvent::Mouse(_) => false,
+    }
+}
+
+fn handle_proc_key(
+    code: KeyCode,
+    state: &mut UiState,
+    proc_count: usize,
+    proc_rows: usize,
+) -> bool {
+    match code {
+        KeyCode::Up => state.proc.move_up(proc_count, proc_rows),
+        KeyCode::Down => state.proc.move_down(proc_count, proc_rows),
+        KeyCode::PageUp => state.proc.page_up(proc_count, proc_rows),
+        KeyCode::PageDown => state.proc.page_down(proc_count, proc_rows),
+        KeyCode::Home => state.proc.home(proc_count, proc_rows),
+        KeyCode::End => state.proc.end(proc_count, proc_rows),
+        KeyCode::Left => state.proc.prev_sort(),
+        KeyCode::Right => state.proc.next_sort(),
+        KeyCode::Char('r') => state.proc.toggle_reverse(),
+        KeyCode::Char('c') => state.proc.toggle_per_core(),
+        KeyCode::Char('%') => state.proc.toggle_mem_bytes(),
+        _ => return false,
+    }
+    true
 }
 
 #[cfg(test)]

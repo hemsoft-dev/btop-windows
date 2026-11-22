@@ -1,6 +1,7 @@
 //! System telemetry collectors, waitable-timer sampler, and pure delta mathematics.
 
 pub mod cpu;
+pub mod proc;
 pub mod replay;
 pub mod sampler;
 
@@ -8,6 +9,7 @@ use btop_model::Snapshot;
 use thiserror::Error;
 
 pub use cpu::{CpuCollector, LiveCollector, compute_cpu_deltas};
+pub use proc::{ProcessCollector, ProcessDeltaTracker};
 pub use replay::{ReplaySource, StubLiveSource};
 pub use sampler::{MAX_UPDATE_MS, MIN_UPDATE_MS, Sampler};
 

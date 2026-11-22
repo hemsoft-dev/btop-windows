@@ -51,6 +51,8 @@ pub struct Config {
     pub proc_sorting: String,
     pub proc_reversed: bool,
     pub proc_tree: bool,
+    pub proc_per_core: bool,
+    pub proc_mem_bytes: bool,
     pub cpu_util_mode: String,
     /// Unknown or deferred upstream keys preserved verbatim when saving `btop.conf`.
     pub preserved_unknown: BTreeMap<String, String>,
@@ -74,6 +76,8 @@ impl Default for Config {
             proc_sorting: "cpu lazy".to_owned(),
             proc_reversed: false,
             proc_tree: false,
+            proc_per_core: false,
+            proc_mem_bytes: true,
             cpu_util_mode: "time".to_owned(),
             preserved_unknown: BTreeMap::new(),
         }
@@ -155,6 +159,8 @@ impl Config {
                 "proc_sorting" => cfg.proc_sorting = val,
                 "proc_reversed" => cfg.proc_reversed = parse_bool(key, &val)?,
                 "proc_tree" => cfg.proc_tree = parse_bool(key, &val)?,
+                "proc_per_core" => cfg.proc_per_core = parse_bool(key, &val)?,
+                "proc_mem_bytes" => cfg.proc_mem_bytes = parse_bool(key, &val)?,
                 "cpu_util_mode" => cfg.cpu_util_mode = val,
                 "graph_symbol" => {
                     cfg.graph_symbol = match val.as_str() {
