@@ -279,24 +279,7 @@ fn render_mem_chrome(
         cursor = tag_rect.x.saturating_add(tag_rect.width).saturating_add(1);
     }
 
-    let total_label = if state.io_mode {
-        "Disk I/O".to_owned()
-    } else {
-        match &snapshot.mem {
-            DataState::Available(mem) => {
-                format!(
-                    "Total: {}",
-                    format_mem_bytes(mem.total_bytes, config.base_10_sizes)
-                )
-            }
-            DataState::Stale { value, age_ms } => format!(
-                "Total: {} [stale {}ms]",
-                format_mem_bytes(value.total_bytes, config.base_10_sizes),
-                age_ms
-            ),
-            _ => String::new(),
-        }
-    };
+    let total_label = mem_chrome_right_label(snapshot, state, config);
     let right_reserved = if total_label.is_empty() {
         0
     } else {
@@ -304,24 +287,27 @@ fn render_mem_chrome(
     };
     let mid_limit = right_limit.saturating_sub(right_reserved);
 
-    // Compact `[d]isks` and `[i]o` mode indicators in top chrome when space permits.
+    // Compact `[d]isks` and `[i]o` mode indicators in top chrome only when they fit intact
+    // without displacing the right-aligned `Total:` / `Disk I/O` tag.
     let disks_fg = if state.show_disks && !state.io_mode {
         theme.hi_fg
     } else {
         theme.inactive_fg
     };
-    if let Some(d_rect) = draw_border_tag(
-        grid,
-        cursor,
-        rect.y,
-        mid_limit,
-        Some('d'),
-        "isks",
-        theme.mem_box,
-        disks_fg,
-        theme.hi_fg,
-        theme.main_bg,
-    ) {
+    if cursor.saturating_add(7) <= mid_limit
+        && let Some(d_rect) = draw_border_tag(
+            grid,
+            cursor,
+            rect.y,
+            mid_limit,
+            Some('d'),
+            "isks",
+            theme.mem_box,
+            disks_fg,
+            theme.hi_fg,
+            theme.main_bg,
+        )
+    {
         cursor = d_rect.x.saturating_add(d_rect.width).saturating_add(1);
     }
     let io_fg = if state.io_mode {
@@ -329,18 +315,20 @@ fn render_mem_chrome(
     } else {
         theme.inactive_fg
     };
-    if let Some(i_rect) = draw_border_tag(
-        grid,
-        cursor,
-        rect.y,
-        mid_limit,
-        Some('i'),
-        "o",
-        theme.mem_box,
-        io_fg,
-        theme.hi_fg,
-        theme.main_bg,
-    ) {
+    if cursor.saturating_add(4) <= mid_limit
+        && let Some(i_rect) = draw_border_tag(
+            grid,
+            cursor,
+            rect.y,
+            mid_limit,
+            Some('i'),
+            "o",
+            theme.mem_box,
+            io_fg,
+            theme.hi_fg,
+            theme.main_bg,
+        )
+    {
         cursor = i_rect.x.saturating_add(i_rect.width).saturating_add(1);
     }
 
@@ -361,6 +349,24 @@ fn render_mem_chrome(
                 theme.main_bg,
             );
         }
+    }
+}
+
+fn mem_chrome_right_label(snapshot: &Snapshot, state: &UiState, config: &Config) -> String {
+    if state.io_mode {
+        return "Disk I/O".to_owned();
+    }
+    match &snapshot.mem {
+        DataState::Available(mem) => format!(
+            "Total: {}",
+            format_mem_bytes(mem.total_bytes, config.base_10_sizes)
+        ),
+        DataState::Stale { value, age_ms } => format!(
+            "Total: {} [stale {}ms]",
+            format_mem_bytes(value.total_bytes, config.base_10_sizes),
+            age_ms
+        ),
+        _ => String::new(),
     }
 }
 

@@ -53,7 +53,8 @@ pub fn matches_disks_filter(mount: &str, filter: &str) -> bool {
     let Some(drive_letter) = extract_drive_letter(mount) else {
         return false;
     };
-    let (is_exclude, body) = if trimmed.len() >= 8 && trimmed[..8].eq_ignore_ascii_case("exclude=")
+    let (is_exclude, body) = if let Some(prefix) = trimmed.get(..8)
+        && prefix.eq_ignore_ascii_case("exclude=")
     {
         (true, &trimmed[8..])
     } else {
@@ -653,7 +654,7 @@ fn format_disk_io_summary(disk: &DiskSnapshot, base_10: bool) -> String {
             format_rate_bytes_per_sec(r, base_10),
             format_rate_bytes_per_sec(w, base_10)
         ),
-        _ => " I/O: warming...".to_owned(),
+        _ => " I/O: n/a".to_owned(),
     }
 }
 
@@ -685,6 +686,8 @@ mod tests {
         assert!(matches_disks_filter("C:\\", "C D"));
         assert!(!matches_disks_filter("E:\\", "C D"));
         assert!(!matches_disks_filter("E:\\", "exclude=E"));
+        assert!(matches_disks_filter("C:\\", "C D E F💾"));
+        assert!(matches_disks_filter("C:\\", "éxclude=C"));
 
         let snap = Snapshot {
             disks: DataState::Available(vec![

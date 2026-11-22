@@ -41,12 +41,9 @@ pub fn matches_disks_filter(mount: &str, filter: &str) -> bool {
         return false;
     };
 
-    let (is_exclude, body) = if let Some(rest) = trimmed
-        .strip_prefix("exclude=")
-        .or_else(|| trimmed.strip_prefix("EXCLUDE="))
+    let (is_exclude, body) = if let Some(prefix) = trimmed.get(..8)
+        && prefix.eq_ignore_ascii_case("exclude=")
     {
-        (true, rest)
-    } else if trimmed.len() >= 8 && trimmed[..8].eq_ignore_ascii_case("exclude=") {
         (true, &trimmed[8..])
     } else {
         (false, trimmed)
@@ -209,6 +206,11 @@ mod tests {
         assert!(!matches_disks_filter("f:\\", "EXCLUDE=e:,f:\\"));
         assert!(matches_disks_filter("C:\\", "exclude=E,F"));
         assert!(matches_disks_filter("C:\\", "exclude="));
+
+        // Arbitrary multi-byte UTF-8 input around byte index 8 must never panic.
+        assert!(matches_disks_filter("C:\\", "C D E F💾"));
+        assert!(!matches_disks_filter("G:\\", "C D E F💾"));
+        assert!(matches_disks_filter("C:\\", "éxclude=C"));
     }
 
     #[test]

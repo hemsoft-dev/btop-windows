@@ -11,7 +11,7 @@ expression: rendered
 │                                  ⠻⠛⠟⠻⠛⠟⠻⠛⠟⠻⠛⠟│ C03 ■■■■■■■■■■■■■■■■■■■■  43% │
 │pk                                            │ Up 04:00:04  4.95 GHz         │
 ╰─┐WIN11-RYZEN8 | +/- cadence | Ctrl+R reload | q quit┌────────────────────────╯
-╭─┐²mem┌─┐dis┌──────────────────╮╭─┐⁴proc┌────────────┐< cpu lazy ↓ >┌──┐1/50┌─╮
+╭─┐²mem┌─┐io┌──┐Total: 32.0 GiB┌╮╭─┐⁴proc┌────────────┐< cpu lazy ↓ >┌──┐1/50┌─╮
 │ RAM ■■■■■■■■■■■■■■■■■■■■■■■■■ ││     Pid Program               MemB    Cpu%  │
 │ Used          14.1 GiB  44.1% ││    4216 rust-analyzer.exe     1.4G    12.8 █│
 │                  ⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤ ││    4100 Code.exe              642M     5.3 ││
