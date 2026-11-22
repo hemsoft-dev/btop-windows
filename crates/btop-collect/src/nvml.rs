@@ -221,14 +221,21 @@ pub fn normalize_pci_bdf(bdf: &str) -> String {
     trimmed
 }
 
-/// Matches NVML devices 1-to-1 onto DXGI NVIDIA hardware adapters (`vendor_id == 0x10DE`),
-/// keyed by DXGI `AdapterLuid`.
+/// Matches NVML devices onto DXGI NVIDIA hardware adapters (`vendor_id == 0x10DE`),
+/// keyed by DXGI `AdapterLuid`, **only** when the mapping is strictly unambiguous (unique
+/// 1-to-1 mutual match).
 ///
-/// Priority order:
-/// 1. Exact `(vendor_id, device_id)` + normalized name match
-/// 2. Exact normalized name match (or substring fallback when NVIDIA adds/omits prefix)
-/// 3. Exact `(vendor_id, device_id)` match
-/// 4. Final 1-to-1 fallback when exactly one NVIDIA adapter and one NVML device remain
+/// Because DXGI `EnumAdapters1` order and NVML device-index order are independent, ambiguous
+/// multi-GPU configurations (such as two identical NVIDIA GPUs with the same vendor/device ID
+/// and name where DXGI does not expose PCI BDF) are deliberately left unenriched rather than
+/// risking cross-wiring one GPU's thermals/power onto another GPU's utilization/VRAM.
+///
+/// Priority order (each pass only commits strictly unique 1-to-1 mutual matches):
+/// 1. Exact `(vendor_id, device_id)` + exact normalized name
+/// 2. Exact normalized name
+/// 3. Substring normalized name (e.g. when driver adds/omits `NVIDIA ` prefix)
+/// 4. Exact `(vendor_id, device_id)`
+/// 5. Final 1-to-1 fallback when exactly one NVIDIA adapter and one NVML device remain
 pub fn match_nvml_devices(
     adapters: &[RawGpuAdapter],
     devices: &[RawNvmlDevice],
@@ -244,54 +251,51 @@ pub fn match_nvml_devices(
     let mut matched: BTreeMap<u64, RawNvmlDevice> = BTreeMap::new();
     let mut claimed = vec![false; devices.len()];
 
-    // Pass 1: exact (vendor_id, device_id) + normalized name match.
-    for adapter in &nvidia_adapters {
-        let a_name = normalize_gpu_name(&adapter.name);
-        if let Some((idx, dev)) = devices.iter().enumerate().find(|(i, d)| {
-            !claimed[*i]
-                && d.pci_vendor_id == Some(adapter.vendor_id)
-                && d.pci_device_id == Some(adapter.device_id)
-                && normalize_gpu_name(&d.name) == a_name
-        }) {
-            claimed[idx] = true;
-            matched.insert(adapter.luid, dev.clone());
-        }
-    }
+    // Pass 1: exact (vendor_id, device_id) + exact normalized name.
+    match_unique_pairs(
+        &nvidia_adapters,
+        devices,
+        &mut matched,
+        &mut claimed,
+        |a, d| {
+            d.pci_vendor_id == Some(a.vendor_id)
+                && d.pci_device_id == Some(a.device_id)
+                && normalize_gpu_name(&d.name) == normalize_gpu_name(&a.name)
+        },
+    );
 
-    // Pass 2: exact or substring normalized name match.
-    for adapter in &nvidia_adapters {
-        if matched.contains_key(&adapter.luid) {
-            continue;
-        }
-        let a_name = normalize_gpu_name(&adapter.name);
-        if let Some((idx, dev)) = devices.iter().enumerate().find(|(i, d)| {
-            if claimed[*i] {
-                return false;
-            }
+    // Pass 2: exact normalized name.
+    match_unique_pairs(
+        &nvidia_adapters,
+        devices,
+        &mut matched,
+        &mut claimed,
+        |a, d| normalize_gpu_name(&d.name) == normalize_gpu_name(&a.name),
+    );
+
+    // Pass 3: substring normalized name.
+    match_unique_pairs(
+        &nvidia_adapters,
+        devices,
+        &mut matched,
+        &mut claimed,
+        |a, d| {
+            let a_name = normalize_gpu_name(&a.name);
             let d_name = normalize_gpu_name(&d.name);
-            d_name == a_name || d_name.contains(&a_name) || a_name.contains(&d_name)
-        }) {
-            claimed[idx] = true;
-            matched.insert(adapter.luid, dev.clone());
-        }
-    }
+            d_name.contains(&a_name) || a_name.contains(&d_name)
+        },
+    );
 
-    // Pass 3: exact (vendor_id, device_id) match.
-    for adapter in &nvidia_adapters {
-        if matched.contains_key(&adapter.luid) {
-            continue;
-        }
-        if let Some((idx, dev)) = devices.iter().enumerate().find(|(i, d)| {
-            !claimed[*i]
-                && d.pci_vendor_id == Some(adapter.vendor_id)
-                && d.pci_device_id == Some(adapter.device_id)
-        }) {
-            claimed[idx] = true;
-            matched.insert(adapter.luid, dev.clone());
-        }
-    }
+    // Pass 4: exact (vendor_id, device_id).
+    match_unique_pairs(
+        &nvidia_adapters,
+        devices,
+        &mut matched,
+        &mut claimed,
+        |a, d| d.pci_vendor_id == Some(a.vendor_id) && d.pci_device_id == Some(a.device_id),
+    );
 
-    // Pass 4: unambiguous 1-to-1 fallback when one NVIDIA adapter and one NVML device remain.
+    // Pass 5: unambiguous 1-to-1 fallback when one NVIDIA adapter and one NVML device remain.
     let remaining_adapters: Vec<&RawGpuAdapter> = nvidia_adapters
         .into_iter()
         .filter(|a| !matched.contains_key(&a.luid))
@@ -306,6 +310,56 @@ pub fn match_nvml_devices(
     }
 
     matched
+}
+
+/// Commits pairs `(adapter, device)` under `predicate` **only** when `adapter` matches exactly
+/// one unclaimed `device` AND that `device` matches exactly one unclaimed `adapter`.
+fn match_unique_pairs<F>(
+    nvidia_adapters: &[&RawGpuAdapter],
+    devices: &[RawNvmlDevice],
+    matched: &mut BTreeMap<u64, RawNvmlDevice>,
+    claimed: &mut [bool],
+    predicate: F,
+) where
+    F: Fn(&RawGpuAdapter, &RawNvmlDevice) -> bool,
+{
+    let unclaimed_adapters: Vec<&RawGpuAdapter> = nvidia_adapters
+        .iter()
+        .copied()
+        .filter(|a| !matched.contains_key(&a.luid))
+        .collect();
+    let unclaimed_devices: Vec<(usize, &RawNvmlDevice)> = devices
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !claimed[*i])
+        .collect();
+
+    if unclaimed_adapters.is_empty() || unclaimed_devices.is_empty() {
+        return;
+    }
+
+    let mut adapter_matches: Vec<Vec<usize>> = vec![Vec::new(); unclaimed_adapters.len()];
+    let mut device_match_count: Vec<usize> = vec![0; unclaimed_devices.len()];
+
+    for (a_pos, adapter) in unclaimed_adapters.iter().enumerate() {
+        for (d_pos, (_, dev)) in unclaimed_devices.iter().enumerate() {
+            if predicate(adapter, dev) {
+                adapter_matches[a_pos].push(d_pos);
+                device_match_count[d_pos] += 1;
+            }
+        }
+    }
+
+    for (a_pos, matching_d_positions) in adapter_matches.iter().enumerate() {
+        if matching_d_positions.len() == 1 {
+            let d_pos = matching_d_positions[0];
+            if device_match_count[d_pos] == 1 {
+                let (orig_dev_idx, dev) = unclaimed_devices[d_pos];
+                claimed[orig_dev_idx] = true;
+                matched.insert(unclaimed_adapters[a_pos].luid, dev.clone());
+            }
+        }
+    }
 }
 
 /// Applies optional NVML enrichment onto baseline WDDM GPU snapshots.
@@ -541,5 +595,81 @@ mod tests {
     fn normalizes_long_and_short_pci_bdf_strings() {
         assert_eq!(normalize_pci_bdf("00000000:01:00.0"), "0000:01:00.0");
         assert_eq!(normalize_pci_bdf("0000:0A:00.0"), "0000:0a:00.0");
+    }
+
+    #[test]
+    fn ambiguous_identical_nvidia_gpus_are_left_unenriched_while_distinct_models_match_even_reversed()
+     {
+        let identical_adapters = vec![
+            RawGpuAdapter {
+                name: "NVIDIA GeForce RTX 5090".to_owned(),
+                vendor: vendor_name_from_id(0x10DE),
+                vendor_id: 0x10DE,
+                device_id: 0x2B85,
+                luid: encode_luid(0, 0x0001_0001),
+                dedicated_vram_total_bytes: 32 * 1024 * 1024 * 1024,
+                shared_vram_total_bytes: 32 * 1024 * 1024 * 1024,
+                is_software: false,
+            },
+            RawGpuAdapter {
+                name: "NVIDIA GeForce RTX 5090".to_owned(),
+                vendor: vendor_name_from_id(0x10DE),
+                vendor_id: 0x10DE,
+                device_id: 0x2B85,
+                luid: encode_luid(0, 0x0001_0002),
+                dedicated_vram_total_bytes: 32 * 1024 * 1024 * 1024,
+                shared_vram_total_bytes: 32 * 1024 * 1024 * 1024,
+                is_software: false,
+            },
+        ];
+        let mut dev_a = sample_nvml_device();
+        dev_a.index = 0;
+        dev_a.pci_bdf = Some("0000:01:00.0".to_owned());
+        dev_a.temp_celsius = Some(45.0);
+        let mut dev_b = sample_nvml_device();
+        dev_b.index = 1;
+        dev_b.pci_bdf = Some("0000:02:00.0".to_owned());
+        dev_b.temp_celsius = Some(72.0);
+
+        // Two identical NVIDIA GPUs cannot be correlated unambiguously without DXGI PCI BDF:
+        // leave both unenriched instead of risking cross-wired telemetry.
+        assert!(
+            match_nvml_devices(&identical_adapters, &[dev_b.clone(), dev_a.clone()]).is_empty()
+        );
+        // Likewise, two identical adapters with only one NVML device remain unenriched.
+        assert!(match_nvml_devices(&identical_adapters, std::slice::from_ref(&dev_a)).is_empty());
+
+        // Two distinct NVIDIA models in reversed DXGI vs NVML order match 1-to-1 unambiguously.
+        let distinct_adapters = vec![
+            identical_adapters[0].clone(),
+            RawGpuAdapter {
+                name: "NVIDIA GeForce RTX 4060".to_owned(),
+                vendor: vendor_name_from_id(0x10DE),
+                vendor_id: 0x10DE,
+                device_id: 0x2882,
+                luid: encode_luid(0, 0x0002_0002),
+                dedicated_vram_total_bytes: 8 * 1024 * 1024 * 1024,
+                shared_vram_total_bytes: 32 * 1024 * 1024 * 1024,
+                is_software: false,
+            },
+        ];
+        let mut dev_4060 = sample_nvml_device();
+        dev_4060.index = 0;
+        dev_4060.name = "NVIDIA GeForce RTX 4060".to_owned();
+        dev_4060.pci_device_id = Some(0x2882);
+        dev_4060.pci_bdf = Some("0000:03:00.0".to_owned());
+        dev_4060.temp_celsius = Some(39.0);
+
+        // Pass NVML list in reversed order relative to DXGI adapters.
+        let matched = match_nvml_devices(&distinct_adapters, &[dev_4060, dev_a]);
+        assert_eq!(matched.len(), 2);
+        assert_eq!(
+            matched[&distinct_adapters[0].luid].pci_bdf.as_deref(),
+            Some("0000:01:00.0")
+        );
+        assert_eq!(
+            matched[&distinct_adapters[1].luid].pci_bdf.as_deref(),
+            Some("0000:03:00.0")
+        );
     }
 }
