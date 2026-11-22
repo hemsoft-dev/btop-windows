@@ -7,6 +7,19 @@ use std::collections::BTreeMap;
 /// Maximum number of dedicated hardware GPUs tracked (`gpu0..gpu5`).
 pub const MAX_GPUS: usize = 6;
 
+const DXGI_SOFTWARE_FLAG_BIT: u32 = 2;
+const MICROSOFT_VENDOR_ID: u32 = 0x1414;
+const MICROSOFT_BASIC_RENDER_DEVICE_ID: u32 = 0x008C;
+
+/// Returns `true` when an adapter is a software/WARP rasterizer (`DXGI_ADAPTER_FLAG_SOFTWARE`,
+/// or `Microsoft Basic Render Driver` (`0x1414:0x008C`), which headless Hyper-V/Azure VMs can
+/// expose without setting `DXGI_ADAPTER_FLAG_SOFTWARE`).
+pub fn is_software_adapter(flags: u32, vendor_id: u32, device_id: u32, name: &str) -> bool {
+    (flags & DXGI_SOFTWARE_FLAG_BIT) != 0
+        || (vendor_id == MICROSOFT_VENDOR_ID && device_id == MICROSOFT_BASIC_RENDER_DEVICE_ID)
+        || name.eq_ignore_ascii_case("Microsoft Basic Render Driver")
+}
+
 /// Hardware adapter metadata enumerated via DXGI (`IDXGIFactory6::EnumAdapters1`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawGpuAdapter {
@@ -59,7 +72,7 @@ pub fn vendor_name_from_id(vendor_id: u32) -> String {
 pub fn filter_hardware_adapters(adapters: Vec<RawGpuAdapter>) -> Vec<RawGpuAdapter> {
     adapters
         .into_iter()
-        .filter(|a| !a.is_software)
+        .filter(|a| !a.is_software && !is_software_adapter(0, a.vendor_id, a.device_id, &a.name))
         .take(MAX_GPUS)
         .collect()
 }
@@ -159,7 +172,8 @@ mod win {
 
     use super::{
         GpuPdhMetrics, GpuPdhSample, RawGpuAdapter, aggregate_gpu_engine_utilization,
-        aggregate_gpu_memory_bytes, encode_luid, filter_hardware_adapters, vendor_name_from_id,
+        aggregate_gpu_memory_bytes, encode_luid, filter_hardware_adapters, is_software_adapter,
+        vendor_name_from_id,
     };
 
     const ERROR_SUCCESS_U32: u32 = 0;
@@ -199,7 +213,12 @@ mod win {
                 .trim()
                 .to_owned();
             let software_flag = u32::try_from(DXGI_ADAPTER_FLAG_SOFTWARE.0).unwrap_or(2);
-            let is_software = (desc.Flags & software_flag) != 0;
+            let is_software = is_software_adapter(
+                desc.Flags & software_flag,
+                desc.VendorId,
+                desc.DeviceId,
+                &name,
+            );
 
             raw.push(RawGpuAdapter {
                 name: if name.is_empty() {
@@ -532,6 +551,17 @@ mod tests {
                 dedicated_vram_total_bytes: 0,
                 shared_vram_total_bytes: 16 * 1024 * 1024 * 1024,
                 is_software: true,
+            },
+            RawGpuAdapter {
+                name: "Microsoft Basic Render Driver".to_owned(),
+                vendor: vendor_name_from_id(0x1414),
+                vendor_id: 0x1414,
+                device_id: 0x008C,
+                luid: encode_luid(0, 0x0001_999A),
+                dedicated_vram_total_bytes: 0,
+                shared_vram_total_bytes: 16 * 1024 * 1024 * 1024,
+                // Headless Hyper-V/Azure VMs can expose WARP without DXGI_ADAPTER_FLAG_SOFTWARE.
+                is_software: false,
             },
             RawGpuAdapter {
                 name: "AMD Radeon(TM) Graphics".to_owned(),
