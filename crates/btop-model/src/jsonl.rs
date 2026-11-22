@@ -2,7 +2,7 @@
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -99,8 +99,25 @@ impl fmt::Debug for SnapshotRecorder {
 
 impl SnapshotRecorder {
     /// Opens `path` in create-and-append mode and starts the background writer thread.
+    ///
+    /// If `path` already exists with content that does not end in a newline, a newline
+    /// separator is written before the first appended snapshot so existing JSONL records
+    /// remain intact.
     pub fn open(path: &Path) -> Result<Self, JsonlError> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .create(true)
+            .append(true)
+            .open(path)?;
+        let mut needs_leading_newline = false;
+        if file.metadata()?.len() > 0 {
+            file.seek(SeekFrom::End(-1))?;
+            let mut last = [0u8; 1];
+            file.read_exact(&mut last)?;
+            file.seek(SeekFrom::End(0))?;
+            needs_leading_newline = last[0] != b'\n';
+        }
+
         let (tx, rx) = mpsc::sync_channel::<Snapshot>(RECORDER_CHANNEL_CAPACITY);
         let dropped = Arc::new(AtomicU64::new(0));
 
@@ -110,6 +127,10 @@ impl SnapshotRecorder {
                 let mut writer = BufWriter::new(file);
                 let mut written = 0u64;
                 while let Ok(snapshot) = rx.recv() {
+                    if needs_leading_newline {
+                        writer.write_all(b"\n")?;
+                        needs_leading_newline = false;
+                    }
                     write_snapshot_line(&mut writer, &snapshot)?;
                     written += 1;
                 }
@@ -218,6 +239,34 @@ mod tests {
         assert_eq!(stats.dropped, 0);
 
         let loaded = parse_jsonl_file(&path).expect("reload recorded file");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded, fixtures);
+    }
+
+    #[test]
+    fn recorder_preserves_boundary_when_appending_to_file_without_trailing_newline() {
+        let unique = format!(
+            "btop-windows-boundary-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        );
+        let path = std::env::temp_dir().join(unique);
+        let fixtures = win11_8core_single_gpu_desktop();
+
+        // Write tick 0 without a trailing newline.
+        let first_line = serde_json::to_string(&fixtures[0]).expect("serialize tick 0");
+        std::fs::write(&path, first_line.as_bytes()).expect("seed file without trailing newline");
+
+        let recorder = SnapshotRecorder::open(&path).expect("open recorder on existing file");
+        recorder.record(fixtures[1].clone());
+        recorder.record(fixtures[2].clone());
+        let stats = recorder.finish().expect("finish recorder");
+        assert_eq!(stats.written, 2);
+        assert_eq!(stats.dropped, 0);
+
+        let loaded = parse_jsonl_file(&path).expect("reloaded stream must stay valid");
         let _ = std::fs::remove_file(&path);
         assert_eq!(loaded, fixtures);
     }

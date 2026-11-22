@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use btop_collect::{CollectError, SnapshotSource};
 use btop_config::Config;
-use btop_model::SnapshotRecorder;
+use btop_model::{RecordStats, SnapshotRecorder};
 use btop_term::{
     DiffEncoder, Grid, InputSource, KeyCode, Size, TermError, TermEvent, TerminalGuard,
 };
@@ -18,6 +18,21 @@ pub enum AppError {
     Term(#[from] TermError),
     #[error(transparent)]
     Jsonl(#[from] btop_model::JsonlError),
+    #[error(
+        "recording incomplete: wrote {written} snapshots and dropped {dropped} due to slow disk I/O"
+    )]
+    IncompleteRecording { written: u64, dropped: u64 },
+}
+
+/// Validates recorder completion statistics and fails clearly if any snapshots were dropped.
+pub fn check_record_stats(stats: RecordStats) -> Result<RecordStats, AppError> {
+    if stats.dropped > 0 {
+        return Err(AppError::IncompleteRecording {
+            written: stats.written,
+            dropped: stats.dropped,
+        });
+    }
+    Ok(stats)
 }
 
 /// Runs a deterministic headless render session for `max_ticks` snapshots, optionally
@@ -124,7 +139,38 @@ pub fn run_tui_loop(
 
     let finish_result = recorder.map(SnapshotRecorder::finish).transpose();
     run_result?;
-    finish_result?;
+    if let Some(stats) = finish_result? {
+        check_record_stats(stats)?;
+    }
 
     Ok(frames_rendered)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_record_stats_fails_when_snapshots_were_dropped() {
+        assert!(
+            check_record_stats(RecordStats {
+                written: 5,
+                dropped: 0,
+            })
+            .is_ok()
+        );
+
+        let err = check_record_stats(RecordStats {
+            written: 64,
+            dropped: 3,
+        })
+        .expect_err("dropped snapshots must fail");
+        assert!(matches!(
+            err,
+            AppError::IncompleteRecording {
+                written: 64,
+                dropped: 3
+            }
+        ));
+    }
 }
