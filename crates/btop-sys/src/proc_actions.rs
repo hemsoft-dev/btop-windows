@@ -69,6 +69,8 @@ impl PriorityClass {
 pub enum ProcActionError {
     /// Target is a kernel or critical Windows process (`IsProcessCritical == TRUE`); refused to prevent BSOD.
     CriticalProcess(u32),
+    /// Target is the running `btop-windows` process itself; refused so terminal restoration always runs.
+    SelfProcess(u32),
     /// Process creation time on the opened handle did not match the selected `ProcessIdentity` (PID reused).
     IdentityMismatch { pid: u32 },
     /// Caller lacks sufficient privileges (or UIPI blocked `WM_CLOSE` to an elevated window).
@@ -87,6 +89,10 @@ impl fmt::Display for ProcActionError {
             Self::CriticalProcess(pid) => write!(
                 f,
                 "Refused: PID {pid} is a critical Windows system process (terminating would cause a BSOD)"
+            ),
+            Self::SelfProcess(pid) => write!(
+                f,
+                "Refused: cannot force-terminate btop-windows itself (PID {pid}); press q to exit cleanly and restore the terminal"
             ),
             Self::IdentityMismatch { pid } => write!(
                 f,
@@ -110,9 +116,10 @@ impl std::error::Error for ProcActionError {}
 
 /// Pure safety gate evaluated before calling `TerminateProcess`.
 ///
-/// Refuses kernel PIDs (`0`/`4`), missing or mismatched `CreateTime`, confirmed critical
-/// system processes (`IsProcessCritical == TRUE`), and fail-safe errors when criticality
-/// cannot be determined.
+/// Refuses kernel PIDs (`0`/`4`), the current `btop-windows` process itself (so terminal
+/// restoration always runs via orderly shutdown), missing or mismatched `CreateTime`,
+/// confirmed critical system processes (`IsProcessCritical == TRUE`), and fail-safe errors
+/// when criticality cannot be determined.
 pub fn guard_terminate_decision(
     pid: u32,
     expected_create_time_100ns: u64,
@@ -121,6 +128,9 @@ pub fn guard_terminate_decision(
 ) -> Result<(), ProcActionError> {
     if matches!(pid, 0 | 4) {
         return Err(ProcActionError::CriticalProcess(pid));
+    }
+    if pid == std::process::id() {
+        return Err(ProcActionError::SelfProcess(pid));
     }
     if expected_create_time_100ns == 0 || actual_create_time_100ns != expected_create_time_100ns {
         return Err(ProcActionError::IdentityMismatch { pid });
@@ -323,11 +333,15 @@ mod win {
 
     /// Terminates `(pid, expected_create_time_100ns)` after opening with
     /// `PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION`, verifying `CreateTime` on that
-    /// handle, and confirming `IsProcessCritical == FALSE` so an elevated user cannot trigger a BSOD.
+    /// handle, rejecting self-termination so terminal restoration always runs, and confirming
+    /// `IsProcessCritical == FALSE` so an elevated user cannot trigger a BSOD.
     pub fn terminate_process(
         pid: u32,
         expected_create_time_100ns: u64,
     ) -> Result<(), ProcActionError> {
+        if pid == std::process::id() {
+            return Err(ProcActionError::SelfProcess(pid));
+        }
         let (handle, actual_create) = open_and_verify(
             pid,
             expected_create_time_100ns,
@@ -540,9 +554,21 @@ mod tests {
             Err(ProcActionError::IdentityMismatch { pid: 4820 })
         );
 
-        // Verified non-critical user process is permitted.
+        // Terminating the running monitor itself is refused so terminal restoration always runs.
+        let my_pid = std::process::id();
         assert_eq!(
-            guard_terminate_decision(4820, 1000, 1000, Ok(false)),
+            guard_terminate_decision(my_pid, 1000, 1000, Ok(false)),
+            Err(ProcActionError::SelfProcess(my_pid))
+        );
+        assert_eq!(
+            terminate_process(my_pid, 1000),
+            Err(ProcActionError::SelfProcess(my_pid))
+        );
+
+        // Verified non-critical user process is permitted (using a synthetic PID != current PID).
+        let other_pid = my_pid.wrapping_add(1).max(100);
+        assert_eq!(
+            guard_terminate_decision(other_pid, 1000, 1000, Ok(false)),
             Ok(())
         );
     }
