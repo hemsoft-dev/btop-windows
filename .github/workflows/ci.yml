@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  linux-portable:
+    name: Linux portable check (fmt, clippy, tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy portable crates
+        run: cargo clippy -p btop-model -p btop-config -p btop-collect -p btop-term -p btop-ui --all-targets -- -D warnings
+      - name: Test portable crates
+        run: cargo test -p btop-model -p btop-config -p btop-collect -p btop-term -p btop-ui
+
+  windows-x64:
+    name: Windows x64 (build, clippy, tests, non-elevated smoke)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test workspace
+        run: cargo test --workspace
+      - name: Build binary and run CLI smoke checks
+        shell: pwsh
+        run: |
+          cargo build -p btop-windows --target x86_64-pc-windows-msvc
+          .\target\x86_64-pc-windows-msvc\debug\btop-windows.exe --version
+          .\target\x86_64-pc-windows-msvc\debug\btop-windows.exe --default-config | Out-Null
+
+  windows-arm64:
+    name: Windows ARM64 (native build and tests)
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy workspace (ARM64)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test workspace (ARM64)
+        run: cargo test --workspace
+      - name: CLI smoke checks (ARM64)
+        shell: pwsh
+        run: |
+          cargo build -p btop-windows --target aarch64-pc-windows-msvc
+          .\target\aarch64-pc-windows-msvc\debug\btop-windows.exe --version

@@ -1,0 +1,39 @@
+name: Feature or task
+description: Propose a bounded feature, collector, widget, or spike
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: State the current gap and the bounded task.
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: Concrete user, reliability, security, or delivery impact.
+    validations:
+      required: true
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: Desired end state without incidental implementation lock-in.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria
+      placeholder: "- [ ] Observable pass/fail condition"
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation
+      description: Exact commands, fixtures, or screenshot requirements.
+    validations:
+      required: true

@@ -1,0 +1,72 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/btop-sys",
+    "crates/btop-model",
+    "crates/btop-config",
+    "crates/btop-collect",
+    "crates/btop-term",
+    "crates/btop-ui",
+    "apps/btop-windows",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+repository = "https://github.com/hemsoft-dev/btop-windows"
+homepage = "https://github.com/hemsoft-dev/btop-windows"
+authors = ["Franz Hemmer <franz_hemmer@hotmail.com>"]
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+struct_excessive_bools = "allow"
+
+[workspace.dependencies]
+arc-swap = "1.7"
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.28"
+libloading = "0.8"
+regex = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-width = "0.2"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+# Internal workspace crates
+btop-sys = { path = "crates/btop-sys" }
+btop-model = { path = "crates/btop-model" }
+btop-config = { path = "crates/btop-config" }
+btop-collect = { path = "crates/btop-collect" }
+btop-term = { path = "crates/btop-term" }
+btop-ui = { path = "crates/btop-ui" }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+opt-level = "s"
+# Keep unwind so Drop guards and panic hooks always restore console mode,
+# leave alternate screen, and unhide the cursor.
+panic = "unwind"

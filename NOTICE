@@ -1,0 +1,11 @@
+btop-windows
+Copyright 2026 Franz Hemmer (hemsoft-dev)
+
+This product is an independent Windows-native resource monitor written in Rust,
+inspired by and aiming for configuration, theme, and UX compatibility with
+btop++ (https://github.com/aristocratos/btop), Copyright 2021-2026 Aristocratos
+(Jakob P. Liljenberg), licensed under the Apache License, Version 2.0.
+
+Upstream theme files bundled from aristocratos/btop (when added in M5) retain
+their original Apache-2.0 license and attribution, with any Windows-specific
+adaptations clearly noted.

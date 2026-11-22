@@ -1,0 +1,15 @@
+[package]
+name = "btop-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+btop-config.workspace = true
+btop-model.workspace = true
+btop-term.workspace = true

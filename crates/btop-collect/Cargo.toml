@@ -1,0 +1,15 @@
+[package]
+name = "btop-collect"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+btop-model.workspace = true
+btop-sys.workspace = true
+thiserror.workspace = true

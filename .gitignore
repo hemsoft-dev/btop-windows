@@ -1,0 +1,21 @@
+# Cargo / Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# IDE / Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+.vs/
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Local runtime artifacts, logs, and recordings
+*.log
+*.jsonl
+btop.conf
+btop-windows.conf

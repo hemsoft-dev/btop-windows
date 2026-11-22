@@ -1,0 +1,25 @@
+name: Bug report
+description: Report a bug, rendering glitch, or telemetry discrepancy
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Observed vs expected behavior.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: "Windows 11 24H2 x64, Windows Terminal 1.22, elevated/standard user"
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: Include a --record JSONL capture if possible.
+    validations:
+      required: true
