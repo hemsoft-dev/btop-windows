@@ -3,12 +3,11 @@
 use std::collections::BTreeMap;
 
 use btop_config::{Config, DisablePresets, GraphSymbol};
-use btop_model::{DataState, Snapshot};
-use btop_term::{Grid, HitAction, Rect, Size};
+use btop_term::{Grid, Rect, Size};
 use thiserror::Error;
 
 use crate::theme::ThemePalette;
-use crate::widgets::{draw_border_tag, draw_box_frame, fill_rect};
+use crate::widgets::{draw_box_frame, fill_rect};
 
 const CPU_MIN_W: u16 = 32;
 const CPU_MIN_H: u16 = 7;
@@ -921,68 +920,6 @@ fn write_centered_clipped(
     let len = clipped.chars().count();
     let pad = u16::try_from(max_width.saturating_sub(len) / 2).unwrap_or(0);
     grid.write_str(x.saturating_add(pad), y, &clipped, fg, bg, bold);
-}
-
-/// Placeholder renderer for `gpu0..gpu5` layout slots until dedicated GPU telemetry lands in M4.
-pub fn render_gpu_placeholder(
-    grid: &mut Grid,
-    rect: Rect,
-    idx: u8,
-    snapshot: &Snapshot,
-    config: &Config,
-    theme: &ThemePalette,
-) {
-    if rect.width < 12 || rect.height < 4 {
-        return;
-    }
-    fill_rect(grid, rect, theme.main_fg, theme.main_bg);
-    draw_box_frame(
-        grid,
-        rect,
-        theme.cpu_box,
-        theme.main_bg,
-        config.rounded_corners,
-    );
-    let hotkey = match idx {
-        0 => '⁵',
-        1 => '⁶',
-        2 => '⁷',
-        3 => '⁸',
-        4 => '⁹',
-        _ => '⁰',
-    };
-    let label = format!("gpu{idx}");
-    let max_x = rect.x.saturating_add(rect.width - 1);
-    if let Some(tag_rect) = draw_border_tag(
-        grid,
-        rect.x.saturating_add(2),
-        rect.y,
-        max_x,
-        Some(hotkey),
-        &label,
-        theme.cpu_box,
-        theme.title,
-        theme.hi_fg,
-        theme.main_bg,
-    ) {
-        grid.hit_map.push(tag_rect, HitAction::ToggleBox(label));
-    }
-
-    let inner_w = usize::from(rect.width.saturating_sub(4));
-    let message = match snapshot.gpus.get(usize::from(idx)) {
-        Some(DataState::Available(gpu) | DataState::Stale { value: gpu, .. }) => gpu.name.clone(),
-        Some(DataState::Unavailable(reason)) => format!("GPU unavailable: {reason}"),
-        _ => "GPU telemetry unavailable".to_owned(),
-    };
-    let clipped: String = message.chars().take(inner_w).collect();
-    grid.write_str(
-        rect.x.saturating_add(2),
-        rect.y.saturating_add(2),
-        &clipped,
-        theme.inactive_fg,
-        theme.main_bg,
-        false,
-    );
 }
 
 #[cfg(test)]

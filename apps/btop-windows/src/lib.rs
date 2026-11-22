@@ -938,6 +938,12 @@ fn handle_layout_key(code: KeyCode, ui_state: &mut UiState, prev_grid: &mut Opti
         KeyCode::Char('2') => ui_state.layout.toggle_box(BoxId::Mem),
         KeyCode::Char('3') => ui_state.layout.toggle_box(BoxId::Net),
         KeyCode::Char('4') => ui_state.layout.toggle_box(BoxId::Proc),
+        KeyCode::Char('5') => ui_state.layout.toggle_box(BoxId::Gpu(0)),
+        KeyCode::Char('6') => ui_state.layout.toggle_box(BoxId::Gpu(1)),
+        KeyCode::Char('7') => ui_state.layout.toggle_box(BoxId::Gpu(2)),
+        KeyCode::Char('8') => ui_state.layout.toggle_box(BoxId::Gpu(3)),
+        KeyCode::Char('9') => ui_state.layout.toggle_box(BoxId::Gpu(4)),
+        KeyCode::Char('0') => ui_state.layout.toggle_box(BoxId::Gpu(5)),
         _ => false,
     };
     if changed {
@@ -1829,5 +1835,25 @@ mod tests {
             Some(ProcActionModal::ActionNotice { ref title, is_error: true, .. })
                 if title == "Service Stop Refused"
         ));
+    }
+
+    #[test]
+    fn gpu_hotkeys_5_through_0_toggle_gpu0_through_gpu5() {
+        let mut state = UiState::default();
+        let mut prev_grid = None;
+        for (ch, idx) in [('5', 0u8), ('6', 1), ('7', 2), ('8', 3), ('9', 4), ('0', 5)] {
+            assert!(handle_layout_key(
+                KeyCode::Char(ch),
+                &mut state,
+                &mut prev_grid
+            ));
+            assert!(state.layout.shown_boxes.contains(&BoxId::Gpu(idx)));
+            assert!(handle_layout_key(
+                KeyCode::Char(ch),
+                &mut state,
+                &mut prev_grid
+            ));
+            assert!(!state.layout.shown_boxes.contains(&BoxId::Gpu(idx)));
+        }
     }
 }

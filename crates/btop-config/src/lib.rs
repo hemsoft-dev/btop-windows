@@ -69,6 +69,38 @@ impl DisablePresets {
     }
 }
 
+/// Upstream `show_gpu_info` mode controlling compact GPU summary inside the CPU box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShowGpuInfo {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl ShowGpuInfo {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::On => "On",
+            Self::Off => "Off",
+        }
+    }
+
+    pub fn parse(key: &str, val: &str) -> Result<Self, ConfigError> {
+        match val.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "on" | "true" | "1" | "yes" => Ok(Self::On),
+            "off" | "false" | "0" | "no" => Ok(Self::Off),
+            _ => Err(ConfigError::InvalidValue {
+                key: key.to_owned(),
+                value: val.to_owned(),
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     pub color_theme: String,
@@ -115,6 +147,10 @@ pub struct Config {
     pub base_10_bitrate: bool,
     pub cpu_util_mode: String,
     pub freq_mode: String,
+    pub show_gpu_info: ShowGpuInfo,
+    pub gpu_mirror_graph: bool,
+    pub graph_symbol_gpu: Option<GraphSymbol>,
+    pub custom_gpu_names: [String; 6],
     /// Unknown or deferred upstream keys preserved verbatim when saving `btop.conf`.
     pub preserved_unknown: BTreeMap<String, String>,
 }
@@ -166,16 +202,31 @@ impl Default for Config {
             base_10_bitrate: true,
             cpu_util_mode: "time".to_owned(),
             freq_mode: "average".to_owned(),
+            show_gpu_info: ShowGpuInfo::Auto,
+            gpu_mirror_graph: true,
+            graph_symbol_gpu: None,
+            custom_gpu_names: std::array::from_fn(|_| String::new()),
             preserved_unknown: BTreeMap::new(),
         }
     }
 }
 
 impl Config {
+    /// Returns the non-empty user-configured custom name for `gpu{idx}` (`0..=5`), if set.
+    pub fn custom_gpu_name(&self, idx: u8) -> Option<&str> {
+        let name = self.custom_gpu_names.get(usize::from(idx))?.trim();
+        if name.is_empty() { None } else { Some(name) }
+    }
+
+    /// Returns the effective graph symbol for GPU boxes (`graph_symbol_gpu` or fallback `graph_symbol`).
+    pub fn effective_gpu_graph_symbol(&self) -> GraphSymbol {
+        self.graph_symbol_gpu.unwrap_or(self.graph_symbol)
+    }
+
     /// Renders a default `btop.conf` compatible with upstream `aristocratos/btop`.
     pub fn render_default_conf() -> String {
         let cfg = Self::default();
-        format!(
+        let mut out = format!(
             concat!(
                 "#? Config file for btop-windows (English Windows 11 x64)\n\n",
                 "#* Name of a .theme file or \"Default\".\n",
@@ -270,7 +321,9 @@ impl Config {
             base_10_bitrate = bool_title(cfg.base_10_bitrate),
             cpu_util_mode = cfg.cpu_util_mode,
             freq_mode = cfg.freq_mode,
-        )
+        );
+        out.push_str(&render_gpu_defaults(&cfg));
+        out
     }
 
     /// Parses an upstream-style `key = value` config string while preserving unknown keys.
@@ -289,91 +342,140 @@ impl Config {
             };
             let key = raw_key.trim();
             let val = unquote(raw_val.trim());
-            match key {
-                "color_theme" => cfg.color_theme = val,
-                "theme_background" => cfg.theme_background = parse_bool(key, &val)?,
-                "truecolor" => cfg.truecolor = parse_bool(key, &val)?,
-                "force_tty" => cfg.force_tty = parse_bool(key, &val)?,
-                "rounded_corners" => cfg.rounded_corners = parse_bool(key, &val)?,
-                "terminal_sync" => cfg.terminal_sync = parse_bool(key, &val)?,
-                "vim_keys" => cfg.vim_keys = parse_bool(key, &val)?,
-                "disable_mouse" => cfg.disable_mouse = parse_bool(key, &val)?,
-                "shown_boxes" => cfg.shown_boxes = val,
-                "presets" => cfg.presets = val,
-                "disable_presets" => cfg.disable_presets = DisablePresets::parse(key, &val)?,
-                "cpu_bottom" => cfg.cpu_bottom = parse_bool(key, &val)?,
-                "proc_left" => cfg.proc_left = parse_bool(key, &val)?,
-                "mem_below_net" => cfg.mem_below_net = parse_bool(key, &val)?,
-                "show_battery" => cfg.show_battery = parse_bool(key, &val)?,
-                "clock_format" => cfg.clock_format = val,
-                "proc_sorting" => cfg.proc_sorting = val,
-                "proc_reversed" => cfg.proc_reversed = parse_bool(key, &val)?,
-                "proc_tree" => cfg.proc_tree = parse_bool(key, &val)?,
-                "proc_aggregate" => cfg.proc_aggregate = parse_bool(key, &val)?,
-                "proc_cpu_graphs" => cfg.proc_cpu_graphs = parse_bool(key, &val)?,
-                "proc_follow_detailed" => cfg.proc_follow_detailed = parse_bool(key, &val)?,
-                "proc_per_core" => cfg.proc_per_core = parse_bool(key, &val)?,
-                "proc_mem_bytes" => cfg.proc_mem_bytes = parse_bool(key, &val)?,
-                "mem_graphs" => cfg.mem_graphs = parse_bool(key, &val)?,
-                "show_swap" => cfg.show_swap = parse_bool(key, &val)?,
-                "base_10_sizes" => cfg.base_10_sizes = parse_bool(key, &val)?,
-                "disks_filter" => cfg.disks_filter = val,
-                "show_disks" => cfg.show_disks = parse_bool(key, &val)?,
-                "show_io_stat" => cfg.show_io_stat = parse_bool(key, &val)?,
-                "io_mode" => cfg.io_mode = parse_bool(key, &val)?,
-                "io_graph_combined" => cfg.io_graph_combined = parse_bool(key, &val)?,
-                "io_graph_speeds" => cfg.io_graph_speeds = val,
-                "net_iface" => cfg.net_iface = val,
-                "net_download" => {
-                    cfg.net_download = val
-                        .parse::<u64>()
-                        .map_err(|_| ConfigError::InvalidValue {
-                            key: key.to_owned(),
-                            value: val.clone(),
-                        })?
-                        .max(1);
-                }
-                "net_upload" => {
-                    cfg.net_upload = val
-                        .parse::<u64>()
-                        .map_err(|_| ConfigError::InvalidValue {
-                            key: key.to_owned(),
-                            value: val.clone(),
-                        })?
-                        .max(1);
-                }
-                "net_auto" => cfg.net_auto = parse_bool(key, &val)?,
-                "net_sync" => cfg.net_sync = parse_bool(key, &val)?,
-                "swap_upload_download" => cfg.swap_upload_download = parse_bool(key, &val)?,
-                "base_10_bitrate" => cfg.base_10_bitrate = parse_bool(key, &val)?,
-                "cpu_util_mode" => cfg.cpu_util_mode = val,
-                "freq_mode" => cfg.freq_mode = val,
-                "graph_symbol" => {
-                    cfg.graph_symbol = match val.as_str() {
-                        "braille" => GraphSymbol::Braille,
-                        "block" => GraphSymbol::Block,
-                        "tty" => GraphSymbol::Tty,
-                        _ => {
-                            return Err(ConfigError::InvalidValue {
-                                key: key.to_owned(),
-                                value: val,
-                            });
-                        }
-                    };
-                }
-                "update_ms" => {
-                    let parsed: u32 = val.parse().map_err(|_| ConfigError::InvalidValue {
-                        key: key.to_owned(),
-                        value: val.clone(),
-                    })?;
-                    cfg.update_ms = parsed.max(100);
-                }
-                other => {
-                    cfg.preserved_unknown.insert(other.to_owned(), val);
-                }
-            }
+            apply_config_entry(&mut cfg, key, val)?;
         }
         Ok(cfg)
+    }
+}
+
+fn render_gpu_defaults(cfg: &Config) -> String {
+    format!(
+        concat!(
+            "\n#* GPU display options: compact CPU-box info (\"Auto\", \"On\", \"Off\"), mirrored graph, and per-GPU custom names.\n",
+            "show_gpu_info = \"{show_gpu_info}\"\n",
+            "gpu_mirror_graph = {gpu_mirror_graph}\n",
+            "graph_symbol_gpu = \"{graph_symbol_gpu}\"\n",
+            "custom_gpu_name0 = \"\"\n",
+            "custom_gpu_name1 = \"\"\n",
+            "custom_gpu_name2 = \"\"\n",
+            "custom_gpu_name3 = \"\"\n",
+            "custom_gpu_name4 = \"\"\n",
+            "custom_gpu_name5 = \"\"\n",
+        ),
+        show_gpu_info = cfg.show_gpu_info.as_str(),
+        gpu_mirror_graph = bool_title(cfg.gpu_mirror_graph),
+        graph_symbol_gpu = cfg.graph_symbol_gpu.map_or("default", GraphSymbol::as_str),
+    )
+}
+
+fn apply_config_entry(cfg: &mut Config, key: &str, val: String) -> Result<(), ConfigError> {
+    if apply_gpu_config_entry(cfg, key, &val)? {
+        return Ok(());
+    }
+    match key {
+        "color_theme" => cfg.color_theme = val,
+        "theme_background" => cfg.theme_background = parse_bool(key, &val)?,
+        "truecolor" => cfg.truecolor = parse_bool(key, &val)?,
+        "force_tty" => cfg.force_tty = parse_bool(key, &val)?,
+        "rounded_corners" => cfg.rounded_corners = parse_bool(key, &val)?,
+        "terminal_sync" => cfg.terminal_sync = parse_bool(key, &val)?,
+        "vim_keys" => cfg.vim_keys = parse_bool(key, &val)?,
+        "disable_mouse" => cfg.disable_mouse = parse_bool(key, &val)?,
+        "shown_boxes" => cfg.shown_boxes = val,
+        "presets" => cfg.presets = val,
+        "disable_presets" => cfg.disable_presets = DisablePresets::parse(key, &val)?,
+        "cpu_bottom" => cfg.cpu_bottom = parse_bool(key, &val)?,
+        "proc_left" => cfg.proc_left = parse_bool(key, &val)?,
+        "mem_below_net" => cfg.mem_below_net = parse_bool(key, &val)?,
+        "show_battery" => cfg.show_battery = parse_bool(key, &val)?,
+        "clock_format" => cfg.clock_format = val,
+        "proc_sorting" => cfg.proc_sorting = val,
+        "proc_reversed" => cfg.proc_reversed = parse_bool(key, &val)?,
+        "proc_tree" => cfg.proc_tree = parse_bool(key, &val)?,
+        "proc_aggregate" => cfg.proc_aggregate = parse_bool(key, &val)?,
+        "proc_cpu_graphs" => cfg.proc_cpu_graphs = parse_bool(key, &val)?,
+        "proc_follow_detailed" => cfg.proc_follow_detailed = parse_bool(key, &val)?,
+        "proc_per_core" => cfg.proc_per_core = parse_bool(key, &val)?,
+        "proc_mem_bytes" => cfg.proc_mem_bytes = parse_bool(key, &val)?,
+        "mem_graphs" => cfg.mem_graphs = parse_bool(key, &val)?,
+        "show_swap" => cfg.show_swap = parse_bool(key, &val)?,
+        "base_10_sizes" => cfg.base_10_sizes = parse_bool(key, &val)?,
+        "disks_filter" => cfg.disks_filter = val,
+        "show_disks" => cfg.show_disks = parse_bool(key, &val)?,
+        "show_io_stat" => cfg.show_io_stat = parse_bool(key, &val)?,
+        "io_mode" => cfg.io_mode = parse_bool(key, &val)?,
+        "io_graph_combined" => cfg.io_graph_combined = parse_bool(key, &val)?,
+        "io_graph_speeds" => cfg.io_graph_speeds = val,
+        "net_iface" => cfg.net_iface = val,
+        "net_download" => {
+            cfg.net_download = val
+                .parse::<u64>()
+                .map_err(|_| ConfigError::InvalidValue {
+                    key: key.to_owned(),
+                    value: val.clone(),
+                })?
+                .max(1);
+        }
+        "net_upload" => {
+            cfg.net_upload = val
+                .parse::<u64>()
+                .map_err(|_| ConfigError::InvalidValue {
+                    key: key.to_owned(),
+                    value: val.clone(),
+                })?
+                .max(1);
+        }
+        "net_auto" => cfg.net_auto = parse_bool(key, &val)?,
+        "net_sync" => cfg.net_sync = parse_bool(key, &val)?,
+        "swap_upload_download" => cfg.swap_upload_download = parse_bool(key, &val)?,
+        "base_10_bitrate" => cfg.base_10_bitrate = parse_bool(key, &val)?,
+        "cpu_util_mode" => cfg.cpu_util_mode = val,
+        "freq_mode" => cfg.freq_mode = val,
+        "graph_symbol" => cfg.graph_symbol = parse_graph_symbol(key, &val)?,
+        "update_ms" => {
+            let parsed: u32 = val.parse().map_err(|_| ConfigError::InvalidValue {
+                key: key.to_owned(),
+                value: val.clone(),
+            })?;
+            cfg.update_ms = parsed.max(100);
+        }
+        other => {
+            cfg.preserved_unknown.insert(other.to_owned(), val);
+        }
+    }
+    Ok(())
+}
+
+fn apply_gpu_config_entry(cfg: &mut Config, key: &str, val: &str) -> Result<bool, ConfigError> {
+    match key {
+        "show_gpu_info" => cfg.show_gpu_info = ShowGpuInfo::parse(key, val)?,
+        "gpu_mirror_graph" => cfg.gpu_mirror_graph = parse_bool(key, val)?,
+        "graph_symbol_gpu" => {
+            cfg.graph_symbol_gpu = match val.trim().to_ascii_lowercase().as_str() {
+                "" | "default" => None,
+                _ => Some(parse_graph_symbol(key, val)?),
+            };
+        }
+        "custom_gpu_name0" => val.clone_into(&mut cfg.custom_gpu_names[0]),
+        "custom_gpu_name1" => val.clone_into(&mut cfg.custom_gpu_names[1]),
+        "custom_gpu_name2" => val.clone_into(&mut cfg.custom_gpu_names[2]),
+        "custom_gpu_name3" => val.clone_into(&mut cfg.custom_gpu_names[3]),
+        "custom_gpu_name4" => val.clone_into(&mut cfg.custom_gpu_names[4]),
+        "custom_gpu_name5" => val.clone_into(&mut cfg.custom_gpu_names[5]),
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+fn parse_graph_symbol(key: &str, val: &str) -> Result<GraphSymbol, ConfigError> {
+    match val.trim().to_ascii_lowercase().as_str() {
+        "braille" => Ok(GraphSymbol::Braille),
+        "block" => Ok(GraphSymbol::Block),
+        "tty" => Ok(GraphSymbol::Tty),
+        _ => Err(ConfigError::InvalidValue {
+            key: key.to_owned(),
+            value: val.to_owned(),
+        }),
     }
 }
 
@@ -470,5 +572,20 @@ mod tests {
     fn clamps_update_ms_floor() {
         let parsed = Config::parse("update_ms = 25\n").expect("parse");
         assert_eq!(parsed.update_ms, 100);
+    }
+
+    #[test]
+    fn parses_gpu_config_keys_and_custom_names() {
+        let parsed = Config::parse(
+            "show_gpu_info = \"On\"\ngpu_mirror_graph = False\ngraph_symbol_gpu = \"block\"\ncustom_gpu_name0 = \"Primary 5090\"\ncustom_gpu_name1 = \"Radeon iGPU\"\n",
+        )
+        .expect("parse GPU config keys");
+        assert_eq!(parsed.show_gpu_info, ShowGpuInfo::On);
+        assert!(!parsed.gpu_mirror_graph);
+        assert_eq!(parsed.graph_symbol_gpu, Some(GraphSymbol::Block));
+        assert_eq!(parsed.effective_gpu_graph_symbol(), GraphSymbol::Block);
+        assert_eq!(parsed.custom_gpu_name(0), Some("Primary 5090"));
+        assert_eq!(parsed.custom_gpu_name(1), Some("Radeon iGPU"));
+        assert_eq!(parsed.custom_gpu_name(2), None);
     }
 }

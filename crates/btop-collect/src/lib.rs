@@ -3,6 +3,7 @@
 pub mod battery;
 pub mod cpu;
 pub mod disk;
+pub mod gpu;
 pub mod mem;
 pub mod net;
 pub mod proc;
@@ -25,6 +26,7 @@ pub use disk::{
     DiskCollector, build_disk_snapshots, compute_disk_busy_pct, compute_disk_io_rates,
     extract_drive_letter, matches_disks_filter,
 };
+pub use gpu::{GpuCollector, build_gpu_snapshots};
 pub use mem::{MemoryCollector, compute_mem_snapshot, pagefile_pages_to_bytes};
 pub use net::{NetCollector, compute_net_rates};
 pub use proc::{ProcessCollector, ProcessDeltaTracker};

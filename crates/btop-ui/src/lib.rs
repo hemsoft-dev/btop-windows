@@ -4,6 +4,7 @@
 
 pub mod cpu_box;
 pub mod disk_view;
+pub mod gpu_box;
 pub mod header;
 pub mod layout;
 pub mod mem_box;
@@ -24,6 +25,7 @@ use btop_model::{DataState, ProcessIdentity, Snapshot};
 use btop_term::{Grid, Size};
 
 pub use disk_view::{format_rate_bytes_per_sec, parse_io_graph_speeds};
+pub use gpu_box::format_compact_gpu_summary;
 pub use header::{format_battery, format_clock};
 pub use layout::{
     BoxId, ComputedLayout, LayoutState, PresetParseError, PresetSpec, SizeError, compute_layout,
@@ -162,6 +164,7 @@ pub struct UiHistory {
     mem_free: VecDeque<f32>,
     disks: BTreeMap<String, DiskIoSeries>,
     net: BTreeMap<u64, NetIoSeries>,
+    gpus: BTreeMap<u8, VecDeque<f32>>,
     proc_cpu: BTreeMap<ProcessIdentity, VecDeque<f32>>,
     proc_mem: BTreeMap<ProcessIdentity, VecDeque<u64>>,
 }
@@ -185,6 +188,7 @@ impl UiHistory {
             mem_free: VecDeque::with_capacity(cap),
             disks: BTreeMap::new(),
             net: BTreeMap::new(),
+            gpus: BTreeMap::new(),
             proc_cpu: BTreeMap::new(),
             proc_mem: BTreeMap::new(),
         }
@@ -300,6 +304,16 @@ impl UiHistory {
             self.proc_cpu.retain(|id, _| live_ids.contains(id));
             self.proc_mem.retain(|id, _| live_ids.contains(id));
         }
+
+        for (slot, gpu_state) in snapshot.gpus.iter().enumerate() {
+            if let DataState::Available(gpu) | DataState::Stale { value: gpu, .. } = gpu_state
+                && let Some(pct) = gpu.utilization_pct
+            {
+                let idx = u8::try_from(slot).unwrap_or(gpu.index);
+                let series = self.gpus.entry(idx).or_default();
+                push_bounded(series, pct.clamp(0.0, 100.0), self.capacity);
+            }
+        }
     }
 
     pub fn cpu_total_slice(&self) -> &[f32] {
@@ -347,6 +361,10 @@ impl UiHistory {
 
     pub fn proc_mem_slice(&self, id: ProcessIdentity) -> &[u64] {
         self.proc_mem.get(&id).map_or(&[], |buf| buf.as_slices().0)
+    }
+
+    pub fn gpu_util_slice(&self, gpu_idx: u8) -> &[f32] {
+        self.gpus.get(&gpu_idx).map_or(&[], |buf| buf.as_slices().0)
     }
 
     /// Clones per-process CPU history buffers for pausing the process panel cleanly.
@@ -417,7 +435,11 @@ pub fn visible_service_rows(size: Size, state: &UiState) -> usize {
 }
 
 fn box_config<'a>(config: &'a Config, state: &UiState, id: BoxId) -> Cow<'a, Config> {
-    let sym = state.layout.symbol_for(id, config.graph_symbol);
+    let default_sym = match id {
+        BoxId::Gpu(_) => config.effective_gpu_graph_symbol(),
+        _ => config.graph_symbol,
+    };
+    let sym = state.layout.symbol_for(id, default_sym);
     if sym == config.graph_symbol {
         Cow::Borrowed(config)
     } else {
@@ -464,9 +486,18 @@ pub fn render_frame(
         }
     };
 
+    let has_dedicated_gpu_boxes = !layout.gpus().is_empty();
     if let Some(rect) = layout.cpu() {
         let cfg = box_config(config, state, BoxId::Cpu);
-        cpu_box::render_cpu_box(&mut grid, rect, snapshot, history, &cfg, &theme);
+        cpu_box::render_cpu_box(
+            &mut grid,
+            rect,
+            snapshot,
+            history,
+            has_dedicated_gpu_boxes,
+            &cfg,
+            &theme,
+        );
     }
     if let Some(rect) = layout.mem() {
         let cfg = box_config(config, state, BoxId::Mem);
@@ -501,7 +532,7 @@ pub fn render_frame(
     }
     for (gpu_idx, rect) in layout.gpus() {
         let cfg = box_config(config, state, BoxId::Gpu(gpu_idx));
-        layout::render_gpu_placeholder(&mut grid, rect, gpu_idx, snapshot, &cfg, &theme);
+        gpu_box::render_gpu_box(&mut grid, rect, gpu_idx, snapshot, history, &cfg, &theme);
     }
 
     header::render_top_header(&mut grid, &layout, snapshot, state, config, &theme);
