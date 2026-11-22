@@ -225,8 +225,12 @@ pub struct GpuSnapshot {
     pub core_clock_mhz: Option<u32>,
     pub mem_clock_mhz: Option<u32>,
     pub temp_celsius: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temp_max_celsius: Option<f32>,
     pub power_watts: Option<f32>,
     pub power_limit_watts: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pstate: Option<String>,
     pub pcie_tx_kbs: Option<u64>,
     pub pcie_rx_kbs: Option<u64>,
     pub encoder_pct: Option<f32>,

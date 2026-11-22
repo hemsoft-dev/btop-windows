@@ -109,7 +109,7 @@ fn main() -> ExitCode {
         }
     } else {
         let freq_mode = FreqMode::from_config_str(&config.freq_mode);
-        match LiveCollector::with_freq_mode(freq_mode) {
+        match LiveCollector::with_options(freq_mode, config.nvml_measure_pcie_speeds) {
             Ok(live) => Box::new(live),
             Err(err) => {
                 eprintln!("error: failed to initialize live telemetry collector: {err}");

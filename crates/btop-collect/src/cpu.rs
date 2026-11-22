@@ -331,6 +331,13 @@ impl LiveCollector {
     }
 
     pub fn with_freq_mode(freq_mode: FreqMode) -> Result<Self, CollectError> {
+        Self::with_options(freq_mode, true)
+    }
+
+    pub fn with_options(
+        freq_mode: FreqMode,
+        nvml_measure_pcie_speeds: bool,
+    ) -> Result<Self, CollectError> {
         let hostname = std::env::var("COMPUTERNAME")
             .or_else(|_| std::env::var("HOSTNAME"))
             .unwrap_or_else(|_| "WINDOWS-HOST".to_owned());
@@ -358,7 +365,7 @@ impl LiveCollector {
             net,
             procs,
             services: ServiceCollector::new(),
-            gpus: GpuCollector::new(),
+            gpus: GpuCollector::with_pcie_speeds(nvml_measure_pcie_speeds),
             battery: BatteryCollector::new(),
             runq: RunQueueEwma::default(),
             last_runq_instant: None,
@@ -437,6 +444,10 @@ impl SnapshotSource for LiveCollector {
 
     fn set_freq_mode(&mut self, mode: FreqMode) {
         self.cpu.set_freq_mode(mode);
+    }
+
+    fn set_nvml_measure_pcie_speeds(&mut self, enabled: bool) {
+        self.gpus.set_measure_pcie_speeds(enabled);
     }
 
     fn set_services_active(&mut self, active: bool) {

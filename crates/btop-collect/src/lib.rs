@@ -6,6 +6,7 @@ pub mod disk;
 pub mod gpu;
 pub mod mem;
 pub mod net;
+pub mod nvml;
 pub mod proc;
 pub mod replay;
 pub mod sampler;
@@ -29,6 +30,10 @@ pub use disk::{
 pub use gpu::{GpuCollector, build_gpu_snapshots};
 pub use mem::{MemoryCollector, compute_mem_snapshot, pagefile_pages_to_bytes};
 pub use net::{NetCollector, compute_net_rates};
+pub use nvml::{
+    NVML_POLL_INTERVAL, NVML_STALE_TIMEOUT, NvmlSnapshotState, NvmlWorker, apply_nvml_enrichment,
+    match_nvml_devices, normalize_pci_bdf,
+};
 pub use proc::{ProcessCollector, ProcessDeltaTracker};
 pub use replay::{ReplaySource, StubLiveSource};
 pub use sampler::{MAX_UPDATE_MS, MIN_UPDATE_MS, Sampler};
@@ -50,6 +55,9 @@ pub trait SnapshotSource: Send {
 
     /// Updates the live frequency aggregation mode (e.g., on `Ctrl+R` config reload).
     fn set_freq_mode(&mut self, _mode: FreqMode) {}
+
+    /// Updates optional NVIDIA NVML `PCIe` Tx/Rx measurement (e.g., on `Ctrl+R` config reload).
+    fn set_nvml_measure_pcie_speeds(&mut self, _enabled: bool) {}
 
     /// Enables or disables on-demand Windows Services (SCM) polling while the Services view is open.
     fn set_services_active(&mut self, _active: bool) {}

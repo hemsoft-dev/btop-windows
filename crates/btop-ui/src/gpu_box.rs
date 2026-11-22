@@ -607,7 +607,11 @@ fn optional_vendor_lines(gpu: &GpuSnapshot, stale_note: Option<&str>) -> Vec<Str
 
     let mut thermal_parts = Vec::new();
     if let Some(temp) = gpu.temp_celsius {
-        thermal_parts.push(format!("TEMP {temp:.0}°C"));
+        if let Some(max_temp) = gpu.temp_max_celsius {
+            thermal_parts.push(format!("TEMP {temp:.0}/{max_temp:.0}°C"));
+        } else {
+            thermal_parts.push(format!("TEMP {temp:.0}°C"));
+        }
     }
     if let Some(power) = gpu.power_watts {
         if let Some(limit) = gpu.power_limit_watts {
@@ -626,6 +630,9 @@ fn optional_vendor_lines(gpu: &GpuSnapshot, stale_note: Option<&str>) -> Vec<Str
     }
     if let Some(mem) = gpu.mem_clock_mhz {
         clk_parts.push(format!("MEM {mem} MHz"));
+    }
+    if let Some(ref ps) = gpu.pstate {
+        clk_parts.push(ps.clone());
     }
     if !clk_parts.is_empty() {
         lines.push(clk_parts.join("  "));
@@ -719,10 +726,12 @@ mod tests {
         // Strip vendor fields from gpu0 too and confirm no "0°C" / "0W" / "0 MHz" placeholders appear.
         if let DataState::Available(ref mut g0) = snap.gpus[0] {
             g0.temp_celsius = None;
+            g0.temp_max_celsius = None;
             g0.power_watts = None;
             g0.power_limit_watts = None;
             g0.core_clock_mhz = None;
             g0.mem_clock_mhz = None;
+            g0.pstate = None;
             g0.encoder_pct = None;
             g0.decoder_pct = None;
             g0.pcie_tx_kbs = None;
@@ -744,6 +753,30 @@ mod tests {
         assert!(!baseline_only.contains("CLK"));
         assert!(!baseline_only.contains("ENC"));
         assert!(!baseline_only.contains("PCIe"));
+
+        // Verify optional NVML temp_max_celsius and pstate render cleanly when populated.
+        if let DataState::Available(ref mut g0) = snap.gpus[0] {
+            g0.temp_celsius = Some(47.0);
+            g0.temp_max_celsius = Some(90.0);
+            g0.core_clock_mhz = Some(2782);
+            g0.pstate = Some("P0".to_owned());
+        }
+        let enriched = render_frame(
+            &snap,
+            &hist,
+            &state,
+            &cfg,
+            Size {
+                width: 120,
+                height: 24,
+            },
+        )
+        .to_plain_text();
+        assert!(
+            enriched.contains("TEMP 47/90°C"),
+            "expected max temp:\n{enriched}"
+        );
+        assert!(enriched.contains("P0"), "expected pstate:\n{enriched}");
     }
 
     #[test]

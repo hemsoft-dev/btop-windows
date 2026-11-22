@@ -150,6 +150,7 @@ pub struct Config {
     pub show_gpu_info: ShowGpuInfo,
     pub gpu_mirror_graph: bool,
     pub graph_symbol_gpu: Option<GraphSymbol>,
+    pub nvml_measure_pcie_speeds: bool,
     pub custom_gpu_names: [String; 6],
     /// Unknown or deferred upstream keys preserved verbatim when saving `btop.conf`.
     pub preserved_unknown: BTreeMap<String, String>,
@@ -205,6 +206,7 @@ impl Default for Config {
             show_gpu_info: ShowGpuInfo::Auto,
             gpu_mirror_graph: true,
             graph_symbol_gpu: None,
+            nvml_measure_pcie_speeds: true,
             custom_gpu_names: std::array::from_fn(|_| String::new()),
             preserved_unknown: BTreeMap::new(),
         }
@@ -355,6 +357,7 @@ fn render_gpu_defaults(cfg: &Config) -> String {
             "show_gpu_info = \"{show_gpu_info}\"\n",
             "gpu_mirror_graph = {gpu_mirror_graph}\n",
             "graph_symbol_gpu = \"{graph_symbol_gpu}\"\n",
+            "nvml_measure_pcie_speeds = {nvml_measure_pcie_speeds}\n",
             "custom_gpu_name0 = \"\"\n",
             "custom_gpu_name1 = \"\"\n",
             "custom_gpu_name2 = \"\"\n",
@@ -365,6 +368,7 @@ fn render_gpu_defaults(cfg: &Config) -> String {
         show_gpu_info = cfg.show_gpu_info.as_str(),
         gpu_mirror_graph = bool_title(cfg.gpu_mirror_graph),
         graph_symbol_gpu = cfg.graph_symbol_gpu.map_or("default", GraphSymbol::as_str),
+        nvml_measure_pcie_speeds = bool_title(cfg.nvml_measure_pcie_speeds),
     )
 }
 
@@ -456,6 +460,7 @@ fn apply_gpu_config_entry(cfg: &mut Config, key: &str, val: &str) -> Result<bool
                 _ => Some(parse_graph_symbol(key, val)?),
             };
         }
+        "nvml_measure_pcie_speeds" => cfg.nvml_measure_pcie_speeds = parse_bool(key, val)?,
         "custom_gpu_name0" => val.clone_into(&mut cfg.custom_gpu_names[0]),
         "custom_gpu_name1" => val.clone_into(&mut cfg.custom_gpu_names[1]),
         "custom_gpu_name2" => val.clone_into(&mut cfg.custom_gpu_names[2]),
@@ -577,13 +582,14 @@ mod tests {
     #[test]
     fn parses_gpu_config_keys_and_custom_names() {
         let parsed = Config::parse(
-            "show_gpu_info = \"On\"\ngpu_mirror_graph = False\ngraph_symbol_gpu = \"block\"\ncustom_gpu_name0 = \"Primary 5090\"\ncustom_gpu_name1 = \"Radeon iGPU\"\n",
+            "show_gpu_info = \"On\"\ngpu_mirror_graph = False\ngraph_symbol_gpu = \"block\"\nnvml_measure_pcie_speeds = False\ncustom_gpu_name0 = \"Primary 5090\"\ncustom_gpu_name1 = \"Radeon iGPU\"\n",
         )
         .expect("parse GPU config keys");
         assert_eq!(parsed.show_gpu_info, ShowGpuInfo::On);
         assert!(!parsed.gpu_mirror_graph);
         assert_eq!(parsed.graph_symbol_gpu, Some(GraphSymbol::Block));
         assert_eq!(parsed.effective_gpu_graph_symbol(), GraphSymbol::Block);
+        assert!(!parsed.nvml_measure_pcie_speeds);
         assert_eq!(parsed.custom_gpu_name(0), Some("Primary 5090"));
         assert_eq!(parsed.custom_gpu_name(1), Some("Radeon iGPU"));
         assert_eq!(parsed.custom_gpu_name(2), None);

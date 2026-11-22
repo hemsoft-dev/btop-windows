@@ -10,13 +10,19 @@ use btop_sys::{
     filter_hardware_adapters,
 };
 
-const ADAPTER_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+use crate::nvml::{NvmlWorker, apply_nvml_enrichment};
 
-/// Stateful DXGI + persistent WDDM PDH GPU telemetry collector.
+const ADAPTER_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const NVIDIA_VENDOR_ID: u32 = 0x10DE;
+
+/// Stateful DXGI + persistent WDDM PDH GPU telemetry collector with optional non-blocking
+/// NVIDIA NVML enrichment.
 #[derive(Debug)]
 pub struct GpuCollector {
     adapters: Vec<RawGpuAdapter>,
     pdh: Option<GpuPdhQuery>,
+    nvml: Option<NvmlWorker>,
+    measure_pcie_speeds: bool,
     last_enum: Instant,
     enum_error: Option<String>,
 }
@@ -30,6 +36,11 @@ impl Default for GpuCollector {
 impl GpuCollector {
     /// Enumerates DXGI hardware adapters and opens the persistent English WDDM PDH query.
     pub fn new() -> Self {
+        Self::with_pcie_speeds(true)
+    }
+
+    /// Creates a GPU collector with explicit `nvml_measure_pcie_speeds` configuration.
+    pub fn with_pcie_speeds(measure_pcie_speeds: bool) -> Self {
         let (adapters, enum_error) = match enumerate_hardware_gpus() {
             Ok(list) => (list, None),
             Err(err) => (Vec::new(), Some(err)),
@@ -39,11 +50,22 @@ impl GpuCollector {
         } else {
             GpuPdhQuery::open()
         };
+        let nvml = has_nvidia_adapter(&adapters).then(|| NvmlWorker::spawn(measure_pcie_speeds));
         Self {
             adapters,
             pdh,
+            nvml,
+            measure_pcie_speeds,
             last_enum: Instant::now(),
             enum_error,
+        }
+    }
+
+    /// Updates `nvml_measure_pcie_speeds` live (e.g. on `Ctrl+R` config reload).
+    pub fn set_measure_pcie_speeds(&mut self, enabled: bool) {
+        self.measure_pcie_speeds = enabled;
+        if let Some(ref nvml) = self.nvml {
+            nvml.set_measure_pcie_speeds(enabled);
         }
     }
 
@@ -51,7 +73,8 @@ impl GpuCollector {
     ///
     /// On the first call, primes WDDM PDH rate counters and publishes `DataState::WarmingUp`
     /// per adapter (matching ADR-0002). Re-enumerates DXGI adapters if a new LUID appears in
-    /// PDH or after 30 seconds.
+    /// PDH or after 30 seconds, and layers optional non-blocking NVML enrichment onto matched
+    /// NVIDIA adapters.
     pub fn sample(&mut self) -> Vec<DataState<GpuSnapshot>> {
         let now = Instant::now();
         if now.saturating_duration_since(self.last_enum) >= ADAPTER_REFRESH_INTERVAL {
@@ -69,31 +92,36 @@ impl GpuCollector {
             self.pdh = GpuPdhQuery::open();
         }
 
-        let Some(ref mut pdh) = self.pdh else {
-            return build_gpu_snapshots(&self.adapters, None, true);
+        let mut snapshots = if let Some(ref mut pdh) = self.pdh {
+            match pdh.sample() {
+                Ok(None) => build_gpu_snapshots(&self.adapters, None, false),
+                Ok(Some(sample)) => {
+                    // Re-enumerate DXGI adapters immediately if WDDM reports a new hardware LUID.
+                    let has_unknown_luid = sample
+                        .by_luid
+                        .keys()
+                        .any(|luid| !self.adapters.iter().any(|a| a.luid == *luid));
+                    if has_unknown_luid
+                        && now.saturating_duration_since(self.last_enum) >= Duration::from_secs(5)
+                    {
+                        self.refresh_adapters(now);
+                    }
+                    build_gpu_snapshots(&self.adapters, Some(&sample), true)
+                }
+                Err(_) => {
+                    // Drop and reopen on next tick; still expose DXGI adapter identity cleanly.
+                    self.pdh = None;
+                    build_gpu_snapshots(&self.adapters, None, true)
+                }
+            }
+        } else {
+            build_gpu_snapshots(&self.adapters, None, true)
         };
 
-        match pdh.sample() {
-            Ok(None) => build_gpu_snapshots(&self.adapters, None, false),
-            Ok(Some(sample)) => {
-                // Re-enumerate DXGI adapters immediately if WDDM reports a new hardware LUID.
-                let has_unknown_luid = sample
-                    .by_luid
-                    .keys()
-                    .any(|luid| !self.adapters.iter().any(|a| a.luid == *luid));
-                if has_unknown_luid
-                    && now.saturating_duration_since(self.last_enum) >= Duration::from_secs(5)
-                {
-                    self.refresh_adapters(now);
-                }
-                build_gpu_snapshots(&self.adapters, Some(&sample), true)
-            }
-            Err(_) => {
-                // Drop and reopen on next tick; still expose DXGI adapter identity cleanly.
-                self.pdh = None;
-                build_gpu_snapshots(&self.adapters, None, true)
-            }
+        if let Some(ref nvml) = self.nvml {
+            apply_nvml_enrichment(&mut snapshots, &self.adapters, &nvml.latest());
         }
+        snapshots
     }
 
     fn refresh_adapters(&mut self, now: Instant) {
@@ -102,6 +130,7 @@ impl GpuCollector {
             Ok(list) => {
                 self.adapters = list;
                 self.enum_error = None;
+                self.sync_nvml_worker();
             }
             Err(err) => {
                 if self.adapters.is_empty() {
@@ -110,6 +139,21 @@ impl GpuCollector {
             }
         }
     }
+
+    fn sync_nvml_worker(&mut self) {
+        let needs_nvml = has_nvidia_adapter(&self.adapters);
+        if needs_nvml && self.nvml.is_none() {
+            self.nvml = Some(NvmlWorker::spawn(self.measure_pcie_speeds));
+        } else if !needs_nvml && self.nvml.is_some() {
+            self.nvml = None;
+        }
+    }
+}
+
+fn has_nvidia_adapter(adapters: &[RawGpuAdapter]) -> bool {
+    adapters
+        .iter()
+        .any(|a| !a.is_software && a.vendor_id == NVIDIA_VENDOR_ID)
 }
 
 /// Pure transformation joining DXGI hardware adapters with WDDM PDH metrics by LUID.
@@ -155,8 +199,10 @@ pub fn build_gpu_snapshots(
                 core_clock_mhz: None,
                 mem_clock_mhz: None,
                 temp_celsius: None,
+                temp_max_celsius: None,
                 power_watts: None,
                 power_limit_watts: None,
+                pstate: None,
                 pcie_tx_kbs: None,
                 pcie_rx_kbs: None,
                 encoder_pct: None,
