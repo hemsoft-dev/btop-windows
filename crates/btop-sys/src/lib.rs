@@ -9,6 +9,7 @@ pub mod disk;
 pub mod gpu;
 pub mod mem;
 pub mod net;
+pub mod nvml;
 pub mod pdh;
 pub mod power;
 pub mod proc_actions;
@@ -32,6 +33,11 @@ pub use mem::{
 };
 pub use net::{
     RawNetEntry, RawNetInterface, enumerate_hardware_interfaces, refresh_interface_entry,
+};
+pub use nvml::{
+    NVML_ERROR_NOT_SUPPORTED, NVML_SUCCESS, NvmlLibrary, NvmlPciInfo, RawNvmlDevice,
+    decode_nvml_field, decode_nvml_pci_ids, decode_nvml_pstate, format_pci_bdf,
+    milliwatts_to_watts,
 };
 pub use pdh::{CpuPdhQuery, CpuPdhSample};
 pub use power::{RawPowerStatus, local_utc_offset_secs, query_system_power_status};

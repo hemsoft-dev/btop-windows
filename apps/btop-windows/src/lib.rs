@@ -461,6 +461,7 @@ fn handle_tui_event(
                 *config = reloaded;
                 config.update_ms = sampler.set_update_ms(config.update_ms);
                 sampler.set_freq_mode(FreqMode::from_config_str(&config.freq_mode));
+                sampler.set_nvml_measure_pcie_speeds(config.nvml_measure_pcie_speeds);
                 *ui_state = build_ui_state(config, overrides);
                 ui_state.net.observe_snapshot(snapshot);
                 sampler.set_services_active(should_poll_services(*size, ui_state));

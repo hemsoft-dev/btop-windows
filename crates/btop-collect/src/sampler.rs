@@ -27,6 +27,8 @@ struct SamplerShared {
     update_ms_dirty: AtomicBool,
     freq_mode: AtomicU8,
     freq_mode_dirty: AtomicBool,
+    nvml_measure_pcie_speeds: AtomicBool,
+    nvml_pcie_dirty: AtomicBool,
     services_active: AtomicBool,
     services_dirty: AtomicBool,
     services_refresh: AtomicBool,
@@ -87,6 +89,8 @@ impl Sampler {
             update_ms_dirty: AtomicBool::new(false),
             freq_mode: AtomicU8::new(FreqMode::Average.to_u8()),
             freq_mode_dirty: AtomicBool::new(false),
+            nvml_measure_pcie_speeds: AtomicBool::new(true),
+            nvml_pcie_dirty: AtomicBool::new(false),
             services_active: AtomicBool::new(false),
             services_dirty: AtomicBool::new(false),
             services_refresh: AtomicBool::new(false),
@@ -146,6 +150,15 @@ impl Sampler {
     pub fn set_freq_mode(&self, mode: FreqMode) {
         self.shared.freq_mode.store(mode.to_u8(), Ordering::Relaxed);
         self.shared.freq_mode_dirty.store(true, Ordering::Release);
+        self.shared.waker.wake();
+    }
+
+    /// Propagates `nvml_measure_pcie_speeds` to the background collector (e.g., on `Ctrl+R` reload).
+    pub fn set_nvml_measure_pcie_speeds(&self, enabled: bool) {
+        self.shared
+            .nvml_measure_pcie_speeds
+            .store(enabled, Ordering::Relaxed);
+        self.shared.nvml_pcie_dirty.store(true, Ordering::Release);
         self.shared.waker.wake();
     }
 
@@ -224,6 +237,11 @@ fn run_sampler_loop(
         let now = Instant::now();
         if shared.freq_mode_dirty.swap(false, Ordering::AcqRel) {
             source.set_freq_mode(FreqMode::from_u8(shared.freq_mode.load(Ordering::Relaxed)));
+        }
+        if shared.nvml_pcie_dirty.swap(false, Ordering::AcqRel) {
+            source.set_nvml_measure_pcie_speeds(
+                shared.nvml_measure_pcie_speeds.load(Ordering::Relaxed),
+            );
         }
         if shared.update_ms_dirty.swap(false, Ordering::AcqRel) {
             main_interval =
