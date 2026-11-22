@@ -3,7 +3,7 @@
 
 use btop_config::Config;
 use btop_model::ProcessIdentity;
-use btop_term::{Grid, Rect};
+use btop_term::{Grid, Rect, Size};
 use unicode_width::UnicodeWidthStr;
 
 use crate::proc_box::clip_text;
@@ -102,6 +102,16 @@ impl ProcActionModal {
     }
 }
 
+/// Computes the centered [`Rect`] for `modal` inside `size`, or `None` when the terminal
+/// viewport is too small to display the dialog safely.
+pub fn modal_rect(size: Size, modal: &ProcActionModal) -> Option<Rect> {
+    match modal {
+        ProcActionModal::ConfirmTerminate { .. } => centered_rect_for_size(size, 62, 8, 8),
+        ProcActionModal::PrioritySelector { .. } => centered_rect_for_size(size, 52, 12, 11),
+        ProcActionModal::ActionNotice { .. } => centered_rect_for_size(size, 66, 8, 8),
+    }
+}
+
 /// Renders the active [`ProcActionModal`] centered inside `grid`.
 pub fn render_proc_action_modal(
     grid: &mut Grid,
@@ -109,9 +119,12 @@ pub fn render_proc_action_modal(
     config: &Config,
     theme: &ThemePalette,
 ) {
+    let Some(rect) = modal_rect(grid.size(), modal) else {
+        return;
+    };
     match modal {
         ProcActionModal::ConfirmTerminate { target, name } => {
-            render_confirm_terminate(grid, *target, name, config, theme);
+            render_confirm_terminate(grid, rect, *target, name, config, theme);
         }
         ProcActionModal::PrioritySelector {
             target,
@@ -119,23 +132,24 @@ pub fn render_proc_action_modal(
             current,
             selected,
         } => {
-            render_priority_selector(grid, *target, name, *current, *selected, config, theme);
+            render_priority_selector(
+                grid, rect, *target, name, *current, *selected, config, theme,
+            );
         }
         ProcActionModal::ActionNotice {
             title,
             message,
             is_error,
         } => {
-            render_action_notice(grid, title, message, *is_error, config, theme);
+            render_action_notice(grid, rect, title, message, *is_error, config, theme);
         }
     }
 }
 
-fn centered_rect(grid: &Grid, desired_w: u16, desired_h: u16) -> Option<Rect> {
-    let size = grid.size();
+fn centered_rect_for_size(size: Size, desired_w: u16, desired_h: u16, min_h: u16) -> Option<Rect> {
     let width = desired_w.min(size.width.saturating_sub(2));
     let height = desired_h.min(size.height.saturating_sub(2));
-    if width < 28 || height < 7 {
+    if width < 28 || height < min_h {
         return None;
     }
     Some(Rect {
@@ -148,14 +162,12 @@ fn centered_rect(grid: &Grid, desired_w: u16, desired_h: u16) -> Option<Rect> {
 
 fn render_confirm_terminate(
     grid: &mut Grid,
+    rect: Rect,
     target: ProcessIdentity,
     name: &str,
     config: &Config,
     theme: &ThemePalette,
 ) {
-    let Some(rect) = centered_rect(grid, 62, 8) else {
-        return;
-    };
     fill_rect(grid, rect, theme.main_fg, theme.main_bg);
     draw_box_frame(
         grid,
@@ -206,8 +218,10 @@ fn render_confirm_terminate(
     grid.write_str(inner_x, rect.y + 5, &hint, theme.hi_fg, theme.main_bg, true);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_priority_selector(
     grid: &mut Grid,
+    rect: Rect,
     target: ProcessIdentity,
     name: &str,
     current: Option<UiPriorityClass>,
@@ -215,9 +229,6 @@ fn render_priority_selector(
     config: &Config,
     theme: &ThemePalette,
 ) {
-    let Some(rect) = centered_rect(grid, 52, 12) else {
-        return;
-    };
     fill_rect(grid, rect, theme.main_fg, theme.main_bg);
     draw_box_frame(
         grid,
@@ -304,15 +315,13 @@ fn render_priority_selector(
 
 fn render_action_notice(
     grid: &mut Grid,
+    rect: Rect,
     title: &str,
     message: &str,
     is_error: bool,
     config: &Config,
     theme: &ThemePalette,
 ) {
-    let Some(rect) = centered_rect(grid, 66, 8) else {
-        return;
-    };
     let border_fg = if is_error {
         theme.hi_fg
     } else {
@@ -470,5 +479,36 @@ mod tests {
         assert!(t3.contains("Action Refused"));
         assert!(t3.contains("critical Windows system process"));
         assert!(t3.contains("[Enter / Esc] Dismiss"));
+    }
+
+    #[test]
+    fn modal_rect_rejects_short_viewports_so_modals_never_arm_invisibly() {
+        let confirm = ProcActionModal::ConfirmTerminate {
+            target: ProcessIdentity {
+                pid: 4216,
+                create_time_100ns: 1000,
+            },
+            name: "worker.exe".to_owned(),
+        };
+        assert_eq!(
+            modal_rect(
+                Size {
+                    width: 80,
+                    height: 7
+                },
+                &confirm
+            ),
+            None
+        );
+        assert!(
+            modal_rect(
+                Size {
+                    width: 80,
+                    height: 24
+                },
+                &confirm
+            )
+            .is_some()
+        );
     }
 }

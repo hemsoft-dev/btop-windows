@@ -169,8 +169,8 @@ mod win {
         SetPriorityClass, TerminateProcess,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GW_OWNER, GetWindow, GetWindowThreadProcessId, IsWindowVisible, PostMessageW,
-        WM_CLOSE,
+        EnumWindows, GW_OWNER, GetWindow, GetWindowThreadProcessId, IsWindow, IsWindowVisible,
+        PostMessageW, WM_CLOSE,
     };
 
     use super::{
@@ -419,7 +419,21 @@ mod win {
         let mut sent = 0usize;
         let mut saw_access_denied = false;
         for hwnd in targets {
-            // SAFETY: Posting asynchronous `WM_CLOSE` to a top-level window owned by verified `pid`.
+            // Revalidate window existence and owning PID immediately before posting `WM_CLOSE`
+            // so a destroyed/reused HWND cannot deliver `WM_CLOSE` to an unrelated process.
+            if unsafe { IsWindow(hwnd) } == 0 {
+                continue;
+            }
+            let mut current_pid = 0u32;
+            // SAFETY: Querying current owning PID of `hwnd` right before sending `WM_CLOSE`.
+            unsafe {
+                let _ = GetWindowThreadProcessId(hwnd, &raw mut current_pid);
+            }
+            if current_pid != pid || !unsafe { GetWindow(hwnd, GW_OWNER) }.is_null() {
+                continue;
+            }
+
+            // SAFETY: Posting asynchronous `WM_CLOSE` to a revalidated window owned by verified `pid`.
             let ok = unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
             if ok != 0 {
                 sent += 1;

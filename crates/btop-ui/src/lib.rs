@@ -30,7 +30,7 @@ pub use layout::{
 };
 pub use mem_box::{format_mem_bytes, stacked_physical_segments};
 pub use net_box::{AUTO_SCALE_FLOOR_BPS, NetViewState, compute_net_scale_ceilings, format_bitrate};
-pub use proc_actions::{ProcActionModal, UiPriorityClass};
+pub use proc_actions::{ProcActionModal, UiPriorityClass, modal_rect};
 pub use proc_box::{ProcSort, ProcViewState};
 pub use proc_detail::{
     detail_overlay_height, format_detail_field, format_elapsed_uptime, format_parent_label,
@@ -373,6 +373,15 @@ fn push_bounded_u64(buf: &mut VecDeque<u64>, value: u64, capacity: usize) {
     }
     buf.push_back(value);
     buf.make_contiguous();
+}
+
+/// Returns `true` iff `state.modal` is set and will be visibly drawn at `size`
+/// (layout succeeds and the modal dialog fits inside `size`).
+pub fn is_modal_visible(size: Size, state: &UiState) -> bool {
+    let Some(ref modal) = state.modal else {
+        return false;
+    };
+    compute_layout(size, &state.layout).is_ok() && modal_rect(size, modal).is_some()
 }
 
 /// Computes the number of visible process rows for a given viewport size and active UI layout state.
