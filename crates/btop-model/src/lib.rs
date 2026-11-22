@@ -216,6 +216,12 @@ pub struct GpuSnapshot {
     pub utilization_pct: Option<f32>,
     pub vram_used_bytes: Option<u64>,
     pub vram_total_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_vram_used_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_vram_total_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub luid: Option<u64>,
     pub core_clock_mhz: Option<u32>,
     pub mem_clock_mhz: Option<u32>,
     pub temp_celsius: Option<f32>,

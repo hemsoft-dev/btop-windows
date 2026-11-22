@@ -7,6 +7,8 @@ use btop_model::{CoreKind, CoreSample, CpuSnapshot, DataState, Snapshot};
 use btop_term::{Cell, Grid, HitAction, Rect};
 
 use crate::UiHistory;
+use crate::gpu_box::format_compact_gpu_summary;
+use crate::proc_box::clip_text;
 use crate::theme::ThemePalette;
 use crate::widgets::{draw_border_tag, draw_box_frame, draw_graph, draw_meter, fill_rect};
 
@@ -16,6 +18,7 @@ pub fn render_cpu_box(
     rect: Rect,
     snapshot: &Snapshot,
     history: &UiHistory,
+    has_dedicated_gpu_boxes: bool,
     config: &Config,
     theme: &ThemePalette,
 ) {
@@ -39,14 +42,33 @@ pub fn render_cpu_box(
         width: rect.width.saturating_sub(2),
         height: rect.height.saturating_sub(2),
     };
+    let gpu_summary = format_compact_gpu_summary(snapshot, config, has_dedicated_gpu_boxes);
 
     match &snapshot.cpu {
         DataState::Available(cpu) => {
-            render_cpu_body(grid, inner, cpu, history, config, theme, None);
+            render_cpu_body(
+                grid,
+                inner,
+                cpu,
+                history,
+                gpu_summary.as_deref(),
+                config,
+                theme,
+                None,
+            );
         }
         DataState::Stale { value, age_ms } => {
             let note = format!("stale {age_ms}ms");
-            render_cpu_body(grid, inner, value, history, config, theme, Some(&note));
+            render_cpu_body(
+                grid,
+                inner,
+                value,
+                history,
+                gpu_summary.as_deref(),
+                config,
+                theme,
+                Some(&note),
+            );
         }
         DataState::WarmingUp => {
             grid.write_str(
@@ -180,11 +202,13 @@ fn render_cpu_chrome(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_cpu_body(
     grid: &mut Grid,
     inner: Rect,
     cpu: &CpuSnapshot,
     history: &UiHistory,
+    gpu_summary: Option<&str>,
     config: &Config,
     theme: &ThemePalette,
     stale_note: Option<&str>,
@@ -229,7 +253,15 @@ fn render_cpu_body(
     }
 
     render_split_graph(grid, graph_rect, history, config, theme);
-    render_stats_pane(grid, stats_rect, cpu, config, theme, stale_note);
+    render_stats_pane(
+        grid,
+        stats_rect,
+        cpu,
+        gpu_summary,
+        config,
+        theme,
+        stale_note,
+    );
 }
 
 fn render_split_graph(
@@ -309,11 +341,12 @@ fn render_split_graph(
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn render_stats_pane(
     grid: &mut Grid,
     rect: Rect,
     cpu: &CpuSnapshot,
+    gpu_summary: Option<&str>,
     config: &Config,
     theme: &ThemePalette,
     stale_note: Option<&str>,
@@ -368,8 +401,15 @@ fn render_stats_pane(
         y = y.saturating_add(1);
     }
 
-    // Reserve footer rows for metadata (uptime, freq, RunQ / stale status)
-    let footer_rows: u16 = if rect.height >= 8 { 2 } else { 1 };
+    // Reserve footer rows for metadata (uptime, freq, RunQ, and optional compact GPU summary)
+    let show_gpu_row = gpu_summary.is_some() && rect.height >= 9;
+    let footer_rows: u16 = if show_gpu_row {
+        3
+    } else if rect.height >= 8 {
+        2
+    } else {
+        1
+    };
     let core_area_end = max_y.saturating_sub(footer_rows);
     if y < core_area_end && !cpu.cores.is_empty() {
         render_core_meters(
@@ -436,6 +476,21 @@ fn render_stats_pane(
             core_area_end + 1,
             &clipped,
             theme.inactive_fg,
+            theme.main_bg,
+            false,
+        );
+    }
+
+    if show_gpu_row
+        && let Some(summary) = gpu_summary
+        && core_area_end + 2 < max_y
+    {
+        let clipped = clip_text(summary, usize::from(rect.width.saturating_sub(2)));
+        grid.write_str(
+            rect.x + 1,
+            core_area_end + 2,
+            &clipped,
+            theme.hi_fg,
             theme.main_bg,
             false,
         );

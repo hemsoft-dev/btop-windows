@@ -14,6 +14,7 @@ use btop_sys::{
 
 use crate::battery::BatteryCollector;
 use crate::disk::DiskCollector;
+use crate::gpu::GpuCollector;
 use crate::math::cpu_busy_percent;
 use crate::mem::MemoryCollector;
 use crate::net::NetCollector;
@@ -318,6 +319,7 @@ pub struct LiveCollector {
     net: NetCollector,
     procs: ProcessCollector,
     services: ServiceCollector,
+    gpus: GpuCollector,
     battery: BatteryCollector,
     runq: RunQueueEwma,
     last_runq_instant: Option<Instant>,
@@ -356,6 +358,7 @@ impl LiveCollector {
             net,
             procs,
             services: ServiceCollector::new(),
+            gpus: GpuCollector::new(),
             battery: BatteryCollector::new(),
             runq: RunQueueEwma::default(),
             last_runq_instant: None,
@@ -413,6 +416,7 @@ impl SnapshotSource for LiveCollector {
         };
 
         let services = self.services.sample();
+        let gpus = self.gpus.sample();
         let battery = self.battery.sample();
 
         Ok(Snapshot {
@@ -426,8 +430,8 @@ impl SnapshotSource for LiveCollector {
             net,
             processes,
             services,
+            gpus,
             battery,
-            ..Snapshot::default()
         })
     }
 

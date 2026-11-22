@@ -4,6 +4,7 @@
 
 pub mod cpu_box;
 pub mod disk_view;
+pub mod gpu_box;
 pub mod header;
 pub mod layout;
 pub mod mem_box;
@@ -20,10 +21,11 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use btop_config::Config;
-use btop_model::{DataState, ProcessIdentity, Snapshot};
+use btop_model::{DataState, GpuSnapshot, ProcessIdentity, Snapshot};
 use btop_term::{Grid, Size};
 
 pub use disk_view::{format_rate_bytes_per_sec, parse_io_graph_speeds};
+pub use gpu_box::format_compact_gpu_summary;
 pub use header::{format_battery, format_clock};
 pub use layout::{
     BoxId, ComputedLayout, LayoutState, PresetParseError, PresetSpec, SizeError, compute_layout,
@@ -150,6 +152,23 @@ impl NetIoSeries {
     }
 }
 
+/// Stable identity key for per-GPU utilization history so topology reordering never mixes
+/// samples from two different adapters.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum GpuHistoryKey {
+    Luid(u64),
+    SlotName(u8, String),
+}
+
+impl GpuHistoryKey {
+    fn for_gpu(slot: u8, gpu: &GpuSnapshot) -> Self {
+        match gpu.luid {
+            Some(luid) => Self::Luid(luid),
+            None => Self::SlotName(slot, gpu.name.clone()),
+        }
+    }
+}
+
 /// Bounded ring-buffer history passed into pure UI rendering for time-series graphs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UiHistory {
@@ -162,6 +181,7 @@ pub struct UiHistory {
     mem_free: VecDeque<f32>,
     disks: BTreeMap<String, DiskIoSeries>,
     net: BTreeMap<u64, NetIoSeries>,
+    gpus: BTreeMap<GpuHistoryKey, VecDeque<f32>>,
     proc_cpu: BTreeMap<ProcessIdentity, VecDeque<f32>>,
     proc_mem: BTreeMap<ProcessIdentity, VecDeque<u64>>,
 }
@@ -185,6 +205,7 @@ impl UiHistory {
             mem_free: VecDeque::with_capacity(cap),
             disks: BTreeMap::new(),
             net: BTreeMap::new(),
+            gpus: BTreeMap::new(),
             proc_cpu: BTreeMap::new(),
             proc_mem: BTreeMap::new(),
         }
@@ -300,6 +321,24 @@ impl UiHistory {
             self.proc_cpu.retain(|id, _| live_ids.contains(id));
             self.proc_mem.retain(|id, _| live_ids.contains(id));
         }
+
+        let mut live_gpu_keys = BTreeSet::new();
+        let mut saw_ready_gpu = false;
+        for (slot, gpu_state) in snapshot.gpus.iter().enumerate() {
+            if let DataState::Available(gpu) | DataState::Stale { value: gpu, .. } = gpu_state {
+                saw_ready_gpu = true;
+                let idx = u8::try_from(slot).unwrap_or(gpu.index);
+                let key = GpuHistoryKey::for_gpu(idx, gpu);
+                live_gpu_keys.insert(key.clone());
+                if let Some(pct) = gpu.utilization_pct {
+                    let series = self.gpus.entry(key).or_default();
+                    push_bounded(series, pct.clamp(0.0, 100.0), self.capacity);
+                }
+            }
+        }
+        if saw_ready_gpu || snapshot.gpus.is_empty() {
+            self.gpus.retain(|k, _| live_gpu_keys.contains(k));
+        }
     }
 
     pub fn cpu_total_slice(&self) -> &[f32] {
@@ -347,6 +386,13 @@ impl UiHistory {
 
     pub fn proc_mem_slice(&self, id: ProcessIdentity) -> &[u64] {
         self.proc_mem.get(&id).map_or(&[], |buf| buf.as_slices().0)
+    }
+
+    /// Returns the utilization history slice associated with the specific GPU adapter identity
+    /// (`luid` when present, falling back to `(slot, name)` for synthetic fixtures without LUID).
+    pub fn gpu_util_slice_for(&self, gpu_idx: u8, gpu: &GpuSnapshot) -> &[f32] {
+        let key = GpuHistoryKey::for_gpu(gpu_idx, gpu);
+        self.gpus.get(&key).map_or(&[], |buf| buf.as_slices().0)
     }
 
     /// Clones per-process CPU history buffers for pausing the process panel cleanly.
@@ -417,7 +463,11 @@ pub fn visible_service_rows(size: Size, state: &UiState) -> usize {
 }
 
 fn box_config<'a>(config: &'a Config, state: &UiState, id: BoxId) -> Cow<'a, Config> {
-    let sym = state.layout.symbol_for(id, config.graph_symbol);
+    let default_sym = match id {
+        BoxId::Gpu(_) => config.effective_gpu_graph_symbol(),
+        _ => config.graph_symbol,
+    };
+    let sym = state.layout.symbol_for(id, default_sym);
     if sym == config.graph_symbol {
         Cow::Borrowed(config)
     } else {
@@ -464,9 +514,18 @@ pub fn render_frame(
         }
     };
 
+    let has_dedicated_gpu_boxes = !layout.gpus().is_empty();
     if let Some(rect) = layout.cpu() {
         let cfg = box_config(config, state, BoxId::Cpu);
-        cpu_box::render_cpu_box(&mut grid, rect, snapshot, history, &cfg, &theme);
+        cpu_box::render_cpu_box(
+            &mut grid,
+            rect,
+            snapshot,
+            history,
+            has_dedicated_gpu_boxes,
+            &cfg,
+            &theme,
+        );
     }
     if let Some(rect) = layout.mem() {
         let cfg = box_config(config, state, BoxId::Mem);
@@ -501,7 +560,7 @@ pub fn render_frame(
     }
     for (gpu_idx, rect) in layout.gpus() {
         let cfg = box_config(config, state, BoxId::Gpu(gpu_idx));
-        layout::render_gpu_placeholder(&mut grid, rect, gpu_idx, snapshot, &cfg, &theme);
+        gpu_box::render_gpu_box(&mut grid, rect, gpu_idx, snapshot, history, &cfg, &theme);
     }
 
     header::render_top_header(&mut grid, &layout, snapshot, state, config, &theme);
@@ -609,5 +668,54 @@ mod tests {
         )
         .to_plain_text();
         assert!(with_bat.contains("BAT 78% - 2h00m"));
+    }
+
+    #[test]
+    fn gpu_history_tracks_adapter_luid_across_slot_reordering() {
+        let make_gpu = |index: u8, name: &str, luid: u64, util: f32| GpuSnapshot {
+            index,
+            name: name.to_owned(),
+            vendor: "NVIDIA".to_owned(),
+            pci_bdf: None,
+            utilization_pct: Some(util),
+            vram_used_bytes: None,
+            vram_total_bytes: None,
+            shared_vram_used_bytes: None,
+            shared_vram_total_bytes: None,
+            luid: Some(luid),
+            core_clock_mhz: None,
+            mem_clock_mhz: None,
+            temp_celsius: None,
+            power_watts: None,
+            power_limit_watts: None,
+            pcie_tx_kbs: None,
+            pcie_rx_kbs: None,
+            encoder_pct: None,
+            decoder_pct: None,
+        };
+
+        let mut hist = UiHistory::default();
+        let gpu_a = make_gpu(0, "Adapter A", 0xAAAA, 92.0);
+        let gpu_b_slot1 = make_gpu(1, "Adapter B", 0xBBBB, 11.0);
+        hist.push(&Snapshot {
+            gpus: vec![
+                DataState::Available(gpu_a.clone()),
+                DataState::Available(gpu_b_slot1),
+            ],
+            ..Snapshot::default()
+        });
+
+        // Adapter A disappears; Adapter B shifts from slot 1 into slot 0.
+        let gpu_b_slot0 = make_gpu(0, "Adapter B", 0xBBBB, 18.0);
+        hist.push(&Snapshot {
+            gpus: vec![DataState::Available(gpu_b_slot0.clone())],
+            ..Snapshot::default()
+        });
+
+        assert_eq!(hist.gpu_util_slice_for(0, &gpu_b_slot0), &[11.0, 18.0]);
+        assert!(
+            hist.gpu_util_slice_for(0, &gpu_a).is_empty(),
+            "departed adapter history must be pruned and never inherited by slot 0"
+        );
     }
 }

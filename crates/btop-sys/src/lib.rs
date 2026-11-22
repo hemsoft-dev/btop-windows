@@ -6,6 +6,7 @@
 #![allow(non_camel_case_types, non_snake_case)]
 
 pub mod disk;
+pub mod gpu;
 pub mod mem;
 pub mod net;
 pub mod pdh;
@@ -18,6 +19,12 @@ use core::mem::{offset_of, size_of};
 
 pub use disk::{
     RawDiskPerformance, RawFixedDrive, enumerate_fixed_drives, query_physical_drive_performance,
+};
+pub use gpu::{
+    GpuPdhMetrics, GpuPdhQuery, GpuPdhSample, MAX_GPUS, RawGpuAdapter,
+    aggregate_gpu_engine_utilization, aggregate_gpu_memory_bytes, encode_luid,
+    enumerate_hardware_gpus, filter_hardware_adapters, parse_gpu_engine_key, parse_gpu_pdh_luid,
+    vendor_name_from_id,
 };
 pub use mem::{
     MemPdhQuery, RawMemCacheSample, RawMemoryStatus, RawPagefileTotals, RawPerformanceInfo,

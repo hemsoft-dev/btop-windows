@@ -601,3 +601,56 @@ fn golden_services_elevated_120x40() {
     let rendered = render_services_golden(true);
     insta::assert_snapshot!("services_elevated_120x40", rendered);
 }
+
+#[test]
+fn golden_gpu0_box_120x40() {
+    let cfg = Config {
+        shown_boxes: "cpu gpu0 mem net proc".to_owned(),
+        ..Config::default()
+    };
+    let rendered = render_fixture_with_config("win11-16core-dual-gpu-desktop.jsonl", &cfg, 120, 40);
+    insta::assert_snapshot!("gpu0_box_120x40", rendered);
+}
+
+#[test]
+fn golden_gpu0_box_200x60() {
+    let cfg = Config {
+        shown_boxes: "cpu gpu0 mem net proc".to_owned(),
+        ..Config::default()
+    };
+    let rendered = render_fixture_with_config("win11-16core-dual-gpu-desktop.jsonl", &cfg, 200, 60);
+    insta::assert_snapshot!("gpu0_box_200x60", rendered);
+}
+
+#[test]
+fn golden_cpu_gpu_summary_120x40() {
+    let cfg = Config {
+        shown_boxes: "cpu".to_owned(),
+        show_gpu_info: btop_config::ShowGpuInfo::On,
+        ..Config::default()
+    };
+    let rendered = render_fixture_with_config("win11-16core-dual-gpu-desktop.jsonl", &cfg, 120, 40);
+    insta::assert_snapshot!("cpu_gpu_summary_120x40", rendered);
+}
+
+#[test]
+fn golden_cpu_gpu_summary_200x60() {
+    let cfg = Config {
+        shown_boxes: "cpu".to_owned(),
+        show_gpu_info: btop_config::ShowGpuInfo::On,
+        ..Config::default()
+    };
+    let rendered =
+        render_fixture_with_config("win11-8core-single-gpu-desktop.jsonl", &cfg, 200, 60);
+    insta::assert_snapshot!("cpu_gpu_summary_200x60", rendered);
+}
+
+#[test]
+fn golden_dual_gpu_120x40() {
+    let cfg = Config {
+        shown_boxes: "cpu gpu0 gpu1 mem net proc".to_owned(),
+        ..Config::default()
+    };
+    let rendered = render_fixture_with_config("win11-16core-dual-gpu-desktop.jsonl", &cfg, 120, 40);
+    insta::assert_snapshot!("dual_gpu_120x40", rendered);
+}
