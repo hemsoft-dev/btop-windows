@@ -100,7 +100,7 @@ pub fn run_headless_frames(
         if let Some(rec) = recorder {
             rec.record(snapshot.clone());
         }
-        history.push(&snapshot);
+        history.push_with_util_mode(&snapshot, is_utility_mode(config));
         frames.push(btop_ui::render_with_history(
             &snapshot, &history, config, size,
         ));

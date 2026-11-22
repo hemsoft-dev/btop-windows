@@ -13,6 +13,7 @@ use btop_sys::{
 };
 
 use crate::math::cpu_busy_percent;
+use crate::mem::MemoryCollector;
 use crate::proc::ProcessCollector;
 use crate::{CollectError, SnapshotSource};
 
@@ -301,13 +302,14 @@ impl CpuCollector {
 }
 
 /// Live Windows 11 snapshot source producing CPU (with P/E topology, PDH frequency/utility,
-/// and `RunQ` EWMA) and read-only process snapshots on each tick.
+/// and `RunQ` EWMA), memory/commit/pagefile/cache, and read-only process snapshots on each tick.
 #[derive(Debug)]
 pub struct LiveCollector {
     hostname: String,
     username: String,
     total_phys_mem: Option<u64>,
     cpu: CpuCollector,
+    mem: MemoryCollector,
     procs: ProcessCollector,
     runq: RunQueueEwma,
     last_runq_instant: Option<Instant>,
@@ -326,6 +328,7 @@ impl LiveCollector {
             .or_else(|_| std::env::var("USER"))
             .unwrap_or_else(|_| "user".to_owned());
         let cpu = CpuCollector::with_freq_mode(freq_mode)?;
+        let mem = MemoryCollector::new();
         let mut procs = ProcessCollector::new();
         // Prime baseline process CPU timestamps so the first displayed tick has real deltas.
         let _ = procs.sample_with_runnable(cpu.prev.len().max(1));
@@ -334,6 +337,7 @@ impl LiveCollector {
             username,
             total_phys_mem: total_physical_memory_bytes(),
             cpu,
+            mem,
             procs,
             runq: RunQueueEwma::default(),
             last_runq_instant: None,
@@ -352,6 +356,14 @@ impl SnapshotSource for LiveCollector {
         .unwrap_or(u64::MAX);
         let mut cpu_snapshot = self.cpu.sample()?;
         let logical_cpus = cpu_snapshot.cores.len().max(1);
+
+        let mem = match self.mem.sample() {
+            Ok(mem_snap) => {
+                self.total_phys_mem = Some(mem_snap.total_bytes);
+                DataState::Available(mem_snap)
+            }
+            Err(err) => DataState::Unavailable(err.to_string()),
+        };
 
         let processes = match self.procs.sample_with_runnable(logical_cpus) {
             Ok((list, runnable)) => {
@@ -378,6 +390,7 @@ impl SnapshotSource for LiveCollector {
             username: self.username.clone(),
             total_phys_mem_bytes: self.total_phys_mem,
             cpu: DataState::Available(cpu_snapshot),
+            mem,
             processes,
             ..Snapshot::default()
         })

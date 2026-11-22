@@ -3,7 +3,7 @@
 use btop_config::GraphSymbol;
 use btop_term::{Cell, Color, Grid, Rect};
 
-use crate::theme::ThemePalette;
+use crate::theme::{GradientStops, ThemePalette};
 
 const BLOCK_UP: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
@@ -126,6 +126,19 @@ pub fn draw_border_tag(
 
 /// Draws a horizontal `btop` meter bar (`■`) colored along the CPU gradient.
 pub fn draw_meter(grid: &mut Grid, x: u16, y: u16, width: u16, percent: f32, theme: &ThemePalette) {
+    draw_meter_with_gradient(grid, x, y, width, percent, theme.cpu_stops(), theme);
+}
+
+/// Draws a horizontal `btop` meter bar (`■`) colored along custom [`GradientStops`].
+pub fn draw_meter_with_gradient(
+    grid: &mut Grid,
+    x: u16,
+    y: u16,
+    width: u16,
+    percent: f32,
+    stops: GradientStops,
+    theme: &ThemePalette,
+) {
     if width == 0 {
         return;
     }
@@ -140,7 +153,7 @@ pub fn draw_meter(grid: &mut Grid, x: u16, y: u16, width: u16, percent: f32, the
             (f32::from(col) / f32::from(width - 1)) * 100.0
         };
         let fg = if col < filled {
-            theme.cpu_gradient(pos_pct)
+            stops.sample(pos_pct)
         } else {
             theme.meter_bg
         };
@@ -158,10 +171,8 @@ pub fn draw_meter(grid: &mut Grid, x: u16, y: u16, width: u16, percent: f32, the
     }
 }
 
-/// Draws a time-series graph inside `rect` using `braille`, `block`, or `tty` symbols.
-///
-/// Values are right-aligned so the newest sample sits on the right edge. When `inverted`
-/// is `true`, bars grow downward from the top edge (used for the lower split CPU graph).
+/// Draws a time-series graph inside `rect` using `braille`, `block`, or `tty` symbols
+/// colored with the CPU gradient.
 pub fn draw_graph(
     grid: &mut Grid,
     rect: Rect,
@@ -170,14 +181,38 @@ pub fn draw_graph(
     inverted: bool,
     theme: &ThemePalette,
 ) {
+    draw_graph_with_gradient(
+        grid,
+        rect,
+        values,
+        symbol,
+        inverted,
+        theme.cpu_stops(),
+        theme,
+    );
+}
+
+/// Draws a time-series graph inside `rect` using custom [`GradientStops`].
+///
+/// Values are right-aligned so the newest sample sits on the right edge. When `inverted`
+/// is `true`, bars grow downward from the top edge (used for the lower split CPU graph).
+pub fn draw_graph_with_gradient(
+    grid: &mut Grid,
+    rect: Rect,
+    values: &[f32],
+    symbol: GraphSymbol,
+    inverted: bool,
+    stops: GradientStops,
+    theme: &ThemePalette,
+) {
     if rect.width == 0 || rect.height == 0 {
         return;
     }
 
     match symbol {
-        GraphSymbol::Braille => draw_braille_graph(grid, rect, values, inverted, theme),
-        GraphSymbol::Block => draw_block_graph(grid, rect, values, inverted, theme),
-        GraphSymbol::Tty => draw_tty_graph(grid, rect, values, inverted, theme),
+        GraphSymbol::Braille => draw_braille_graph(grid, rect, values, inverted, stops, theme),
+        GraphSymbol::Block => draw_block_graph(grid, rect, values, inverted, stops, theme),
+        GraphSymbol::Tty => draw_tty_graph(grid, rect, values, inverted, stops, theme),
     }
 }
 
@@ -186,6 +221,7 @@ fn draw_braille_graph(
     rect: Rect,
     values: &[f32],
     inverted: bool,
+    stops: GradientStops,
     theme: &ThemePalette,
 ) {
     const LEFT_BITS: [u8; 4] = [0x01, 0x02, 0x04, 0x40];
@@ -248,7 +284,7 @@ fn draw_braille_graph(
                 continue;
             }
             let ch = char::from_u32(0x2800 + u32::from(mask)).unwrap_or(' ');
-            let fg = theme.cpu_gradient(row_gradient_percent(row, height, inverted));
+            let fg = stops.sample(row_gradient_percent(row, height, inverted));
             grid.set(
                 rect.x.saturating_add(u16::try_from(col).unwrap_or(0)),
                 rect.y.saturating_add(u16::try_from(row).unwrap_or(0)),
@@ -269,6 +305,7 @@ fn draw_block_graph(
     rect: Rect,
     values: &[f32],
     inverted: bool,
+    stops: GradientStops,
     theme: &ThemePalette,
 ) {
     let width = usize::from(rect.width);
@@ -309,7 +346,7 @@ fn draw_block_graph(
             if ch == ' ' {
                 continue;
             }
-            let fg = theme.cpu_gradient(row_gradient_percent(row, height, inverted));
+            let fg = stops.sample(row_gradient_percent(row, height, inverted));
             grid.set(
                 rect.x.saturating_add(u16::try_from(col).unwrap_or(0)),
                 rect.y.saturating_add(u16::try_from(row).unwrap_or(0)),
@@ -330,6 +367,7 @@ fn draw_tty_graph(
     rect: Rect,
     values: &[f32],
     inverted: bool,
+    stops: GradientStops,
     theme: &ThemePalette,
 ) {
     let width = usize::from(rect.width);
@@ -358,7 +396,7 @@ fn draw_tty_graph(
             if !lit {
                 continue;
             }
-            let fg = theme.cpu_gradient(row_gradient_percent(row, height, inverted));
+            let fg = stops.sample(row_gradient_percent(row, height, inverted));
             grid.set(
                 rect.x.saturating_add(u16::try_from(col).unwrap_or(0)),
                 rect.y.saturating_add(u16::try_from(row).unwrap_or(0)),

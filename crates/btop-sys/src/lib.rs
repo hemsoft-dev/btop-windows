@@ -5,10 +5,15 @@
 
 #![allow(non_camel_case_types, non_snake_case)]
 
+pub mod mem;
 pub mod pdh;
 
 use core::mem::{offset_of, size_of};
 
+pub use mem::{
+    MemPdhQuery, RawMemCacheSample, RawMemoryStatus, RawPagefileTotals, RawPerformanceInfo,
+    query_memory_status, query_pagefile_totals, query_performance_info,
+};
 pub use pdh::{CpuPdhQuery, CpuPdhSample};
 
 /// Matches `UNICODE_STRING` in `winternl.h` (16 bytes on 64-bit targets).

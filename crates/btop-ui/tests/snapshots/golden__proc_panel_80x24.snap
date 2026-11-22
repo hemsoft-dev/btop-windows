@@ -11,18 +11,18 @@ expression: rendered
 │                                  ⠻⠛⠟⠻⠛⠟⠻⠛⠟⠻⠛⠟│ C03 ■■■■■■■■■■■■■■■■■■■■  43% │
 │pk                                            │ Up 04:00:04  4.95 GHz         │
 ╰─┐WIN11-RYZEN8 | +/- cadence | Ctrl+R reload | q quit┌────────────────────────╯
-╭─┐⁴proc┌─────────────────────────────────────────────┐< cpu lazy ↓ >┌──┐1/50┌─╮
-│     Pid Program                                        Thr     MemB    Cpu%  │
-│    4216 rust-analyzer.exe                               18     1.4G    12.8 █│
-│    4100 Code.exe                                        48     642M     5.3 ││
-│    5048 Code.exe                                        10     118M     4.2 ││
-│    5108 Code.exe                                        10     118M     4.2 ││
-│    5044 msedge.exe                                      12     100M     3.9 ││
-│    5104 msedge.exe                                      12     100M     3.9 ││
-│    4500 msedge.exe                                      52     522M     3.6 ││
-│    5040 svchost.exe                                      8    24.0M     3.6 ││
-│    5100 svchost.exe                                      8    24.0M     3.6 ││
-│    5036 conhost.exe                                      4    30.0M     3.3 ││
-│    5096 conhost.exe                                      4    30.0M     3.3 ││
-│    1416 dwm.exe                                         18     144M     3.0 ││
-╰─┐↑↓ select | ←→ sort | r rev | c core | % mem | q quit┌──────────────────────╯
+╭─┐²mem┌───────┐Total: 32.0 GiB┌╮╭─┐⁴proc┌────────────┐< cpu lazy ↓ >┌──┐1/50┌─╮
+│ RAM ■■■■■■■■■■■■■■■■■■■■■■■■■ ││     Pid Program               MemB    Cpu%  │
+│ Used          14.1 GiB  44.1% ││    4216 rust-analyzer.exe     1.4G    12.8 █│
+│                  ⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤ ││    4100 Code.exe              642M     5.3 ││
+│ Available     17.9 GiB  55.9% ││    5048 Code.exe              118M     4.2 ││
+│                  ⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤ ││    5108 Code.exe              118M     4.2 ││
+│ Cached        6.00 GiB  18.8% ││    5044 msedge.exe            100M     3.9 ││
+│                  ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀ ││    5104 msedge.exe            100M     3.9 ││
+│ Free          11.9 GiB  37.1% ││    4500 msedge.exe            522M     3.6 ││
+│                  ⣄⣠⣀⣄⣠⣀⣄⣠⣀⣄⣠⣀ ││    5040 svchost.exe          24.0M     3.6 ││
+│───────────────────────────────││    5100 svchost.exe          24.0M     3.6 ││
+│ Commit  17.1GiB/37.0GiB 46%   ││    5036 conhost.exe          30.0M     3.3 ││
+│ Swap    512 MiB/5.00 GiB  10% ││    5096 conhost.exe          30.0M     3.3 ││
+│ Compressed: 320 MiB           ││    1416 dwm.exe               144M     3.0 ││
+╰───────────────────────────────╯╰─┐↑↓ select | ←→ sort | r rev | c core | % m┌╯
