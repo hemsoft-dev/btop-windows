@@ -2,7 +2,7 @@
 
 use crate::{
     CoreKind, CoreSample, CpuSnapshot, DataState, DiskSnapshot, GpuSnapshot, LogicalCpuId,
-    MemSnapshot, ProcessEntry, ProcessIdentity, ServiceEntry, Snapshot,
+    MemSnapshot, NetInterfaceSnapshot, ProcessEntry, ProcessIdentity, ServiceEntry, Snapshot,
 };
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -62,6 +62,7 @@ pub fn win11_8core_single_gpu_desktop() -> Vec<Snapshot> {
                     compressed_bytes: Some(320 * MIB),
                 }),
                 disks: DataState::Available(synthetic_disks(step, delta)),
+                net: DataState::Available(synthetic_net(step)),
                 processes: DataState::Available(synthetic_processes(50, tick, "alex")),
                 services: DataState::Available(synthetic_services()),
                 gpus: vec![DataState::Available(GpuSnapshot {
@@ -152,6 +153,7 @@ pub fn win11_16core_dual_gpu_desktop() -> Vec<Snapshot> {
                     compressed_bytes: Some(512 * MIB),
                 }),
                 disks: DataState::Available(synthetic_disks(step, delta)),
+                net: DataState::Available(synthetic_net(step)),
                 processes: DataState::Available(synthetic_processes(52, tick, "franz")),
                 services: DataState::Available(synthetic_services()),
                 gpus: dual_gpu_snapshots(step, delta),
@@ -159,6 +161,37 @@ pub fn win11_16core_dual_gpu_desktop() -> Vec<Snapshot> {
             }
         })
         .collect()
+}
+
+fn synthetic_net(step: u64) -> Vec<NetInterfaceSnapshot> {
+    vec![
+        NetInterfaceSnapshot {
+            luid: 0x0006_0000_0100_0000,
+            name: "Ethernet".to_owned(),
+            description: "Realtek PCIe 2.5GbE Family Controller".to_owned(),
+            is_up: true,
+            ipv4: Some("192.168.1.42".to_owned()),
+            ipv6: Some("fe80::1a2b:3c4d:5e6f:7890".to_owned()),
+            rx_bytes_per_sec: (18 + step * 9) * MIB,
+            tx_bytes_per_sec: (6 + step * 4) * MIB,
+            rx_total_bytes: 14 * GIB + step * 36 * MIB,
+            tx_total_bytes: 3 * GIB + step * 12 * MIB,
+            link_speed_bps: Some(2_500_000_000),
+        },
+        NetInterfaceSnapshot {
+            luid: 0x0047_0000_0200_0000,
+            name: "Wi-Fi".to_owned(),
+            description: "Intel(R) Wi-Fi 7 BE200 320MHz".to_owned(),
+            is_up: true,
+            ipv4: Some("192.168.1.88".to_owned()),
+            ipv6: None,
+            rx_bytes_per_sec: (2 + step) * MIB,
+            tx_bytes_per_sec: 512 * 1024 + step * 256 * 1024,
+            rx_total_bytes: 2 * GIB + step * 4 * MIB,
+            tx_total_bytes: 640 * MIB + step * MIB,
+            link_speed_bps: Some(2_400_000_000),
+        },
+    ]
 }
 
 fn synthetic_disks(step: u64, delta: f32) -> Vec<DiskSnapshot> {

@@ -132,6 +132,7 @@ pub fn run_tui_loop(
     let mut last_generation = sampler.generation();
     let mut current_snapshot = sampler.latest();
     history.push_with_util_mode(&current_snapshot, is_utility_mode(&config));
+    ui_state.net.observe_snapshot(&current_snapshot);
 
     let mut prev_grid: Option<Grid> = None;
     let mut dirty = true;
@@ -144,6 +145,7 @@ pub fn run_tui_loop(
                 last_generation = gen_now;
                 current_snapshot = sampler.latest();
                 history.push_with_util_mode(&current_snapshot, is_utility_mode(&config));
+                ui_state.net.observe_snapshot(&current_snapshot);
                 dirty = true;
             }
 
@@ -180,6 +182,8 @@ pub fn run_tui_loop(
                         event,
                         &sampler,
                         &guard,
+                        &current_snapshot,
+                        &mut history,
                         &mut size,
                         &mut config,
                         config_path,
@@ -236,6 +240,8 @@ fn handle_tui_event(
     event: TermEvent,
     sampler: &Sampler,
     guard: &TerminalGuard,
+    snapshot: &btop_model::Snapshot,
+    history: &mut UiHistory,
     size: &mut Size,
     config: &mut Config,
     config_path: Option<&Path>,
@@ -252,6 +258,7 @@ fn handle_tui_event(
                 config.update_ms = sampler.set_update_ms(config.update_ms);
                 sampler.set_freq_mode(FreqMode::from_config_str(&config.freq_mode));
                 *ui_state = UiState::from_config(config);
+                ui_state.net.observe_snapshot(snapshot);
                 *prev_grid = None;
                 return true;
             }
@@ -271,6 +278,26 @@ fn handle_tui_event(
         }
         TermEvent::Key(k) if !k.ctrl && !k.alt && k.code == KeyCode::Char('i') => {
             ui_state.toggle_io_mode();
+            true
+        }
+        TermEvent::Key(k) if !k.ctrl && !k.alt && k.code == KeyCode::Char('b') => {
+            ui_state.net.select_prev(snapshot);
+            true
+        }
+        TermEvent::Key(k) if !k.ctrl && !k.alt && k.code == KeyCode::Char('n') => {
+            ui_state.net.select_next(snapshot);
+            true
+        }
+        TermEvent::Key(k) if !k.ctrl && !k.alt && k.code == KeyCode::Char('a') => {
+            ui_state.net.toggle_auto();
+            true
+        }
+        TermEvent::Key(k) if !k.ctrl && !k.alt && k.code == KeyCode::Char('y') => {
+            ui_state.net.toggle_sync();
+            true
+        }
+        TermEvent::Key(k) if !k.ctrl && !k.alt && k.code == KeyCode::Char('z') => {
+            ui_state.net.reset_session_totals(snapshot, history);
             true
         }
         TermEvent::Key(k) => handle_proc_key(k.code, ui_state, proc_count, proc_rows),

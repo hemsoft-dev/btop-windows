@@ -5,6 +5,7 @@
 pub mod cpu_box;
 pub mod disk_view;
 pub mod mem_box;
+pub mod net_box;
 pub mod proc_box;
 pub mod theme;
 pub mod widgets;
@@ -17,6 +18,7 @@ use btop_term::{Grid, Rect, Size};
 
 pub use disk_view::{format_rate_bytes_per_sec, parse_io_graph_speeds};
 pub use mem_box::{format_mem_bytes, stacked_physical_segments};
+pub use net_box::{AUTO_SCALE_FLOOR_BPS, NetViewState, compute_net_scale_ceilings, format_bitrate};
 pub use proc_box::{ProcSort, ProcViewState};
 
 use crate::mem_box::ratio_percent;
@@ -28,6 +30,7 @@ const DEFAULT_HISTORY_CAPACITY: usize = 512;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UiState {
     pub proc: ProcViewState,
+    pub net: NetViewState,
     pub show_disks: bool,
     pub io_mode: bool,
 }
@@ -36,6 +39,7 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             proc: ProcViewState::default(),
+            net: NetViewState::default(),
             show_disks: true,
             io_mode: false,
         }
@@ -46,6 +50,7 @@ impl UiState {
     pub fn from_config(config: &Config) -> Self {
         Self {
             proc: ProcViewState::from_config(config),
+            net: NetViewState::from_config(config),
             show_disks: config.show_disks,
             io_mode: config.io_mode,
         }
@@ -80,6 +85,33 @@ impl DiskIoSeries {
     }
 }
 
+/// Per-interface bounded download/upload throughput history and peaks in bytes/sec.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NetIoSeries {
+    rx_bps: VecDeque<u64>,
+    tx_bps: VecDeque<u64>,
+    peak_rx: u64,
+    peak_tx: u64,
+}
+
+impl NetIoSeries {
+    pub fn rx_slice(&self) -> &[u64] {
+        self.rx_bps.as_slices().0
+    }
+
+    pub fn tx_slice(&self) -> &[u64] {
+        self.tx_bps.as_slices().0
+    }
+
+    pub fn peak_rx(&self) -> u64 {
+        self.peak_rx
+    }
+
+    pub fn peak_tx(&self) -> u64 {
+        self.peak_tx
+    }
+}
+
 /// Bounded ring-buffer history passed into pure UI rendering for time-series graphs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UiHistory {
@@ -91,6 +123,7 @@ pub struct UiHistory {
     mem_cached: VecDeque<f32>,
     mem_free: VecDeque<f32>,
     disks: BTreeMap<String, DiskIoSeries>,
+    net: BTreeMap<u64, NetIoSeries>,
 }
 
 impl Default for UiHistory {
@@ -111,6 +144,7 @@ impl UiHistory {
             mem_cached: VecDeque::with_capacity(cap),
             mem_free: VecDeque::with_capacity(cap),
             disks: BTreeMap::new(),
+            net: BTreeMap::new(),
         }
     }
 
@@ -190,6 +224,17 @@ impl UiHistory {
                 }
             }
         }
+
+        if let DataState::Available(ifaces) | DataState::Stale { value: ifaces, .. } = &snapshot.net
+        {
+            for iface in ifaces {
+                let entry = self.net.entry(iface.luid).or_default();
+                push_bounded_u64(&mut entry.rx_bps, iface.rx_bytes_per_sec, self.capacity);
+                push_bounded_u64(&mut entry.tx_bps, iface.tx_bytes_per_sec, self.capacity);
+                entry.peak_rx = entry.peak_rx.max(iface.rx_bytes_per_sec);
+                entry.peak_tx = entry.peak_tx.max(iface.tx_bytes_per_sec);
+            }
+        }
     }
 
     pub fn cpu_total_slice(&self) -> &[f32] {
@@ -219,6 +264,17 @@ impl UiHistory {
     pub fn disk_series(&self, mount: &str) -> Option<&DiskIoSeries> {
         self.disks.get(mount)
     }
+
+    pub fn net_series(&self, luid: u64) -> Option<&NetIoSeries> {
+        self.net.get(&luid)
+    }
+
+    pub fn reset_net_peaks(&mut self, luid: u64) {
+        if let Some(entry) = self.net.get_mut(&luid) {
+            entry.peak_rx = 0;
+            entry.peak_tx = 0;
+        }
+    }
 }
 
 fn push_bounded(buf: &mut VecDeque<f32>, value: f32, capacity: usize) {
@@ -239,8 +295,18 @@ fn push_bounded_u64(buf: &mut VecDeque<u64>, value: u64, capacity: usize) {
 
 /// Computes the number of visible process rows for a given viewport size and config.
 pub fn visible_proc_rows(size: Size, config: &Config) -> usize {
-    let (_, _, proc_rect) = compute_layout(size, config);
-    proc_rect.map_or(0, |r| usize::from(r.height.saturating_sub(3)))
+    let layout = compute_layout(size, config);
+    layout
+        .proc
+        .map_or(0, |r| usize::from(r.height.saturating_sub(3)))
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PanelLayout {
+    cpu: Option<Rect>,
+    mem: Option<Rect>,
+    net: Option<Rect>,
+    proc: Option<Rect>,
 }
 
 fn split_top_bottom(area: Rect) -> (Rect, Rect) {
@@ -260,26 +326,53 @@ fn split_top_bottom(area: Rect) -> (Rect, Rect) {
 }
 
 fn split_mem_proc(area: Rect) -> (Rect, Rect) {
-    let mem_w = u16::try_from((u32::from(area.width) * 42 / 100).clamp(32, 80)).unwrap_or(80);
-    let proc_w = area.width.saturating_sub(mem_w);
+    let left_w = u16::try_from((u32::from(area.width) * 42 / 100).clamp(32, 80)).unwrap_or(80);
+    let proc_w = area.width.saturating_sub(left_w);
     (
         Rect {
-            width: mem_w,
+            width: left_w,
             ..area
         },
         Rect {
-            x: area.x.saturating_add(mem_w),
+            x: area.x.saturating_add(left_w),
             width: proc_w,
             ..area
         },
     )
 }
 
-fn compute_layout(size: Size, config: &Config) -> (Option<Rect>, Option<Rect>, Option<Rect>) {
+fn split_left_column(area: Rect, show_mem: bool, show_net: bool) -> (Option<Rect>, Option<Rect>) {
+    match (show_mem, show_net) {
+        (true, true) if area.height >= 12 => {
+            let mem_h =
+                u16::try_from((u32::from(area.height) * 55) / 100).unwrap_or(area.height / 2);
+            let mem_h = mem_h.max(6).min(area.height.saturating_sub(6));
+            let net_h = area.height.saturating_sub(mem_h);
+            (
+                Some(Rect {
+                    height: mem_h,
+                    ..area
+                }),
+                Some(Rect {
+                    y: area.y.saturating_add(mem_h),
+                    height: net_h,
+                    ..area
+                }),
+            )
+        }
+        (true, _) => (Some(area), None),
+        (false, true) => (None, Some(area)),
+        (false, false) => (None, None),
+    }
+}
+
+fn compute_layout(size: Size, config: &Config) -> PanelLayout {
     let boxes: Vec<&str> = config.shown_boxes.split_whitespace().collect();
     let show_cpu = boxes.contains(&"cpu") || boxes.is_empty();
     let show_mem = boxes.contains(&"mem");
+    let show_net = boxes.contains(&"net");
     let show_proc = boxes.contains(&"proc");
+    let show_left = show_mem || show_net;
 
     let full = Rect {
         x: 0,
@@ -288,32 +381,60 @@ fn compute_layout(size: Size, config: &Config) -> (Option<Rect>, Option<Rect>, O
         height: size.height,
     };
 
-    match (show_cpu, show_mem, show_proc) {
-        (true, true, true) if size.height >= 14 => {
-            let (cpu_rect, bottom) = split_top_bottom(full);
-            if size.width >= 68 {
-                let (mem_rect, proc_rect) = split_mem_proc(bottom);
-                (Some(cpu_rect), Some(mem_rect), Some(proc_rect))
-            } else {
-                // Narrow viewport fallback: keep CPU + proc readable rather than squeezing columns.
-                (Some(cpu_rect), None, Some(bottom))
+    if show_cpu && (show_left || show_proc) && size.height >= 14 {
+        let (cpu_rect, bottom) = split_top_bottom(full);
+        let (mem, net, proc) = match (show_left, show_proc) {
+            (true, true) if size.width >= 68 => {
+                let (left_col, proc_rect) = split_mem_proc(bottom);
+                let (mem_rect, net_rect) = split_left_column(left_col, show_mem, show_net);
+                (mem_rect, net_rect, Some(proc_rect))
             }
+            (true, false) => {
+                let (mem_rect, net_rect) = split_left_column(bottom, show_mem, show_net);
+                (mem_rect, net_rect, None)
+            }
+            (_, true) => (None, None, Some(bottom)),
+            (false, false) => (None, None, None),
+        };
+        return PanelLayout {
+            cpu: Some(cpu_rect),
+            mem,
+            net,
+            proc,
+        };
+    }
+
+    if !show_cpu {
+        if show_left && show_proc && size.width >= 68 {
+            let (left_col, proc_rect) = split_mem_proc(full);
+            let (mem, net) = split_left_column(left_col, show_mem, show_net);
+            return PanelLayout {
+                cpu: None,
+                mem,
+                net,
+                proc: Some(proc_rect),
+            };
         }
-        (true, true, false) if size.height >= 14 => {
-            let (cpu_rect, mem_rect) = split_top_bottom(full);
-            (Some(cpu_rect), Some(mem_rect), None)
+        if show_left && !show_proc {
+            let (mem, net) = split_left_column(full, show_mem, show_net);
+            return PanelLayout {
+                cpu: None,
+                mem,
+                net,
+                proc: None,
+            };
         }
-        (true, false, true) if size.height >= 14 => {
-            let (cpu_rect, proc_rect) = split_top_bottom(full);
-            (Some(cpu_rect), None, Some(proc_rect))
+        if show_proc {
+            return PanelLayout {
+                proc: Some(full),
+                ..PanelLayout::default()
+            };
         }
-        (false, true, true) if size.width >= 68 => {
-            let (mem_rect, proc_rect) = split_mem_proc(full);
-            (None, Some(mem_rect), Some(proc_rect))
-        }
-        (false, true, false) => (None, Some(full), None),
-        (false, _, true) => (None, None, Some(full)),
-        _ => (Some(full), None, None),
+    }
+
+    PanelLayout {
+        cpu: Some(full),
+        ..PanelLayout::default()
     }
 }
 
@@ -351,14 +472,19 @@ pub fn render_frame(
         return grid;
     }
 
-    let (cpu_rect, mem_rect, proc_rect) = compute_layout(size, config);
-    if let Some(rect) = cpu_rect {
+    let layout = compute_layout(size, config);
+    if let Some(rect) = layout.cpu {
         cpu_box::render_cpu_box(&mut grid, rect, snapshot, history, config, &theme);
     }
-    if let Some(rect) = mem_rect {
+    if let Some(rect) = layout.mem {
         mem_box::render_mem_box(&mut grid, rect, snapshot, history, state, config, &theme);
     }
-    if let Some(rect) = proc_rect {
+    if let Some(rect) = layout.net {
+        net_box::render_net_box(
+            &mut grid, rect, snapshot, history, &state.net, config, &theme,
+        );
+    }
+    if let Some(rect) = layout.proc {
         proc_box::render_proc_box(&mut grid, rect, snapshot, &state.proc, config, &theme);
     }
     grid

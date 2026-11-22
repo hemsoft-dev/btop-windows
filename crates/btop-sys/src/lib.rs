@@ -7,6 +7,7 @@
 
 pub mod disk;
 pub mod mem;
+pub mod net;
 pub mod pdh;
 
 use core::mem::{offset_of, size_of};
@@ -17,6 +18,9 @@ pub use disk::{
 pub use mem::{
     MemPdhQuery, RawMemCacheSample, RawMemoryStatus, RawPagefileTotals, RawPerformanceInfo,
     query_memory_status, query_pagefile_totals, query_performance_info,
+};
+pub use net::{
+    RawNetEntry, RawNetInterface, enumerate_hardware_interfaces, refresh_interface_entry,
 };
 pub use pdh::{CpuPdhQuery, CpuPdhSample};
 

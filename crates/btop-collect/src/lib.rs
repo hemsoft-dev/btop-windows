@@ -3,6 +3,7 @@
 pub mod cpu;
 pub mod disk;
 pub mod mem;
+pub mod net;
 pub mod proc;
 pub mod replay;
 pub mod sampler;
@@ -19,6 +20,7 @@ pub use disk::{
     extract_drive_letter, matches_disks_filter,
 };
 pub use mem::{MemoryCollector, compute_mem_snapshot, pagefile_pages_to_bytes};
+pub use net::{NetCollector, compute_net_rates};
 pub use proc::{ProcessCollector, ProcessDeltaTracker};
 pub use replay::{ReplaySource, StubLiveSource};
 pub use sampler::{MAX_UPDATE_MS, MIN_UPDATE_MS, Sampler};

@@ -209,6 +209,7 @@ fn golden_mem_meter_200x60() {
 #[test]
 fn golden_disks_split_120x40() {
     let cfg = Config {
+        shown_boxes: "cpu mem proc".to_owned(),
         show_disks: true,
         io_mode: false,
         ..Config::default()
@@ -220,6 +221,7 @@ fn golden_disks_split_120x40() {
 #[test]
 fn golden_disks_split_200x60() {
     let cfg = Config {
+        shown_boxes: "cpu mem proc".to_owned(),
         show_disks: true,
         io_mode: false,
         ..Config::default()
@@ -231,6 +233,7 @@ fn golden_disks_split_200x60() {
 #[test]
 fn golden_disk_io_mode_120x40() {
     let cfg = Config {
+        shown_boxes: "cpu mem proc".to_owned(),
         show_disks: true,
         io_mode: true,
         ..Config::default()
@@ -242,10 +245,88 @@ fn golden_disk_io_mode_120x40() {
 #[test]
 fn golden_disk_io_mode_200x60() {
     let cfg = Config {
+        shown_boxes: "cpu mem proc".to_owned(),
         show_disks: true,
         io_mode: true,
         ..Config::default()
     };
     let rendered = render_fixture_with_config("win11-16core-dual-gpu-desktop.jsonl", &cfg, 200, 60);
     insta::assert_snapshot!("disk_io_mode_200x60", rendered);
+}
+
+fn net_only_config(net_auto: bool) -> Config {
+    Config {
+        shown_boxes: "net".to_owned(),
+        net_auto,
+        net_sync: true,
+        net_download: 500,
+        net_upload: 250,
+        ..Config::default()
+    }
+}
+
+#[test]
+fn golden_net_auto_80x24() {
+    let rendered = render_fixture_with_config(
+        "win11-8core-single-gpu-desktop.jsonl",
+        &net_only_config(true),
+        80,
+        24,
+    );
+    insta::assert_snapshot!("net_auto_80x24", rendered);
+}
+
+#[test]
+fn golden_net_auto_120x40() {
+    let rendered = render_fixture_with_config(
+        "win11-16core-dual-gpu-desktop.jsonl",
+        &net_only_config(true),
+        120,
+        40,
+    );
+    insta::assert_snapshot!("net_auto_120x40", rendered);
+}
+
+#[test]
+fn golden_net_auto_200x60() {
+    let rendered = render_fixture_with_config(
+        "win11-16core-dual-gpu-desktop.jsonl",
+        &net_only_config(true),
+        200,
+        60,
+    );
+    insta::assert_snapshot!("net_auto_200x60", rendered);
+}
+
+#[test]
+fn golden_net_fixed_80x24() {
+    let rendered = render_fixture_with_config(
+        "win11-8core-single-gpu-desktop.jsonl",
+        &net_only_config(false),
+        80,
+        24,
+    );
+    insta::assert_snapshot!("net_fixed_80x24", rendered);
+}
+
+#[test]
+fn golden_net_fixed_120x40() {
+    let rendered = render_fixture_with_config(
+        "win11-16core-dual-gpu-desktop.jsonl",
+        &net_only_config(false),
+        120,
+        40,
+    );
+    insta::assert_snapshot!("net_fixed_120x40", rendered);
+}
+
+#[test]
+fn golden_net_fixed_200x60() {
+    let rendered = render_fixture_with_config(
+        "win11-16core-dual-gpu-desktop.jsonl",
+        &net_only_config(false),
+        200,
+        60,
+    );
+    insta::assert_snapshot!("net_fixed_200x60", rendered);
 }

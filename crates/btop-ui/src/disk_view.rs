@@ -188,10 +188,14 @@ fn render_disks_list(
 
     if disks.is_empty() {
         if y < y_end {
+            let clipped: String = "No matching local fixed drives"
+                .chars()
+                .take(usize::from(rect.width.saturating_sub(2)))
+                .collect();
             grid.write_str(
                 rect.x.saturating_add(1),
                 y,
-                "No matching local fixed drives",
+                &clipped,
                 theme.inactive_fg,
                 theme.main_bg,
                 false,

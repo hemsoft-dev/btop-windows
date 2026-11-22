@@ -15,6 +15,7 @@ use btop_sys::{
 use crate::disk::DiskCollector;
 use crate::math::cpu_busy_percent;
 use crate::mem::MemoryCollector;
+use crate::net::NetCollector;
 use crate::proc::ProcessCollector;
 use crate::{CollectError, SnapshotSource};
 
@@ -312,6 +313,7 @@ pub struct LiveCollector {
     cpu: CpuCollector,
     mem: MemoryCollector,
     disks: DiskCollector,
+    net: NetCollector,
     procs: ProcessCollector,
     runq: RunQueueEwma,
     last_runq_instant: Option<Instant>,
@@ -334,6 +336,9 @@ impl LiveCollector {
         let mut disks = DiskCollector::new();
         // Prime physical disk I/O baseline so the first displayed tick has live rates.
         let _ = disks.sample();
+        let mut net = NetCollector::new();
+        // Prime 64-bit network counters so the first displayed tick has live deltas.
+        let _ = net.sample();
         let mut procs = ProcessCollector::new();
         // Prime baseline process CPU timestamps so the first displayed tick has real deltas.
         let _ = procs.sample_with_runnable(cpu.prev.len().max(1));
@@ -344,6 +349,7 @@ impl LiveCollector {
             cpu,
             mem,
             disks,
+            net,
             procs,
             runq: RunQueueEwma::default(),
             last_runq_instant: None,
@@ -376,6 +382,11 @@ impl SnapshotSource for LiveCollector {
             Err(err) => DataState::Unavailable(err.to_string()),
         };
 
+        let net = match self.net.sample() {
+            Ok(list) => DataState::Available(list),
+            Err(err) => DataState::Unavailable(err.to_string()),
+        };
+
         let processes = match self.procs.sample_with_runnable(logical_cpus) {
             Ok((list, runnable)) => {
                 let dt_secs = self.last_runq_instant.map_or(0.0, |prev| {
@@ -403,6 +414,7 @@ impl SnapshotSource for LiveCollector {
             cpu: DataState::Available(cpu_snapshot),
             mem,
             disks,
+            net,
             processes,
             ..Snapshot::default()
         })
