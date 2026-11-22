@@ -22,6 +22,7 @@ pub const MAX_UPDATE_MS: u32 = 60_000;
 struct SamplerShared {
     latest: ArcSwap<Snapshot>,
     generation: AtomicU64,
+    telemetry_generation: AtomicU64,
     update_ms: AtomicU32,
     update_ms_dirty: AtomicBool,
     freq_mode: AtomicU8,
@@ -81,6 +82,7 @@ impl Sampler {
         let shared = Arc::new(SamplerShared {
             latest: ArcSwap::from_pointee(initial_snapshot),
             generation: AtomicU64::new(1),
+            telemetry_generation: AtomicU64::new(1),
             update_ms: AtomicU32::new(initial_update_ms.clamp(MIN_UPDATE_MS, MAX_UPDATE_MS)),
             update_ms_dirty: AtomicBool::new(false),
             freq_mode: AtomicU8::new(FreqMode::Average.to_u8()),
@@ -112,9 +114,17 @@ impl Sampler {
         self.shared.latest.load_full()
     }
 
-    /// Monotonically increasing tick counter incremented on every newly published snapshot.
+    /// Monotonically increasing tick counter incremented on every newly published snapshot
+    /// (including service-only refreshes).
     pub fn generation(&self) -> u64 {
         self.shared.generation.load(Ordering::Acquire)
+    }
+
+    /// Monotonically increasing counter incremented **only** when a full telemetry snapshot
+    /// (CPU, memory, disk, network, processes) is published, so UI history graphs never
+    /// append duplicate telemetry on service-only refreshes.
+    pub fn telemetry_generation(&self) -> u64 {
+        self.shared.telemetry_generation.load(Ordering::Acquire)
     }
 
     /// Returns the currently configured update cadence in milliseconds.
@@ -245,6 +255,10 @@ fn run_sampler_loop(
                         rec.record(snapshot.clone());
                     }
                     shared.latest.store(Arc::new(snapshot));
+                    // Increment `telemetry_generation` before `generation` (both Release) so
+                    // Acquire readers observing a new `generation` always observe the matching
+                    // `telemetry_generation`.
+                    shared.telemetry_generation.fetch_add(1, Ordering::Release);
                     shared.generation.fetch_add(1, Ordering::Release);
                 }
                 Err(CollectError::EndOfStream) => break,
@@ -389,6 +403,15 @@ mod tests {
             main_polls.load(Ordering::SeqCst),
             1,
             "service-only ticks must not run extra full telemetry snapshots"
+        );
+        assert!(
+            sampler.generation() >= 3,
+            "service-only updates must advance UI redraw generation"
+        );
+        assert_eq!(
+            sampler.telemetry_generation(),
+            1,
+            "service-only updates must NOT advance telemetry_generation"
         );
         assert!(matches!(
             sampler.latest().services,

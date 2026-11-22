@@ -1,14 +1,18 @@
 //! Runtime session loop shared by the `btop-windows` binary and integration tests.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
 use btop_collect::{CollectError, FreqMode, Sampler, SnapshotSource};
 use btop_config::{Config, ConfigError};
 use btop_model::{DataState, RecordStats, SnapshotRecorder};
 use btop_sys::{
-    PriorityClass, graceful_close_process, is_process_elevated, query_process_priority,
-    set_process_priority, start_windows_service, stop_windows_service, terminate_process,
+    PriorityClass, ServiceActionError, graceful_close_process, is_process_elevated,
+    query_process_priority, set_process_priority, start_windows_service, stop_windows_service,
+    terminate_process,
 };
 use btop_term::{
     DiffEncoder, Grid, HitAction, InputSource, KeyCode, MouseButton, MouseKind, Size, TermError,
@@ -162,6 +166,26 @@ fn should_poll_services(size: Size, ui_state: &UiState) -> bool {
     ui_state.services.active && has_proc_panel(size, ui_state)
 }
 
+struct ServiceActionOutcome {
+    service_name: String,
+    display_name: String,
+    start: bool,
+    result: Result<(), ServiceActionError>,
+}
+
+struct ServiceDispatch<'a> {
+    tx: &'a Sender<ServiceActionOutcome>,
+    in_flight: &'a Arc<AtomicBool>,
+}
+
+struct ResetBoolOnDrop(Arc<AtomicBool>);
+
+impl Drop for ResetBoolOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 fn build_ui_state(config: &Config, overrides: &ConfigOverrides) -> UiState {
     let mut ui_state = UiState::from_config(config);
     ui_state.tz_offset_secs = btop_sys::local_utc_offset_secs();
@@ -198,35 +222,32 @@ pub fn run_tui_loop(
     let mut history = UiHistory::default();
     let mut ui_state = build_ui_state(&config, overrides);
     let mut last_generation = sampler.generation();
+    let mut last_telemetry_generation = sampler.telemetry_generation();
     let mut current_snapshot = sampler.latest();
     history.push_with_util_mode(&current_snapshot, is_utility_mode(&config));
     ui_state.net.observe_snapshot(&current_snapshot);
 
+    let (svc_tx, svc_rx) = mpsc::channel::<ServiceActionOutcome>();
+    let svc_in_flight = Arc::new(AtomicBool::new(false));
     let mut prev_grid: Option<Grid> = None;
     let mut dirty = true;
     let mut frames_rendered = 0u64;
 
     let run_result: Result<(), AppError> = (|| {
         loop {
-            let gen_now = sampler.generation();
-            if gen_now != last_generation {
-                last_generation = gen_now;
-                current_snapshot = sampler.latest();
-                ui_state.tz_offset_secs = btop_sys::local_utc_offset_secs();
-                history.push_with_util_mode(&current_snapshot, is_utility_mode(&config));
-                ui_state.net.observe_snapshot(&current_snapshot);
-                dirty = true;
-            }
-
-            let proc_rows = visible_proc_rows(size, &ui_state);
-            let service_rows = visible_service_rows(size, &ui_state);
-            sync_proc_selection(&current_snapshot, &mut ui_state, proc_rows);
-            if ui_state.services.active {
-                sync_services_selection(&current_snapshot, &mut ui_state, service_rows);
-            }
-            if cancel_invisible_modal(size, &mut ui_state, &mut prev_grid) {
-                dirty = true;
-            }
+            let (proc_rows, service_rows, state_dirty) = sync_loop_state(
+                &sampler,
+                &svc_rx,
+                size,
+                &config,
+                &mut last_generation,
+                &mut last_telemetry_generation,
+                &mut current_snapshot,
+                &mut history,
+                &mut ui_state,
+                &mut prev_grid,
+            );
+            dirty |= state_dirty;
 
             if dirty {
                 render_dirty_frame(
@@ -247,17 +268,13 @@ pub fn run_tui_loop(
             }
 
             match input.poll(Duration::from_millis(50))? {
-                Some(TermEvent::Key(k))
-                    if k.is_ctrl_c()
-                        || (!ui_state.proc.filter_editing
-                            && !ui_state.services.filter_editing
-                            && ui_state.modal.is_none()
-                            && k.code == KeyCode::Char('q')) =>
-                {
-                    break;
-                }
+                Some(TermEvent::Key(k)) if is_quit_key(k, &ui_state) => break,
                 Some(event) => {
-                    if handle_tui_event(
+                    let dispatch = ServiceDispatch {
+                        tx: &svc_tx,
+                        in_flight: &svc_in_flight,
+                    };
+                    dirty |= handle_tui_event(
                         event,
                         &sampler,
                         &guard,
@@ -271,10 +288,9 @@ pub fn run_tui_loop(
                         proc_rows,
                         service_rows,
                         allow_live_actions,
+                        Some(&dispatch),
                         &mut prev_grid,
-                    ) {
-                        dirty = true;
-                    }
+                    );
                 }
                 None => {
                     if let Ok(live) = guard.size()
@@ -294,6 +310,72 @@ pub fn run_tui_loop(
     drop(guard);
     finish_sampler_and_recording(sampler, run_result)?;
     Ok(frames_rendered)
+}
+
+fn is_quit_key(k: btop_term::KeyEvent, ui_state: &UiState) -> bool {
+    k.is_ctrl_c()
+        || (!ui_state.proc.filter_editing
+            && !ui_state.services.filter_editing
+            && ui_state.modal.is_none()
+            && k.code == KeyCode::Char('q'))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sync_loop_state(
+    sampler: &Sampler,
+    svc_rx: &Receiver<ServiceActionOutcome>,
+    size: Size,
+    config: &Config,
+    last_generation: &mut u64,
+    last_telemetry_generation: &mut u64,
+    current_snapshot: &mut Arc<btop_model::Snapshot>,
+    history: &mut UiHistory,
+    ui_state: &mut UiState,
+    prev_grid: &mut Option<Grid>,
+) -> (usize, usize, bool) {
+    let mut dirty = poll_sampler_updates(
+        sampler,
+        last_generation,
+        last_telemetry_generation,
+        current_snapshot,
+        history,
+        ui_state,
+        config,
+    );
+    dirty |= drain_service_action_outcomes(svc_rx, size, Some(sampler), ui_state, prev_grid);
+    let proc_rows = visible_proc_rows(size, ui_state);
+    let service_rows = visible_service_rows(size, ui_state);
+    sync_proc_selection(current_snapshot, ui_state, proc_rows);
+    if ui_state.services.active {
+        sync_services_selection(current_snapshot, ui_state, service_rows);
+    }
+    dirty |= cancel_invisible_modal(size, ui_state, prev_grid);
+    (proc_rows, service_rows, dirty)
+}
+
+fn poll_sampler_updates(
+    sampler: &Sampler,
+    last_generation: &mut u64,
+    last_telemetry_generation: &mut u64,
+    current_snapshot: &mut Arc<btop_model::Snapshot>,
+    history: &mut UiHistory,
+    ui_state: &mut UiState,
+    config: &Config,
+) -> bool {
+    let gen_now = sampler.generation();
+    if gen_now == *last_generation {
+        return false;
+    }
+    *last_generation = gen_now;
+    *current_snapshot = sampler.latest();
+    let telemetry_gen_now = sampler.telemetry_generation();
+    if telemetry_gen_now != *last_telemetry_generation {
+        *last_telemetry_generation = telemetry_gen_now;
+        ui_state.tz_offset_secs = btop_sys::local_utc_offset_secs();
+        history.push_with_util_mode(current_snapshot, is_utility_mode(config));
+        ui_state.net.observe_snapshot(current_snapshot);
+    }
+    true
 }
 
 fn finish_sampler_and_recording(
@@ -354,6 +436,7 @@ fn handle_tui_event(
     proc_rows: usize,
     service_rows: usize,
     allow_live_actions: bool,
+    service_dispatch: Option<&ServiceDispatch<'_>>,
     prev_grid: &mut Option<Grid>,
 ) -> bool {
     match event {
@@ -363,7 +446,7 @@ fn handle_tui_event(
             k.alt,
             *size,
             allow_live_actions,
-            Some(sampler),
+            service_dispatch,
             ui_state,
             prev_grid,
         ),
@@ -509,7 +592,7 @@ fn handle_modal_key(
     alt: bool,
     size: Size,
     allow_live_actions: bool,
-    sampler: Option<&Sampler>,
+    service_dispatch: Option<&ServiceDispatch<'_>>,
     ui_state: &mut UiState,
     prev_grid: &mut Option<Grid>,
 ) -> bool {
@@ -565,8 +648,9 @@ fn handle_modal_key(
             &service_name,
             &display_name,
             start,
+            size,
             allow_live_actions,
-            sampler,
+            service_dispatch,
             ui_state,
             prev_grid,
         ),
@@ -610,52 +694,74 @@ fn handle_service_confirm_modal(
     service_name: &str,
     display_name: &str,
     start: bool,
+    size: Size,
     allow_live_actions: bool,
-    sampler: Option<&Sampler>,
+    service_dispatch: Option<&ServiceDispatch<'_>>,
     ui_state: &mut UiState,
     prev_grid: &mut Option<Grid>,
 ) -> bool {
     match code {
         KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
+            ui_state.modal = None;
+            *prev_grid = None;
             if !allow_live_actions {
-                ui_state.modal = None;
                 ui_state.services.action_status =
                     Some("Service actions are disabled in replay mode".to_owned());
-                *prev_grid = None;
                 return true;
             }
-            let result = if start {
-                start_windows_service(service_name)
-            } else {
-                stop_windows_service(service_name)
+            let Some(dispatch) = service_dispatch else {
+                ui_state.services.action_status =
+                    Some("Service action dispatcher unavailable".to_owned());
+                return true;
             };
-            match result {
-                Ok(()) => {
-                    ui_state.modal = None;
-                    let verb = if start {
-                        "Requested start for"
+            if dispatch.in_flight.swap(true, Ordering::AcqRel) {
+                ui_state.services.action_status =
+                    Some("Another service Start/Stop request is still in progress".to_owned());
+                return true;
+            }
+            let svc_name = service_name.to_owned();
+            let disp_name = display_name.to_owned();
+            let tx = dispatch.tx.clone();
+            let in_flight = Arc::clone(dispatch.in_flight);
+            let verb = if start { "start" } else { "stop" };
+            ui_state.services.action_status = Some(format!(
+                "Sending {verb} request to '{svc_name}' ({disp_name})..."
+            ));
+
+            // Dispatch SCM `StartServiceW` / `ControlService` off the UI thread because Windows
+            // `ControlService` may block for up to 30 seconds while another control is pending.
+            let spawn_res = std::thread::Builder::new()
+                .name("btop-svc-action".to_owned())
+                .spawn(move || {
+                    let _guard = ResetBoolOnDrop(in_flight);
+                    let result = if start {
+                        start_windows_service(&svc_name)
                     } else {
-                        "Requested stop for"
+                        stop_windows_service(&svc_name)
                     };
-                    ui_state.services.action_status =
-                        Some(format!("{verb} '{service_name}' ({display_name})"));
-                    if let Some(s) = sampler {
-                        s.refresh_services();
-                    }
-                }
-                Err(err) => {
-                    ui_state.modal = Some(ProcActionModal::ActionNotice {
-                        title: if start {
-                            "Service Start Refused".to_owned()
-                        } else {
-                            "Service Stop Refused".to_owned()
-                        },
-                        message: err.to_string(),
-                        is_error: true,
+                    let _ = tx.send(ServiceActionOutcome {
+                        service_name: svc_name,
+                        display_name: disp_name,
+                        start,
+                        result,
                     });
+                });
+            if let Err(err) = spawn_res {
+                dispatch.in_flight.store(false, Ordering::Release);
+                let notice = ProcActionModal::ActionNotice {
+                    title: if start {
+                        "Service Start Failed".to_owned()
+                    } else {
+                        "Service Stop Failed".to_owned()
+                    },
+                    message: format!("Failed to spawn service control worker: {err}"),
+                    is_error: true,
+                };
+                if !try_open_modal(size, ui_state, notice) {
+                    ui_state.services.action_status =
+                        Some(format!("Failed to spawn service control worker: {err}"));
                 }
             }
-            *prev_grid = None;
             true
         }
         KeyCode::Esc | KeyCode::Char('n' | 'N') => {
@@ -665,6 +771,53 @@ fn handle_service_confirm_modal(
         }
         _ => false,
     }
+}
+
+fn drain_service_action_outcomes(
+    rx: &Receiver<ServiceActionOutcome>,
+    size: Size,
+    sampler: Option<&Sampler>,
+    ui_state: &mut UiState,
+    prev_grid: &mut Option<Grid>,
+) -> bool {
+    let mut updated = false;
+    while let Ok(outcome) = rx.try_recv() {
+        updated = true;
+        *prev_grid = None;
+        match outcome.result {
+            Ok(()) => {
+                let verb = if outcome.start {
+                    "Requested start for"
+                } else {
+                    "Requested stop for"
+                };
+                ui_state.services.action_status = Some(format!(
+                    "{verb} '{}' ({})",
+                    outcome.service_name, outcome.display_name
+                ));
+                if let Some(s) = sampler {
+                    s.refresh_services();
+                }
+            }
+            Err(err) => {
+                let title = if outcome.start {
+                    "Service Start Refused".to_owned()
+                } else {
+                    "Service Stop Refused".to_owned()
+                };
+                let msg = err.to_string();
+                let notice = ProcActionModal::ActionNotice {
+                    title,
+                    message: msg.clone(),
+                    is_error: true,
+                };
+                if !try_open_modal(size, ui_state, notice) {
+                    ui_state.services.action_status = Some(msg);
+                }
+            }
+        }
+    }
+    updated
 }
 
 fn apply_priority_modal_selection(
@@ -1590,5 +1743,91 @@ mod tests {
         ));
         assert_eq!(state.services.filter, "q");
         assert_eq!(state.proc.filter, "");
+    }
+
+    #[test]
+    fn service_control_outcomes_apply_asynchronously_and_guard_overlap() {
+        let size = Size {
+            width: 120,
+            height: 40,
+        };
+        let mut state = UiState::default();
+        state.services.active = true;
+        let mut prev_grid = None;
+
+        // Overlapping confirm while another control call is already in flight returns immediately.
+        let (tx, rx) = mpsc::channel();
+        let in_flight = Arc::new(AtomicBool::new(true));
+        let dispatch = ServiceDispatch {
+            tx: &tx,
+            in_flight: &in_flight,
+        };
+        state.modal = Some(ProcActionModal::ConfirmServiceAction {
+            service_name: "W32Time".to_owned(),
+            display_name: "Windows Time".to_owned(),
+            start: false,
+        });
+        assert!(handle_modal_key(
+            KeyCode::Enter,
+            false,
+            false,
+            size,
+            true,
+            Some(&dispatch),
+            &mut state,
+            &mut prev_grid,
+        ));
+        assert!(state.modal.is_none());
+        assert!(
+            state
+                .services
+                .action_status
+                .as_deref()
+                .is_some_and(|s| s.contains("still in progress"))
+        );
+
+        // Draining a completed success outcome updates `services.action_status`.
+        tx.send(ServiceActionOutcome {
+            service_name: "W32Time".to_owned(),
+            display_name: "Windows Time".to_owned(),
+            start: true,
+            result: Ok(()),
+        })
+        .expect("send ok outcome");
+        assert!(drain_service_action_outcomes(
+            &rx,
+            size,
+            None,
+            &mut state,
+            &mut prev_grid,
+        ));
+        assert!(
+            state
+                .services
+                .action_status
+                .as_deref()
+                .is_some_and(|s| s.contains("Requested start for 'W32Time'"))
+        );
+
+        // Draining an error outcome opens a refusal notice modal cleanly.
+        tx.send(ServiceActionOutcome {
+            service_name: "W32Time".to_owned(),
+            display_name: "Windows Time".to_owned(),
+            start: false,
+            result: Err(ServiceActionError::AccessDenied("W32Time".to_owned())),
+        })
+        .expect("send err outcome");
+        assert!(drain_service_action_outcomes(
+            &rx,
+            size,
+            None,
+            &mut state,
+            &mut prev_grid,
+        ));
+        assert!(matches!(
+            state.modal,
+            Some(ProcActionModal::ActionNotice { ref title, is_error: true, .. })
+                if title == "Service Stop Refused"
+        ));
     }
 }
