@@ -178,6 +178,29 @@ impl Grid {
             x = x.saturating_add(width);
         }
     }
+
+    /// Renders the grid to newline-separated plain text with trailing spaces trimmed per row,
+    /// suitable for deterministic golden snapshot tests.
+    pub fn to_plain_text(&self) -> String {
+        let mut out = String::with_capacity(
+            usize::from(self.size.height) * (usize::from(self.size.width) + 1),
+        );
+        for y in 0..self.size.height {
+            let mut row = String::with_capacity(usize::from(self.size.width));
+            for x in 0..self.size.width {
+                if let Some(cell) = self.get(x, y)
+                    && !cell.continuation
+                {
+                    row.push(cell.ch);
+                }
+            }
+            out.push_str(row.trim_end_matches(' '));
+            if y + 1 < self.size.height {
+                out.push('\n');
+            }
+        }
+        out
+    }
 }
 
 /// Encodes incremental cell diffs into a single ANSI/VT frame buffer, optionally

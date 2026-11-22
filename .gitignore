@@ -17,5 +17,6 @@ Desktop.ini
 # Local runtime artifacts, logs, and recordings
 *.log
 *.jsonl
+!fixtures/*.jsonl
 btop.conf
 btop-windows.conf

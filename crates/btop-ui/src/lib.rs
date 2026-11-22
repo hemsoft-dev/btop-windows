@@ -40,6 +40,60 @@ pub fn render(snapshot: &Snapshot, config: &Config, size: Size) -> Grid {
         },
         HitAction::ToggleBox("cpu".to_owned()),
     );
+
+    if size.height >= 5 {
+        let mem_summary = match &snapshot.mem {
+            DataState::Available(mem) => {
+                let gib = 1024.0 * 1024.0 * 1024.0;
+                #[allow(clippy::cast_precision_loss)]
+                let used_gib = mem.used_bytes as f64 / gib;
+                #[allow(clippy::cast_precision_loss)]
+                let total_gib = mem.total_bytes as f64 / gib;
+                format!("MEM {used_gib:.1} / {total_gib:.1} GiB")
+            }
+            DataState::WarmingUp => "MEM warming up...".to_owned(),
+            DataState::Stale { age_ms, .. } => format!("MEM stale ({age_ms}ms)"),
+            DataState::Denied => "MEM denied".to_owned(),
+            DataState::Unavailable(reason) => format!("MEM unavailable: {reason}"),
+        };
+        grid.write_str(1, 2, &mem_summary, Color::Reset, Color::Reset, false);
+
+        let gpu_summary = if snapshot.gpus.is_empty() {
+            "GPU none".to_owned()
+        } else {
+            let names: Vec<String> = snapshot
+                .gpus
+                .iter()
+                .enumerate()
+                .map(|(i, state)| match state {
+                    DataState::Available(g) => {
+                        let util = g
+                            .utilization_pct
+                            .map_or_else(|| "n/a".to_owned(), |u| format!("{u:.0}%"));
+                        format!("gpu{i}: {} ({util})", g.name)
+                    }
+                    DataState::WarmingUp => format!("gpu{i}: warming up"),
+                    DataState::Stale { age_ms, .. } => format!("gpu{i}: stale ({age_ms}ms)"),
+                    DataState::Denied => format!("gpu{i}: denied"),
+                    DataState::Unavailable(r) => format!("gpu{i}: {r}"),
+                })
+                .collect();
+            format!("GPU {}", names.join(" | "))
+        };
+        grid.write_str(1, 3, &gpu_summary, Color::Reset, Color::Reset, false);
+
+        let proc_summary = match &snapshot.processes {
+            DataState::Available(procs) => format!("PROC {} running", procs.len()),
+            DataState::WarmingUp => "PROC warming up...".to_owned(),
+            DataState::Stale { value, age_ms } => {
+                format!("PROC {} (stale {age_ms}ms)", value.len())
+            }
+            DataState::Denied => "PROC denied".to_owned(),
+            DataState::Unavailable(reason) => format!("PROC unavailable: {reason}"),
+        };
+        grid.write_str(1, 4, &proc_summary, Color::Reset, Color::Reset, false);
+    }
+
     grid
 }
 

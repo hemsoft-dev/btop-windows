@@ -1,12 +1,20 @@
 //! System telemetry collectors and pure delta mathematics.
 
+pub mod replay;
+
 use btop_model::Snapshot;
 use thiserror::Error;
+
+pub use replay::{ReplaySource, StubLiveSource};
 
 #[derive(Debug, Error)]
 pub enum CollectError {
     #[error("collector failed: {0}")]
     Platform(String),
+    #[error("replay stream error: {0}")]
+    Replay(String),
+    #[error("replay stream reached end of file")]
+    EndOfStream,
 }
 
 /// Trait implemented by live Windows collectors and deterministic replay fixtures.
