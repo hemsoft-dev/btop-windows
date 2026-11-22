@@ -1,5 +1,6 @@
 //! Safe, bounded Win32/NT per-process metadata queries:
 //! - `NtQueryInformationProcess(ProcessCommandLineInformation = 60)` with `CreateTime` guard
+//! - `NtQueryInformationProcess(ProcessProtectionInformation = 61)` for confirmed PPL/PP status
 //! - `NtQuerySystemInformation(SystemProcessIdInformation = 88)` for full image paths (works on PPL)
 //! - `OpenProcessToken` + `GetTokenInformation(TokenUser)` + `LookupAccountSidW` locally cached by SID
 
@@ -8,7 +9,7 @@ use std::collections::HashMap;
 
 use crate::UnicodeString;
 
-/// Explicit query outcome distinguishing privilege denial (e.g., PPL) from other unavailability.
+/// Explicit query outcome distinguishing privilege denial (e.g., PPL/ACL) from other unavailability.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcFieldQuery<T> {
     Available(T),
@@ -27,6 +28,22 @@ impl<T> ProcFieldQuery<T> {
     pub const fn is_denied(&self) -> bool {
         matches!(self, Self::Denied)
     }
+}
+
+/// Bundled per-process metadata queried under a single `CreateTime`-verified process handle
+/// whenever accessible, or flagged for post-query lifetime verification when `OpenProcess` is denied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawProcessMetadata {
+    pub image_path: ProcFieldQuery<String>,
+    /// `true` when `image_path` was queried while holding a `CreateTime`-verified process handle
+    /// (preventing PID reuse); `false` when `OpenProcess` was denied so the caller must re-verify
+    /// `(pid, create_time_100ns)` is still alive before accepting or caching `image_path`.
+    pub image_path_verified: bool,
+    pub command_line: ProcFieldQuery<String>,
+    pub user: ProcFieldQuery<String>,
+    /// `true` only for kernel pseudo-processes (`0`, `4`) or when
+    /// `NtQueryInformationProcess(ProcessProtectionInformation = 61)` confirms `PsProtectedType != None`.
+    pub is_protected: bool,
 }
 
 /// Matches `SYSTEM_PROCESS_ID_INFORMATION` in `phnt` (24 bytes on `x86_64`).
@@ -112,6 +129,12 @@ pub fn translate_nt_device_path(nt_path: &str, device_map: &[(String, String)]) 
     nt_path.to_owned()
 }
 
+/// Returns `true` when `PS_PROTECTION` byte indicates an active Windows Protected / PPL process
+/// (`Type` in bits `0..=2` is non-zero: `1 = ProtectedLight`, `2 = Protected`).
+pub const fn is_ps_protection_active(ps_protection_byte: u8) -> bool {
+    (ps_protection_byte & 0x07) != 0
+}
+
 #[cfg(windows)]
 mod win {
     use core::ffi::c_void;
@@ -133,11 +156,13 @@ mod win {
     };
 
     use super::{
-        ProcFieldQuery, SidAccountCache, SystemProcessIdInformation, translate_nt_device_path,
+        ProcFieldQuery, RawProcessMetadata, SidAccountCache, SystemProcessIdInformation,
+        is_ps_protection_active, translate_nt_device_path,
     };
     use crate::UnicodeString;
 
     const PROCESS_COMMAND_LINE_INFORMATION: u32 = 60;
+    const PROCESS_PROTECTION_INFORMATION: u32 = 61;
     const SYSTEM_PROCESS_ID_INFORMATION_CLASS: u32 = 88;
     const INITIAL_CMDLINE_BYTES: usize = 2048;
     const MAX_CMDLINE_BYTES: usize = 256 * 1024;
@@ -241,19 +266,23 @@ mod win {
         ProcFieldQuery::Available(handle)
     }
 
-    /// Queries the user-mode command line of `pid` via `NtQueryInformationProcess(60)`
-    /// (`ProcessCommandLineInformation`), verifying `GetProcessTimes` matches
-    /// `expected_create_time_100ns` before reading.
-    pub fn query_process_command_line_state(
-        pid: u32,
-        expected_create_time_100ns: u64,
-    ) -> ProcFieldQuery<String> {
-        let handle = match open_verified_process(pid, expected_create_time_100ns) {
-            ProcFieldQuery::Available(h) => h,
-            ProcFieldQuery::Denied => return ProcFieldQuery::Denied,
-            ProcFieldQuery::Unavailable(reason) => return ProcFieldQuery::Unavailable(reason),
+    fn query_protection_on_handle(handle: HANDLE) -> bool {
+        let mut ps_protection: u8 = 0;
+        let mut returned_len = 0u32;
+        // SAFETY: `ProcessProtectionInformation` writes a 1-byte `PS_PROTECTION` value.
+        let status = unsafe {
+            NtQueryInformationProcess(
+                handle,
+                PROCESS_PROTECTION_INFORMATION,
+                (&raw mut ps_protection).cast::<c_void>(),
+                1,
+                &raw mut returned_len,
+            )
         };
+        status >= 0 && is_ps_protection_active(ps_protection)
+    }
 
+    fn query_command_line_on_handle(handle: HANDLE) -> ProcFieldQuery<String> {
         let mut buf = vec![0u8; INITIAL_CMDLINE_BYTES];
         for _ in 0..4 {
             let Ok(buf_len) = u32::try_from(buf.len()) else {
@@ -264,7 +293,7 @@ mod win {
             // SAFETY: `buf` provides `buf_len` writable bytes for `UNICODE_STRING` + UTF-16 payload.
             let status = unsafe {
                 NtQueryInformationProcess(
-                    handle.0,
+                    handle,
                     PROCESS_COMMAND_LINE_INFORMATION,
                     buf.as_mut_ptr().cast::<c_void>(),
                     buf_len,
@@ -302,6 +331,157 @@ mod win {
         }
 
         ProcFieldQuery::Unavailable("ProcessCommandLineInformation did not converge".to_owned())
+    }
+
+    fn query_owner_on_handle(
+        handle: HANDLE,
+        sid_cache: &mut SidAccountCache,
+    ) -> ProcFieldQuery<String> {
+        let mut raw_token: HANDLE = ptr::null_mut();
+        // SAFETY: Opening process token with read-only `TOKEN_QUERY` access.
+        let tok_ok = unsafe { OpenProcessToken(handle, TOKEN_QUERY, &raw mut raw_token) };
+        if tok_ok == 0 || raw_token.is_null() {
+            let err = unsafe { GetLastError() };
+            return if err == ERROR_ACCESS_DENIED {
+                ProcFieldQuery::Denied
+            } else {
+                ProcFieldQuery::Unavailable(format!("OpenProcessToken failed ({err})"))
+            };
+        }
+        let token = OwnedWinHandle(raw_token);
+
+        let mut needed_bytes = 0u32;
+        // SAFETY: First call queries required `TOKEN_USER` buffer size.
+        let _ = unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                ptr::null_mut(),
+                0,
+                &raw mut needed_bytes,
+            )
+        };
+        if needed_bytes == 0 || (needed_bytes as usize) < size_of::<TOKEN_USER>() {
+            let err = unsafe { GetLastError() };
+            return if err == ERROR_ACCESS_DENIED {
+                ProcFieldQuery::Denied
+            } else {
+                ProcFieldQuery::Unavailable(format!("GetTokenInformation size failed ({err})"))
+            };
+        }
+
+        let u64_len = (needed_bytes as usize).div_ceil(size_of::<u64>());
+        let mut buf = vec![0u64; u64_len];
+        let mut actual_bytes = 0u32;
+        let buf_bytes = u32::try_from(buf.len() * size_of::<u64>()).unwrap_or(needed_bytes);
+        // SAFETY: `buf` is 8-byte aligned and at least `needed_bytes` long.
+        let ok = unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                buf.as_mut_ptr().cast::<c_void>(),
+                buf_bytes,
+                &raw mut actual_bytes,
+            )
+        };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            return if err == ERROR_ACCESS_DENIED {
+                ProcFieldQuery::Denied
+            } else {
+                ProcFieldQuery::Unavailable(format!("GetTokenInformation failed ({err})"))
+            };
+        }
+
+        // SAFETY: `buf` holds a valid `TOKEN_USER` structure written by Win32.
+        let token_user = unsafe { &*buf.as_ptr().cast::<TOKEN_USER>() };
+        let sid = token_user.User.Sid;
+        if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
+            return ProcFieldQuery::Unavailable("invalid token SID".to_owned());
+        }
+        let sid_len = unsafe { GetLengthSid(sid) } as usize;
+        if sid_len == 0 || sid_len > 256 {
+            return ProcFieldQuery::Unavailable("unexpected SID length".to_owned());
+        }
+        // SAFETY: `IsValidSid(sid)` succeeded and `GetLengthSid(sid)` gives its exact byte length.
+        let sid_bytes = unsafe { core::slice::from_raw_parts(sid.cast::<u8>(), sid_len) };
+
+        match sid_cache.resolve_with(sid_bytes, || lookup_account_sid_local(sid)) {
+            Some(name) => ProcFieldQuery::Available(name),
+            None => ProcFieldQuery::Unavailable("LookupAccountSidW unresolved".to_owned()),
+        }
+    }
+
+    /// Queries per-process image path, command line, owner, and confirmed protection status.
+    ///
+    /// When `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` succeeds, the opened handle is
+    /// verified against `expected_create_time_100ns` and kept alive across the
+    /// `SystemProcessIdInformation` query so Windows cannot reuse the PID mid-query. When
+    /// `OpenProcess` is denied, `image_path_verified` is returned as `false` so the collector
+    /// re-verifies `(pid, create_time_100ns)` before caching the image path.
+    pub fn query_process_metadata(
+        pid: u32,
+        expected_create_time_100ns: u64,
+        device_map: &[(String, String)],
+        sid_cache: &mut SidAccountCache,
+    ) -> RawProcessMetadata {
+        if matches!(pid, 0 | 4) {
+            return RawProcessMetadata {
+                image_path: ProcFieldQuery::Unavailable("kernel process".to_owned()),
+                image_path_verified: true,
+                command_line: ProcFieldQuery::Denied,
+                user: ProcFieldQuery::Denied,
+                is_protected: true,
+            };
+        }
+
+        match open_verified_process(pid, expected_create_time_100ns) {
+            ProcFieldQuery::Available(handle) => {
+                // Holding `handle` pins the kernel EPROCESS object so `pid` cannot be reused
+                // while `SystemProcessIdInformation` runs.
+                let image_path = query_process_image_path_raw(pid, device_map);
+                let command_line = query_command_line_on_handle(handle.0);
+                let user = query_owner_on_handle(handle.0, sid_cache);
+                let is_protected = query_protection_on_handle(handle.0);
+                drop(handle);
+                RawProcessMetadata {
+                    image_path,
+                    image_path_verified: true,
+                    command_line,
+                    user,
+                    is_protected,
+                }
+            }
+            ProcFieldQuery::Denied => RawProcessMetadata {
+                image_path: query_process_image_path_raw(pid, device_map),
+                image_path_verified: false,
+                command_line: ProcFieldQuery::Denied,
+                user: ProcFieldQuery::Denied,
+                is_protected: false,
+            },
+            ProcFieldQuery::Unavailable(reason) => RawProcessMetadata {
+                image_path: ProcFieldQuery::Unavailable(reason.clone()),
+                image_path_verified: false,
+                command_line: ProcFieldQuery::Unavailable(reason.clone()),
+                user: ProcFieldQuery::Unavailable(reason),
+                is_protected: false,
+            },
+        }
+    }
+
+    /// Queries the user-mode command line of `pid` via `NtQueryInformationProcess(60)`
+    /// (`ProcessCommandLineInformation`), verifying `GetProcessTimes` matches
+    /// `expected_create_time_100ns` before reading.
+    pub fn query_process_command_line_state(
+        pid: u32,
+        expected_create_time_100ns: u64,
+    ) -> ProcFieldQuery<String> {
+        let handle = match open_verified_process(pid, expected_create_time_100ns) {
+            ProcFieldQuery::Available(h) => h,
+            ProcFieldQuery::Denied => return ProcFieldQuery::Denied,
+            ProcFieldQuery::Unavailable(reason) => return ProcFieldQuery::Unavailable(reason),
+        };
+        query_command_line_on_handle(handle.0)
     }
 
     /// Convenience wrapper returning `Some(command_line)` when accessible, or `None` otherwise.
@@ -345,7 +525,13 @@ mod win {
         if matches!(pid, 0 | 4) {
             return ProcFieldQuery::Unavailable("kernel process".to_owned());
         }
+        query_process_image_path_raw(pid, device_map)
+    }
 
+    fn query_process_image_path_raw(
+        pid: u32,
+        device_map: &[(String, String)],
+    ) -> ProcFieldQuery<String> {
         let mut wide_buf = vec![0u16; INITIAL_IMAGE_PATH_WCHARS];
         for _ in 0..4 {
             let max_bytes = u16::try_from(wide_buf.len().saturating_mul(2)).unwrap_or(u16::MAX - 1);
@@ -417,80 +603,7 @@ mod win {
             ProcFieldQuery::Denied => return ProcFieldQuery::Denied,
             ProcFieldQuery::Unavailable(reason) => return ProcFieldQuery::Unavailable(reason),
         };
-
-        let mut raw_token: HANDLE = ptr::null_mut();
-        // SAFETY: Opening process token with read-only `TOKEN_QUERY` access.
-        let tok_ok = unsafe { OpenProcessToken(proc_handle.0, TOKEN_QUERY, &raw mut raw_token) };
-        if tok_ok == 0 || raw_token.is_null() {
-            let err = unsafe { GetLastError() };
-            return if err == ERROR_ACCESS_DENIED {
-                ProcFieldQuery::Denied
-            } else {
-                ProcFieldQuery::Unavailable(format!("OpenProcessToken failed ({err})"))
-            };
-        }
-        let token = OwnedWinHandle(raw_token);
-
-        let mut needed_bytes = 0u32;
-        // SAFETY: First call queries required `TOKEN_USER` buffer size.
-        let _ = unsafe {
-            GetTokenInformation(
-                token.0,
-                TokenUser,
-                ptr::null_mut(),
-                0,
-                &raw mut needed_bytes,
-            )
-        };
-        if needed_bytes == 0 || (needed_bytes as usize) < size_of::<TOKEN_USER>() {
-            let err = unsafe { GetLastError() };
-            return if err == ERROR_ACCESS_DENIED {
-                ProcFieldQuery::Denied
-            } else {
-                ProcFieldQuery::Unavailable(format!("GetTokenInformation size failed ({err})"))
-            };
-        }
-
-        let u64_len = (needed_bytes as usize).div_ceil(size_of::<u64>());
-        let mut buf = vec![0u64; u64_len];
-        let mut actual_bytes = 0u32;
-        let buf_bytes = u32::try_from(buf.len() * size_of::<u64>()).unwrap_or(needed_bytes);
-        // SAFETY: `buf` is 8-byte aligned and at least `needed_bytes` long.
-        let ok = unsafe {
-            GetTokenInformation(
-                token.0,
-                TokenUser,
-                buf.as_mut_ptr().cast::<c_void>(),
-                buf_bytes,
-                &raw mut actual_bytes,
-            )
-        };
-        if ok == 0 {
-            let err = unsafe { GetLastError() };
-            return if err == ERROR_ACCESS_DENIED {
-                ProcFieldQuery::Denied
-            } else {
-                ProcFieldQuery::Unavailable(format!("GetTokenInformation failed ({err})"))
-            };
-        }
-
-        // SAFETY: `buf` holds a valid `TOKEN_USER` structure written by Win32.
-        let token_user = unsafe { &*buf.as_ptr().cast::<TOKEN_USER>() };
-        let sid = token_user.User.Sid;
-        if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
-            return ProcFieldQuery::Unavailable("invalid token SID".to_owned());
-        }
-        let sid_len = unsafe { GetLengthSid(sid) } as usize;
-        if sid_len == 0 || sid_len > 256 {
-            return ProcFieldQuery::Unavailable("unexpected SID length".to_owned());
-        }
-        // SAFETY: `IsValidSid(sid)` succeeded and `GetLengthSid(sid)` gives its exact byte length.
-        let sid_bytes = unsafe { core::slice::from_raw_parts(sid.cast::<u8>(), sid_len) };
-
-        match sid_cache.resolve_with(sid_bytes, || lookup_account_sid_local(sid)) {
-            Some(name) => ProcFieldQuery::Available(name),
-            None => ProcFieldQuery::Unavailable("LookupAccountSidW unresolved".to_owned()),
-        }
+        query_owner_on_handle(proc_handle.0, sid_cache)
     }
 
     fn lookup_account_sid_local(sid: *mut c_void) -> Option<String> {
@@ -598,7 +711,7 @@ mod win {
 #[cfg(windows)]
 pub use win::{
     query_nt_device_drive_map, query_process_command_line, query_process_command_line_state,
-    query_process_image_path, query_process_owner,
+    query_process_image_path, query_process_metadata, query_process_owner,
 };
 
 #[cfg(not(windows))]
@@ -634,6 +747,22 @@ pub fn query_process_owner(
     _sid_cache: &mut SidAccountCache,
 ) -> ProcFieldQuery<String> {
     ProcFieldQuery::Unavailable("non-Windows host".to_owned())
+}
+
+#[cfg(not(windows))]
+pub fn query_process_metadata(
+    pid: u32,
+    _expected_create_time_100ns: u64,
+    _device_map: &[(String, String)],
+    _sid_cache: &mut SidAccountCache,
+) -> RawProcessMetadata {
+    RawProcessMetadata {
+        image_path: ProcFieldQuery::Unavailable("non-Windows host".to_owned()),
+        image_path_verified: true,
+        command_line: ProcFieldQuery::Unavailable("non-Windows host".to_owned()),
+        user: ProcFieldQuery::Unavailable("non-Windows host".to_owned()),
+        is_protected: matches!(pid, 0 | 4),
+    }
 }
 
 #[cfg(test)]
@@ -698,24 +827,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn decodes_ps_protection_type_bits_accurately() {
+        assert!(!is_ps_protection_active(0x00)); // PsProtectedTypeNone
+        assert!(is_ps_protection_active(0x31)); // WinTcb Light (PPL)
+        assert!(is_ps_protection_active(0x61)); // WinSystem Light (PPL)
+        assert!(is_ps_protection_active(0x52)); // Windows Full (PP)
+    }
+
     #[cfg(windows)]
     #[test]
     fn live_windows_queries_current_process_image_path_and_owner_with_sid_cache() {
         let pid = std::process::id();
         let dev_map = query_nt_device_drive_map();
-        let img = query_process_image_path(pid, &dev_map);
-        match img {
+        let mut cache = SidAccountCache::new();
+
+        let meta = query_process_metadata(pid, 0, &dev_map, &mut cache);
+        assert!(meta.image_path_verified);
+        assert!(!meta.is_protected);
+        match meta.image_path {
             ProcFieldQuery::Available(path) => {
                 assert!(path.to_ascii_lowercase().ends_with(".exe"), "path={path}");
             }
             other => panic!("expected Available image path for current process, got {other:?}"),
         }
 
-        let mut cache = SidAccountCache::new();
-        let owner1 = query_process_owner(pid, 0, &mut cache);
         let owner2 = query_process_owner(pid, 0, &mut cache);
-        assert!(matches!(owner1, ProcFieldQuery::Available(ref s) if !s.is_empty()));
-        assert_eq!(owner1, owner2);
+        assert!(matches!(meta.user, ProcFieldQuery::Available(ref s) if !s.is_empty()));
+        assert_eq!(meta.user, owner2);
         assert_eq!(cache.misses(), 1);
         assert_eq!(cache.hits(), 1);
     }

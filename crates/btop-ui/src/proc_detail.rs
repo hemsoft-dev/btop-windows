@@ -228,6 +228,8 @@ fn render_detail_chrome(
         Some(("EXITED", theme.hi_fg))
     } else if entry.is_protected {
         Some(("PPL", theme.hi_fg))
+    } else if entry.command_line_denied || entry.user_denied {
+        Some(("RESTRICTED", theme.inactive_fg))
     } else {
         None
     };
@@ -448,6 +450,8 @@ fn render_detail_metadata(
         "Exited"
     } else if entry.is_protected {
         "Protected (PPL)"
+    } else if entry.command_line_denied || entry.user_denied {
+        "Access Restricted"
     } else {
         "Running"
     };
@@ -746,5 +750,53 @@ mod tests {
         assert!(text_ppl.contains("User: -"));
         assert!(text_ppl.contains("Path: C:\\Windows\\System32\\csrss.exe"));
         assert!(text_ppl.contains("Cmd:  -"));
+    }
+
+    #[test]
+    fn detail_overlay_distinguishes_restricted_acl_from_ppl() {
+        let mut restricted_proc = sample_proc(3300, 4100, "svc_acl.exe", false);
+        restricted_proc.command_line = None;
+        restricted_proc.command_line_denied = true;
+        restricted_proc.user = None;
+        restricted_proc.user_denied = true;
+        let acl_procs = vec![restricted_proc.clone()];
+        let snap = Snapshot {
+            timestamp_ms: 1_735_693_200_000,
+            total_phys_mem_bytes: Some(64 * 1024 * 1024 * 1024),
+            processes: DataState::Available(acl_procs.clone()),
+            ..Snapshot::default()
+        };
+        let history = UiHistory::from_snapshot(&snap);
+        let mut grid_acl = Grid::new(Size {
+            width: 118,
+            height: 9,
+        });
+        let view_acl = ProcViewState {
+            detailed: Some(restricted_proc.identity),
+            detailed_snapshot: Some(restricted_proc.clone()),
+            ..ProcViewState::default()
+        };
+        render_proc_detail(
+            &mut grid_acl,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 118,
+                height: 9,
+            },
+            restricted_proc.identity,
+            &snap,
+            &history,
+            &acl_procs,
+            &view_acl,
+            &Config::default(),
+            &ThemePalette::default_dark(true),
+        );
+        let text_acl = grid_acl.to_plain_text();
+        assert!(text_acl.contains("RESTRICTED"));
+        assert!(text_acl.contains("Status: Access Restricted"));
+        assert!(!text_acl.contains("Protected (PPL)"));
+        assert!(text_acl.contains("User: -"));
+        assert!(text_acl.contains("Cmd:  -"));
     }
 }

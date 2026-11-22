@@ -27,8 +27,9 @@ pub use net::{
 pub use pdh::{CpuPdhQuery, CpuPdhSample};
 pub use power::{RawPowerStatus, local_utc_offset_secs, query_system_power_status};
 pub use proc_info::{
-    ProcFieldQuery, SidAccountCache, SystemProcessIdInformation, query_nt_device_drive_map,
-    query_process_command_line, query_process_command_line_state, query_process_image_path,
+    ProcFieldQuery, RawProcessMetadata, SidAccountCache, SystemProcessIdInformation,
+    is_ps_protection_active, query_nt_device_drive_map, query_process_command_line,
+    query_process_command_line_state, query_process_image_path, query_process_metadata,
     query_process_owner, translate_nt_device_path,
 };
 

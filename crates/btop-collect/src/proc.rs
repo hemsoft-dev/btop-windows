@@ -1,25 +1,61 @@
 //! Read-only Windows process collector backed by `NtQuerySystemInformation(SystemProcessInformation)`
-//! enriched with cached per-process image paths (`SystemProcessIdInformation`), command lines
-//! (`ProcessCommandLineInformation`), and locally SID-cached owner accounts.
+//! enriched with identity-verified cached per-process image paths (`SystemProcessIdInformation`),
+//! command lines (`ProcessCommandLineInformation`), confirmed protection status, and locally
+//! SID-cached owner accounts.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use btop_model::{ProcessEntry, ProcessIdentity};
 use btop_sys::{
-    RawProcessInfo, SidAccountCache, query_nt_device_drive_map, query_process_command_line_state,
-    query_process_image_path, query_process_information, query_process_owner,
+    RawProcessInfo, RawProcessMetadata, SidAccountCache, query_nt_device_drive_map,
+    query_process_information, query_process_metadata,
 };
 
 use crate::CollectError;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CachedProcessMeta {
     image_path: Option<String>,
     command_line: Option<String>,
     command_line_denied: bool,
     user: Option<String>,
     user_denied: bool,
+    is_protected: bool,
+}
+
+/// Validates and finalizes an unverified `SystemProcessIdInformation` image path against a
+/// post-query `SystemProcessInformation` snapshot so PID reuse between enumeration and
+/// `SystemProcessIdInformation` can never attach another executable's path to `identity`.
+fn verify_unverified_image_path(
+    identity: ProcessIdentity,
+    expected_name: &str,
+    candidate_path: Option<String>,
+    post_query_live_ids: &HashSet<ProcessIdentity>,
+) -> Option<String> {
+    let path = candidate_path?;
+    if !post_query_live_ids.contains(&identity) {
+        return None;
+    }
+    if !expected_name.is_empty()
+        && let Some(base) = path.rsplit('\\').next()
+        && !base.is_empty()
+        && !base.eq_ignore_ascii_case(expected_name)
+    {
+        return None;
+    }
+    Some(path)
+}
+
+fn meta_from_raw(raw: RawProcessMetadata) -> CachedProcessMeta {
+    CachedProcessMeta {
+        image_path: raw.image_path.into_option(),
+        command_line_denied: raw.command_line.is_denied(),
+        command_line: raw.command_line.into_option(),
+        user_denied: raw.user.is_denied(),
+        user: raw.user.into_option(),
+        is_protected: raw.is_protected,
+    }
 }
 
 /// Tracks per-process CPU time deltas keyed by `(pid, create_time_100ns)` to prevent
@@ -143,36 +179,73 @@ impl ProcessCollector {
             .compute_entries(&raw, elapsed_100ns, logical_cpus);
 
         let mut live_ids = HashSet::with_capacity(entries.len());
-        for entry in &mut entries {
+        let mut pending_recheck: Vec<(usize, CachedProcessMeta)> = Vec::new();
+
+        for (idx, entry) in entries.iter_mut().enumerate() {
             let id = entry.identity;
             live_ids.insert(id);
-            let meta = self.meta_cache.entry(id).or_insert_with(|| {
-                let image_res = query_process_image_path(id.pid, &self.device_map);
-                let cmd_res = query_process_command_line_state(id.pid, id.create_time_100ns);
-                let user_res =
-                    query_process_owner(id.pid, id.create_time_100ns, &mut self.sid_cache);
+            if let Some(cached) = self.meta_cache.get(&id) {
+                apply_cached_meta(entry, cached);
+                continue;
+            }
 
-                CachedProcessMeta {
-                    image_path: image_res.into_option(),
-                    command_line_denied: cmd_res.is_denied(),
-                    command_line: cmd_res.into_option(),
-                    user_denied: user_res.is_denied(),
-                    user: user_res.into_option(),
-                }
-            });
-            entry.image_path.clone_from(&meta.image_path);
-            entry.command_line.clone_from(&meta.command_line);
-            entry.command_line_denied = meta.command_line_denied;
-            entry.user.clone_from(&meta.user);
-            entry.user_denied = meta.user_denied;
-            if meta.command_line_denied || meta.user_denied {
-                entry.is_protected = true;
+            let queried = query_process_metadata(
+                id.pid,
+                id.create_time_100ns,
+                &self.device_map,
+                &mut self.sid_cache,
+            );
+            let verified = queried.image_path_verified;
+            let meta = meta_from_raw(queried);
+
+            if verified {
+                apply_cached_meta(entry, &meta);
+                self.meta_cache.insert(id, meta);
+            } else {
+                // Access-denied or failed OpenProcess: defer accepting/caching `image_path`
+                // until a post-query snapshot proves `(pid, create_time_100ns)` is still alive.
+                pending_recheck.push((idx, meta));
             }
         }
+
+        if !pending_recheck.is_empty() {
+            let post_live: HashSet<ProcessIdentity> = query_process_information(&mut self.scratch)
+                .map(|rows| {
+                    rows.into_iter()
+                        .map(|r| ProcessIdentity {
+                            pid: r.pid,
+                            create_time_100ns: r.create_time_100ns,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            for (idx, mut meta) in pending_recheck {
+                let entry = &mut entries[idx];
+                let id = entry.identity;
+                let still_alive = post_live.contains(&id);
+                meta.image_path =
+                    verify_unverified_image_path(id, &entry.name, meta.image_path, &post_live);
+                apply_cached_meta(entry, &meta);
+                if still_alive {
+                    self.meta_cache.insert(id, meta);
+                }
+            }
+        }
+
         self.meta_cache.retain(|id, _| live_ids.contains(id));
 
         Ok((entries, runnable_threads))
     }
+}
+
+fn apply_cached_meta(entry: &mut ProcessEntry, meta: &CachedProcessMeta) {
+    entry.image_path.clone_from(&meta.image_path);
+    entry.command_line.clone_from(&meta.command_line);
+    entry.command_line_denied = meta.command_line_denied;
+    entry.user.clone_from(&meta.user);
+    entry.user_denied = meta.user_denied;
+    entry.is_protected = entry.is_protected || meta.is_protected;
 }
 
 #[cfg(test)]
@@ -218,6 +291,76 @@ mod tests {
         assert!((out2[0].cpu_pct - 0.0).abs() < f32::EPSILON);
     }
 
+    #[test]
+    fn unverified_image_path_is_rejected_on_pid_reuse_or_name_mismatch() {
+        let old_id = ProcessIdentity {
+            pid: 4820,
+            create_time_100ns: 1000,
+        };
+        let reused_id = ProcessIdentity {
+            pid: 4820,
+            create_time_100ns: 2000,
+        };
+
+        // Post-query snapshot contains only the reused process -> original identity must reject path.
+        let mut post_reused = HashSet::new();
+        post_reused.insert(reused_id);
+        assert_eq!(
+            verify_unverified_image_path(
+                old_id,
+                "old.exe",
+                Some("C:\\Tools\\replacement.exe".to_owned()),
+                &post_reused,
+            ),
+            None
+        );
+
+        // Post-query snapshot still contains exact (pid, create_time) AND matching executable name -> accept.
+        let mut post_alive = HashSet::new();
+        post_alive.insert(old_id);
+        assert_eq!(
+            verify_unverified_image_path(
+                old_id,
+                "csrss.exe",
+                Some("C:\\Windows\\System32\\csrss.exe".to_owned()),
+                &post_alive,
+            )
+            .as_deref(),
+            Some("C:\\Windows\\System32\\csrss.exe")
+        );
+
+        // Basename mismatch is also rejected defensively.
+        assert_eq!(
+            verify_unverified_image_path(
+                old_id,
+                "csrss.exe",
+                Some("C:\\Windows\\System32\\other.exe".to_owned()),
+                &post_alive,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn field_access_denial_does_not_falsely_mark_process_as_protected_ppl() {
+        let denied_meta = RawProcessMetadata {
+            image_path: btop_sys::ProcFieldQuery::Available(
+                "C:\\Program Files\\Service\\svc.exe".to_owned(),
+            ),
+            image_path_verified: true,
+            command_line: btop_sys::ProcFieldQuery::Denied,
+            user: btop_sys::ProcFieldQuery::Denied,
+            is_protected: false,
+        };
+        let cached = meta_from_raw(denied_meta);
+        assert!(cached.command_line_denied);
+        assert!(cached.user_denied);
+        assert!(
+            !cached.is_protected,
+            "ACL query denial alone must not claim confirmed PPL protection"
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn live_windows_process_collector_finds_current_pid_metadata_and_sid_cache_hits() {
@@ -254,6 +397,7 @@ mod tests {
             me.user.as_deref().is_some_and(|u| !u.is_empty()),
             "current process owner user must be populated via locally cached SID lookup"
         );
+        assert!(!me.is_protected);
 
         let (hits, misses) = collector.sid_cache_stats();
         assert!(misses >= 1, "at least one SID must be resolved");
