@@ -1,0 +1,28 @@
+---
+source: crates/btop-ui/tests/golden.rs
+expression: rendered
+---
+╭─┐¹cpu┌─┐p0┌───┐Intel Core i9┌────┐01:00:04┌─────────────────────┐- 2000ms +┌─╮
+│1╭─┐Options (F2)┌───────────────────────────────────────────────────┐✕ Esc┌─╮ │
+│ │  General   CPU   GPU   MEM   NET   PROC                                  │─│
+│ │──────────────────────────────────────────────────────────────────────────│ │
+│0│▸ color_theme            ◀ Default ▶      │ color_theme                   │ │
+│ │  theme_background       ◀ True ▶         │ Type: Choice (← / → / Enter)  │ │
+│ │  rounded_corners        ◀ True ▶         │                               │ │
+│p│  terminal_sync          ◀ True ▶         │ Active color theme palette    │ │
+╰─│  background_update      ◀ True ▶         │ with instant live preview.    │─╯
+╭─│  update_ms              2000             │                               │─╮
+│ │  shown_boxes            cpu mem net proc │ Theme preview: Default        │ │
+│ │  clock_format           %X               │ ████████████████              │█│
+│ │  graph_symbol           ◀ braille ▶      │                               │││
+│ │  vim_keys               ◀ False ▶        │                               │││
+│ │  disable_mouse          ◀ False ▶        │                               │││
+│ │  cpu_bottom             ◀ False ▶        │                               │││
+╰─│  proc_left              ◀ False ▶        │                               │││
+╭─│  mem_below_net          ◀ False ▶        │                               │││
+│ │  show_battery           ◀ True ▶         │                               │││
+│ │                                          │                               │││
+│ │                                          │                               │││
+│ │ ↑↓ select  |  ←→/Enter edit  |  Tab category  |  R reset  |  Esc close   │││
+│ ╰──────────────────────────────────────────────────────────────────────────╯││
+╰───────────────────────────────╯╰─┐↑↓ sel | e tree | f filter | u pause | F f┌╯

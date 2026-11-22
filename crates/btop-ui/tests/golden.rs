@@ -654,3 +654,87 @@ fn golden_dual_gpu_120x40() {
     let rendered = render_fixture_with_config("win11-16core-dual-gpu-desktop.jsonl", &cfg, 120, 40);
     insta::assert_snapshot!("dual_gpu_120x40", rendered);
 }
+
+fn render_overlay_menu_golden(menu: btop_ui::OverlayMenu, width: u16, height: u16) -> String {
+    let snapshots =
+        parse_jsonl_file(&fixture_path("win11-16core-dual-gpu-desktop.jsonl")).expect("fixture");
+    let mut history = UiHistory::default();
+    for _ in 0..4 {
+        for snap in &snapshots {
+            history.push(snap);
+        }
+    }
+    let latest = snapshots.last().expect("non-empty fixture");
+    let config = Config::default();
+    let mut state = btop_ui::UiState::from_config(&config);
+    state.menu = Some(menu);
+    btop_ui::render_frame(latest, &history, &state, &config, Size { width, height }).to_plain_text()
+}
+
+#[test]
+fn golden_menu_main_80x24() {
+    let rendered = render_overlay_menu_golden(btop_ui::OverlayMenu::main(), 80, 24);
+    insta::assert_snapshot!("menu_main_80x24", rendered);
+}
+
+#[test]
+fn golden_menu_main_120x40() {
+    let rendered = render_overlay_menu_golden(btop_ui::OverlayMenu::main(), 120, 40);
+    insta::assert_snapshot!("menu_main_120x40", rendered);
+}
+
+#[test]
+fn golden_menu_options_80x24() {
+    let rendered = render_overlay_menu_golden(btop_ui::OverlayMenu::options(), 80, 24);
+    insta::assert_snapshot!("menu_options_80x24", rendered);
+}
+
+#[test]
+fn golden_menu_options_120x40() {
+    let rendered = render_overlay_menu_golden(btop_ui::OverlayMenu::options(), 120, 40);
+    insta::assert_snapshot!("menu_options_120x40", rendered);
+}
+
+#[test]
+fn golden_menu_help_80x24() {
+    let rendered = render_overlay_menu_golden(btop_ui::OverlayMenu::help(), 80, 24);
+    insta::assert_snapshot!("menu_help_80x24", rendered);
+}
+
+#[test]
+fn golden_menu_help_120x40() {
+    let rendered = render_overlay_menu_golden(btop_ui::OverlayMenu::help(), 120, 40);
+    insta::assert_snapshot!("menu_help_120x40", rendered);
+}
+
+#[test]
+fn golden_menu_messagebox_80x24() {
+    let dialog = btop_ui::MessageBoxState::yes_no(
+        "Reset Options",
+        vec![
+            "Restore all btop-windows options to their default values?".to_owned(),
+            "Live theme and panel settings will update immediately.".to_owned(),
+        ],
+        btop_ui::MessageBoxAction::ResetOptionsToDefaults,
+        false,
+    );
+    let rendered =
+        render_overlay_menu_golden(btop_ui::OverlayMenu::message_box(dialog, None), 80, 24);
+    insta::assert_snapshot!("menu_messagebox_80x24", rendered);
+}
+
+#[test]
+fn golden_menu_messagebox_120x40() {
+    let dialog = btop_ui::MessageBoxState::yes_no(
+        "Reset Options",
+        vec![
+            "Restore all btop-windows options to their default values?".to_owned(),
+            "Live theme and panel settings will update immediately.".to_owned(),
+        ],
+        btop_ui::MessageBoxAction::ResetOptionsToDefaults,
+        false,
+    );
+    let rendered =
+        render_overlay_menu_golden(btop_ui::OverlayMenu::message_box(dialog, None), 120, 40);
+    insta::assert_snapshot!("menu_messagebox_120x40", rendered);
+}

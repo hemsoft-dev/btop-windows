@@ -1,0 +1,44 @@
+---
+source: crates/btop-ui/tests/golden.rs
+expression: rendered
+---
+╭─┐¹cpu┌─┐p0┌───┐Intel Core i9-14900K (8P+8E)┌─────────┐01:00:04┌─────────────────────────────────────────┐- 2000ms +┌─╮
+│100%                                                                          │ CPU ■■■■■■■■■■■■■■■■■■■■■■■■■■  36.3% │
+│                                                                              │───────────────────────────────────────│
+│           ╭─┐Help & Windows 11 Keybindings (F1)┌─────────────────────────────────────────────────┐✕ Esc┌─╮■■■■  17%  │
+│           │ Key                      Action                                                              │■■■■  28%  │
+│           │──────────────────────────────────────────────────────────────────────────────────────────────│■■■■  39%  │
+│           │ ── Menus & General ──                                                                        │■■■■  15%  │
+│           │ Esc / m                  Open or close the game-inspired Main menu                           │■■■■  26%  │
+│           │ F2 / o                   Open Options menu (live editing & theme preview)                    │■■■■  37%  │
+│0%         │ F1 / ? / h               Open Help keybindings reference (Shift+H when vim_keys=True)        │■■■■  13%  │
+│           │ q / Ctrl+C               Quit btop-windows and restore Windows Terminal                      │           │
+│           │ Ctrl+R                   Reload btop.conf and refresh collectors                             │           │
+│           │ + / -                    Adjust update_ms cadence (+/- 100 ms, floor 100 ms)                 │           │
+│           │ ── Layout & Panels ──                                                                        │           │
+│pk         │ 1 / 2 / 3 / 4            Toggle CPU, MEM, NET, and PROC panels                               │56M/512M   │
+╰─┐WIN11-HYB│ 5 .. 9 / 0               Toggle dedicated GPU panels gpu0 through gpu5                       │───────────╯
+╭─┐²mem┌─┐di│ p / Shift+P              Cycle layout presets forward / backward                             │>┌──┐1/52┌─╮
+│ RAM ■■■■■■│ d / i                    Toggle local fixed disks list / Disk I/O graph mode                 │h    Cpu%  │
+│ Used  ■■■■│ ── Network Panel ──                                                                          │█    12.8 █│
+│ Avail ■■■■│ b / n                    Select previous / next hardware network adapter                     │▅     5.3 ││
+│ Cache ■■■■│ a / y / z                Toggle auto-scale, sync scale, or reset session totals              │▄     4.2 ││
+│ Free  ■■■■│ ── Processes & Tree ──                                                                       │▄     4.2 ││
+│           │ Up / Down / PgUp / PgDn  Navigate process list (Home / End to jump)                          │▄     3.9 ││
+│           │ Left / Right / r         Cycle sort column / reverse sort order                              │▄     3.9 ││
+│───────────│ e / Space / Shift+E      Toggle tree view / collapse branch / collapse all                   │▄     3.6 ││
+│ Commit ■■■│ f or / / Del             Edit process filter (prefix '!' for regex) / clear                  │▄     3.6 ││
+│ Swap   ■■■│ Enter / Esc              Open or close Selected Process Detail overlay                       │▄     3.6 ││
+│ Compressed│ u / Shift+F              Pause process list / follow selected process identity               │▃     3.3 ││
+╰───────────│ c / %                    Toggle per-core CPU% / memory bytes vs percent                      │▃     3.3 ││
+╭─┐³net┌─┐au│ ── Safe Windows Process & Service Actions ──                                                 │▃     3.0 ││
+│302 Mbps   │ t                        Graceful close via WM_CLOSE (interactive GUI apps)                  │▃     3.0 ││
+│           │ k                        Guarded TerminateProcess (CreateTime + critical guard)              │▃     3.0 ││
+│           │ Shift+N                  Open Windows Priority Class selector (SetPriorityClass)             │▃     2.7 ││
+│           │ Shift+S                  Toggle Windows Services (SCM) view inside PROC panel                │▃     2.7 ││
+│           │ s / x (Services)         Start / Stop selected service (requires Administrator)              │▃     2.4 ││
+│           │ ↑↓ / PgUp / PgDn scroll (1-29 of 29)  |  Esc / q close                                       │▃     2.4 ││
+│           ╰──────────────────────────────────────────────────────────────────────────────────────────────╯▃     2.2 ││
+│                          │ IP6: fe80::1a2b:3c4d││    5020 svchost.exe                   8    24.0M ▂▂▂▂▂▂▂▂     2.1 ││
+│302 Mbps                  │ auto sync 302 Mbps  ││    5080 svchost.exe                   8    24.0M ▂▂▂▂▂▂▂▂     2.1 ││
+╰────────────────────────────────────────────────╯╰─┐↑↓ sel | e tree | f filter | u pause | F follow | ←→ sort | r rev┌╯
