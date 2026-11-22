@@ -36,6 +36,7 @@ pub fn win11_8core_single_gpu_desktop() -> Vec<Snapshot> {
                 timestamp_ms: 1_735_689_600_000 + step * 2000,
                 hostname: "WIN11-RYZEN8".to_owned(),
                 username: "alex".to_owned(),
+                total_phys_mem_bytes: None,
                 cpu: DataState::Available(CpuSnapshot {
                     model_name: "AMD Ryzen 7 7800X3D 8-Core Processor".to_owned(),
                     total_busy_pct: (total_busy * 10.0).round() / 10.0,
@@ -123,6 +124,7 @@ pub fn win11_16core_dual_gpu_desktop() -> Vec<Snapshot> {
                 timestamp_ms: 1_735_693_200_000 + step * 2000,
                 hostname: "WIN11-HYBRID16".to_owned(),
                 username: "franz".to_owned(),
+                total_phys_mem_bytes: None,
                 cpu: DataState::Available(CpuSnapshot {
                     model_name: "Intel Core i9-14900K (8P+8E)".to_owned(),
                     total_busy_pct: (total_busy * 10.0).round() / 10.0,

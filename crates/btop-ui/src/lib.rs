@@ -1,8 +1,9 @@
-//! Pure UI layout and widget rendering (`fn(&Snapshot, &UiHistory, &Config, Size) -> Grid`).
+//! Pure UI layout and widget rendering (`fn(&Snapshot, &UiHistory, &UiState, &Config, Size) -> Grid`).
 
 #![forbid(unsafe_code)]
 
 pub mod cpu_box;
+pub mod proc_box;
 pub mod theme;
 pub mod widgets;
 
@@ -12,9 +13,25 @@ use btop_config::Config;
 use btop_model::{DataState, Snapshot};
 use btop_term::{Grid, Rect, Size};
 
+pub use proc_box::{ProcSort, ProcViewState};
+
 use crate::theme::ThemePalette;
 
 const DEFAULT_HISTORY_CAPACITY: usize = 512;
+
+/// Pure UI interaction state passed into [`render_frame`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UiState {
+    pub proc: ProcViewState,
+}
+
+impl UiState {
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            proc: ProcViewState::from_config(config),
+        }
+    }
+}
 
 /// Bounded ring-buffer history passed into pure UI rendering for time-series graphs.
 #[derive(Debug, Clone, PartialEq)]
@@ -79,10 +96,62 @@ fn push_bounded(buf: &mut VecDeque<f32>, value: f32, capacity: usize) {
     buf.make_contiguous();
 }
 
+/// Computes the number of visible process rows for a given viewport size and config.
+pub fn visible_proc_rows(size: Size, config: &Config) -> usize {
+    let (_, proc_rect) = compute_m1_layout(size, config);
+    proc_rect.map_or(0, |r| usize::from(r.height.saturating_sub(3)))
+}
+
+fn compute_m1_layout(size: Size, config: &Config) -> (Option<Rect>, Option<Rect>) {
+    let boxes: Vec<&str> = config.shown_boxes.split_whitespace().collect();
+    let show_cpu = boxes.contains(&"cpu") || boxes.is_empty();
+    let show_proc = boxes.contains(&"proc");
+
+    match (show_cpu, show_proc) {
+        (true, true) if size.height >= 14 => {
+            let cpu_h = ((size.height * 2) / 5).clamp(8, 22);
+            let proc_h = size.height.saturating_sub(cpu_h);
+            (
+                Some(Rect {
+                    x: 0,
+                    y: 0,
+                    width: size.width,
+                    height: cpu_h,
+                }),
+                Some(Rect {
+                    x: 0,
+                    y: cpu_h,
+                    width: size.width,
+                    height: proc_h,
+                }),
+            )
+        }
+        (false, true) => (
+            None,
+            Some(Rect {
+                x: 0,
+                y: 0,
+                width: size.width,
+                height: size.height,
+            }),
+        ),
+        _ => (
+            Some(Rect {
+                x: 0,
+                y: 0,
+                width: size.width,
+                height: size.height,
+            }),
+            None,
+        ),
+    }
+}
+
 /// Renders a complete terminal frame from a single snapshot into a deterministic [`Grid`].
 pub fn render(snapshot: &Snapshot, config: &Config, size: Size) -> Grid {
     let history = UiHistory::from_snapshot(snapshot);
-    render_with_history(snapshot, &history, config, size)
+    let state = UiState::from_config(config);
+    render_frame(snapshot, &history, &state, config, size)
 }
 
 /// Renders a complete terminal frame with accumulated time-series history into a [`Grid`].
@@ -92,21 +161,33 @@ pub fn render_with_history(
     config: &Config,
     size: Size,
 ) -> Grid {
+    let state = UiState::from_config(config);
+    render_frame(snapshot, history, &state, config, size)
+}
+
+/// Renders a complete terminal frame with history and interactive UI state into a [`Grid`].
+pub fn render_frame(
+    snapshot: &Snapshot,
+    history: &UiHistory,
+    state: &UiState,
+    config: &Config,
+    size: Size,
+) -> Grid {
     let mut grid = Grid::new(size);
     let theme = ThemePalette::default_dark(config.theme_background);
 
-    if size.width < 20 || size.height < 6 {
+    if size.width < 24 || size.height < 6 {
         grid.write_str(0, 0, "Terminal too small", theme.hi_fg, theme.main_bg, true);
         return grid;
     }
 
-    let full_rect = Rect {
-        x: 0,
-        y: 0,
-        width: size.width,
-        height: size.height,
-    };
-    cpu_box::render_cpu_box(&mut grid, full_rect, snapshot, history, config, &theme);
+    let (cpu_rect, proc_rect) = compute_m1_layout(size, config);
+    if let Some(rect) = cpu_rect {
+        cpu_box::render_cpu_box(&mut grid, rect, snapshot, history, config, &theme);
+    }
+    if let Some(rect) = proc_rect {
+        proc_box::render_proc_box(&mut grid, rect, snapshot, &state.proc, config, &theme);
+    }
     grid
 }
 

@@ -1,0 +1,28 @@
+---
+source: crates/btop-ui/tests/golden.rs
+expression: rendered
+---
+╭─┐¹cpu┌──┐AMD Ryzen 7 7800X3D 8-Core Processor┌───┐up 04:00:04┌──┐- 2000ms +┌─╮
+│100%                                          │ CPU ■■■■■■■■■■■■■■■■■■  32.3% │
+│                                              │───────────────────────────────│
+│                                  ⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀⣀│ C00 ■■■■■■■■■■■■■■■■■■■■  22% │
+│0%                                ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿│ C01 ■■■■■■■■■■■■■■■■■■■■  29% │
+│                                  ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿│ C02 ■■■■■■■■■■■■■■■■■■■■  36% │
+│                                  ⠻⠛⠟⠻⠛⠟⠻⠛⠟⠻⠛⠟│ C03 ■■■■■■■■■■■■■■■■■■■■  43% │
+│pk                                            │ Up 04:00:04  4.95 GHz         │
+╰─┐WIN11-RYZEN8 | +/- cadence | Ctrl+R reload | q quit┌────────────────────────╯
+╭─┐⁴proc┌─────────────────────────────────────────────┐< cpu lazy ↓ >┌──┐1/50┌─╮
+│     Pid Program                                        Thr     MemB    Cpu%  │
+│    4216 rust-analyzer.exe                               18     1.4G    12.8 █│
+│    4100 Code.exe                                        48     642M     5.3 ││
+│    5048 Code.exe                                        10     118M     4.2 ││
+│    5108 Code.exe                                        10     118M     4.2 ││
+│    5044 msedge.exe                                      12     100M     3.9 ││
+│    5104 msedge.exe                                      12     100M     3.9 ││
+│    4500 msedge.exe                                      52     522M     3.6 ││
+│    5040 svchost.exe                                      8    24.0M     3.6 ││
+│    5100 svchost.exe                                      8    24.0M     3.6 ││
+│    5036 conhost.exe                                      4    30.0M     3.3 ││
+│    5096 conhost.exe                                      4    30.0M     3.3 ││
+│    1416 dwm.exe                                         18     144M     3.0 ││
+╰─┐↑↓ select | ←→ sort | r rev | c core | % mem | q quit┌──────────────────────╯
