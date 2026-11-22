@@ -337,7 +337,9 @@ fn handle_tui_event(
                 k.code, sampler, snapshot, history, config, *size, ui_state, proc_rows,
             )
         }
-        TermEvent::Key(k) => handle_proc_key(k.code, snapshot, history, *size, ui_state, proc_rows),
+        TermEvent::Key(k) => handle_unmodified_proc_key(
+            k.code, k.ctrl, k.alt, snapshot, history, *size, ui_state, proc_rows,
+        ),
         TermEvent::Resize(new_size) => {
             *size = guard.size().unwrap_or(new_size);
             let _ = cancel_invisible_modal(*size, ui_state, prev_grid);
@@ -615,6 +617,23 @@ fn handle_panel_key(
         }
         other => handle_proc_key(other, snapshot, history, size, ui_state, proc_rows),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_unmodified_proc_key(
+    code: KeyCode,
+    ctrl: bool,
+    alt: bool,
+    snapshot: &btop_model::Snapshot,
+    history: &UiHistory,
+    size: Size,
+    state: &mut UiState,
+    proc_rows: usize,
+) -> bool {
+    if ctrl || alt {
+        return false;
+    }
+    handle_proc_key(code, snapshot, history, size, state, proc_rows)
 }
 
 fn handle_proc_key(
@@ -935,6 +954,33 @@ mod tests {
         let mut prev = None;
         assert!(cancel_invisible_modal(tiny, &mut state, &mut prev));
         assert!(state.modal.is_none());
+    }
+
+    #[test]
+    fn modified_ctrl_or_alt_shortcuts_do_not_dispatch_process_actions() {
+        let snap = sample_snapshot_with_proc();
+        let history = UiHistory::default();
+        let mut state = UiState::default();
+        let size = Size {
+            width: 120,
+            height: 40,
+        };
+        let proc_rows = visible_proc_rows(size, &state);
+        assert!(proc_rows > 0);
+
+        for (code, ctrl, alt) in [
+            (KeyCode::Char('t'), true, false),
+            (KeyCode::Char('t'), false, true),
+            (KeyCode::Char('k'), true, false),
+            (KeyCode::Char('N'), false, true),
+        ] {
+            let handled = handle_unmodified_proc_key(
+                code, ctrl, alt, &snap, &history, size, &mut state, proc_rows,
+            );
+            assert!(!handled);
+            assert!(state.modal.is_none());
+            assert!(state.proc.action_status.is_none());
+        }
     }
 
     #[test]

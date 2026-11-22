@@ -107,7 +107,7 @@ impl ProcActionModal {
 pub fn modal_rect(size: Size, modal: &ProcActionModal) -> Option<Rect> {
     match modal {
         ProcActionModal::ConfirmTerminate { .. } => centered_rect_for_size(size, 62, 8, 8),
-        ProcActionModal::PrioritySelector { .. } => centered_rect_for_size(size, 52, 12, 11),
+        ProcActionModal::PrioritySelector { .. } => centered_rect_for_size(size, 52, 12, 12),
         ProcActionModal::ActionNotice { .. } => centered_rect_for_size(size, 66, 8, 8),
     }
 }
@@ -510,5 +510,39 @@ mod tests {
             )
             .is_some()
         );
+
+        let prio = ProcActionModal::PrioritySelector {
+            target: ProcessIdentity {
+                pid: 4216,
+                create_time_100ns: 1000,
+            },
+            name: "worker.exe".to_owned(),
+            current: Some(UiPriorityClass::Normal),
+            selected: UiPriorityClass::Realtime.index(),
+        };
+        assert_eq!(
+            modal_rect(
+                Size {
+                    width: 80,
+                    height: 13
+                },
+                &prio
+            ),
+            None,
+            "80x13 cannot display all 6 priority options without hiding Realtime"
+        );
+        let min_fit = Size {
+            width: 80,
+            height: 14,
+        };
+        assert!(modal_rect(min_fit, &prio).is_some());
+        let mut g = Grid::new(min_fit);
+        render_proc_action_modal(
+            &mut g,
+            &prio,
+            &Config::default(),
+            &ThemePalette::default_dark(true),
+        );
+        assert!(g.to_plain_text().contains("> Realtime"));
     }
 }
