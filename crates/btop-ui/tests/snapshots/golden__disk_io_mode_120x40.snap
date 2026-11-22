@@ -18,7 +18,7 @@ expression: rendered
 │                                                                              │ Up 1d 00:00:04  5.50 GHz              │
 │pk                                                                            │ 16 LP  RunQ 2.80 1.80 1.30            │
 ╰─┐WIN11-HYBRID16 | +/- cadence | Ctrl+R reload | q quit┌──────────────────────────────────────────────────────────────╯
-╭─┐²mem┌─┐disks┌─┐io┌──────────────────┐Disk I/O┌╮╭─┐⁴proc┌───────────────────────────────────┐< cpu lazy ↓ >┌──┐1/52┌─╮
+╭─┐²mem┌─┐disks┌─┐io┌──────────────────┐Disk I/O┌╮╭─┐⁴proc┌─┐S:svc┌───────────────────────────┐< cpu lazy ↓ >┌──┐1/52┌─╮
 │ Disk I/O (split R/W)  d:disks  i:mem           ││     Pid Program                     Thr     MemB    Graph    Cpu%  │
 │ C:\ Windows      R:175 MiB/s W:88.0 MiB/s  38% ││    4216 rust-analyzer.exe            18     1.4G ████████    12.8 █│
 │                                    ⡇⢸ ⡇⢸ ⡇⢸ ⡇⢸ ││    4100 Code.exe                     48     642M ▅▅▄▅▅▄▅▅     5.3 ││

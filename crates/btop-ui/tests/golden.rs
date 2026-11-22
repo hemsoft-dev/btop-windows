@@ -519,3 +519,85 @@ fn golden_proc_detail_ppl_120x40() {
     let rendered = render_proc_detail_golden(720);
     insta::assert_snapshot!("proc_detail_ppl_120x40", rendered);
 }
+
+fn render_services_golden(is_elevated: bool) -> String {
+    let mut snapshots =
+        parse_jsonl_file(&fixture_path("win11-16core-dual-gpu-desktop.jsonl")).expect("fixture");
+    let services = vec![
+        btop_model::ServiceEntry {
+            name: "Spooler".to_owned(),
+            display_name: "Print Spooler".to_owned(),
+            state: "Start Pending".to_owned(),
+            start_type: "Auto".to_owned(),
+            pid: Some(4216),
+        },
+        btop_model::ServiceEntry {
+            name: "wuauserv".to_owned(),
+            display_name: "Windows Update".to_owned(),
+            state: "Stop Pending".to_owned(),
+            start_type: "Manual".to_owned(),
+            pid: Some(4216),
+        },
+        btop_model::ServiceEntry {
+            name: "W32Time".to_owned(),
+            display_name: "Windows Time".to_owned(),
+            state: "Running".to_owned(),
+            start_type: "Auto".to_owned(),
+            pid: Some(720),
+        },
+        btop_model::ServiceEntry {
+            name: "EventLog".to_owned(),
+            display_name: "Windows Event Log".to_owned(),
+            state: "Running".to_owned(),
+            start_type: "Auto".to_owned(),
+            pid: Some(720),
+        },
+        btop_model::ServiceEntry {
+            name: "Fax".to_owned(),
+            display_name: "Fax".to_owned(),
+            state: "Stopped".to_owned(),
+            start_type: "Disabled".to_owned(),
+            pid: None,
+        },
+    ];
+    for snap in &mut snapshots {
+        snap.services = btop_model::DataState::Available(services.clone());
+    }
+    let mut history = UiHistory::default();
+    for _ in 0..8 {
+        for snap in &snapshots {
+            history.push(snap);
+        }
+    }
+    let latest = snapshots.last().expect("non-empty fixture");
+    let config = Config {
+        shown_boxes: "cpu mem net proc".to_owned(),
+        ..Config::default()
+    };
+    let mut state = btop_ui::UiState::from_config(&config);
+    state.services.active = true;
+    state.services.is_elevated = is_elevated;
+    btop_ui::render_frame(
+        latest,
+        &history,
+        &state,
+        &config,
+        Size {
+            width: 120,
+            height: 40,
+        },
+    )
+    .to_plain_text()
+}
+
+#[test]
+fn golden_services_disabled_120x40() {
+    let rendered = render_services_golden(false);
+    insta::assert_snapshot!("services_disabled_120x40", rendered);
+}
+
+#[test]
+fn golden_services_elevated_120x40() {
+    let rendered = render_services_golden(true);
+    insta::assert_snapshot!("services_elevated_120x40", rendered);
+}

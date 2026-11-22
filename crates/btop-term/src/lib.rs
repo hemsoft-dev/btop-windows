@@ -75,6 +75,7 @@ impl Cell {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HitAction {
     ToggleBox(String),
+    ToggleServicesView,
     SelectProcess(u32),
     OpenMenu(String),
 }

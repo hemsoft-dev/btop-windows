@@ -12,6 +12,7 @@ pub mod pdh;
 pub mod power;
 pub mod proc_actions;
 pub mod proc_info;
+pub mod services;
 
 use core::mem::{offset_of, size_of};
 
@@ -37,6 +38,10 @@ pub use proc_info::{
     is_ps_protection_active, query_nt_device_drive_map, query_process_command_line,
     query_process_command_line_state, query_process_image_path, query_process_metadata,
     query_process_owner, translate_nt_device_path,
+};
+pub use services::{
+    RawServiceInfo, ServiceActionError, decode_service_start_type, decode_service_state,
+    enumerate_windows_services, is_process_elevated, start_windows_service, stop_windows_service,
 };
 
 /// Matches `UNICODE_STRING` in `winternl.h` (16 bytes on 64-bit targets).

@@ -18,6 +18,7 @@ use crate::math::cpu_busy_percent;
 use crate::mem::MemoryCollector;
 use crate::net::NetCollector;
 use crate::proc::ProcessCollector;
+use crate::services::ServiceCollector;
 use crate::{CollectError, SnapshotSource};
 
 /// Aggregation mode for live CPU frequency derived from PDH `% Processor Performance`.
@@ -316,6 +317,7 @@ pub struct LiveCollector {
     disks: DiskCollector,
     net: NetCollector,
     procs: ProcessCollector,
+    services: ServiceCollector,
     battery: BatteryCollector,
     runq: RunQueueEwma,
     last_runq_instant: Option<Instant>,
@@ -353,6 +355,7 @@ impl LiveCollector {
             disks,
             net,
             procs,
+            services: ServiceCollector::new(),
             battery: BatteryCollector::new(),
             runq: RunQueueEwma::default(),
             last_runq_instant: None,
@@ -409,6 +412,7 @@ impl SnapshotSource for LiveCollector {
             }
         };
 
+        let services = self.services.sample();
         let battery = self.battery.sample();
 
         Ok(Snapshot {
@@ -421,6 +425,7 @@ impl SnapshotSource for LiveCollector {
             disks,
             net,
             processes,
+            services,
             battery,
             ..Snapshot::default()
         })
@@ -428,6 +433,18 @@ impl SnapshotSource for LiveCollector {
 
     fn set_freq_mode(&mut self, mode: FreqMode) {
         self.cpu.set_freq_mode(mode);
+    }
+
+    fn set_services_active(&mut self, active: bool) {
+        self.services.set_active(active);
+    }
+
+    fn request_services_refresh(&mut self) {
+        self.services.request_refresh();
+    }
+
+    fn poll_services_only(&mut self) -> Option<DataState<Vec<btop_model::ServiceEntry>>> {
+        Some(self.services.sample())
     }
 
     fn allows_live_actions(&self) -> bool {
