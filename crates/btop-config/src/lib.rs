@@ -312,6 +312,9 @@ impl Config {
                 "color_theme = \"{color_theme}\"\n\n",
                 "#* Show theme background color; set False for terminal transparency.\n",
                 "theme_background = {theme_background}\n\n",
+                "#* Preserved upstream display flags (Windows 11 Terminal is TrueColor natively).\n",
+                "truecolor = {truecolor}\n",
+                "force_tty = {force_tty}\n\n",
                 "#* Rounded corners on boxes.\n",
                 "rounded_corners = {rounded_corners}\n\n",
                 "#* Use DEC 2026 synchronized output sequences to prevent tearing.\n",
@@ -351,6 +354,8 @@ impl Config {
             ),
             color_theme = sanitize_conf_str(&self.color_theme),
             theme_background = bool_title(self.theme_background),
+            truecolor = bool_title(self.truecolor),
+            force_tty = bool_title(self.force_tty),
             rounded_corners = bool_title(self.rounded_corners),
             terminal_sync = bool_title(self.terminal_sync),
             background_update = bool_title(self.background_update),
@@ -635,9 +640,7 @@ fn bool_title(v: bool) -> &'static str {
 }
 
 fn sanitize_conf_str(s: &str) -> String {
-    s.chars()
-        .filter(|&ch| !matches!(ch, '\r' | '\n' | '"'))
-        .collect()
+    s.chars().filter(|&ch| !matches!(ch, '\r' | '\n')).collect()
 }
 
 fn sanitize_conf_key(s: &str) -> String {
@@ -770,15 +773,19 @@ mod tests {
     fn roundtrip_save_preserves_unknown_unix_keys_and_mutated_settings() {
         let initial = concat!(
             "color_theme = \"Default\"\n",
+            "truecolor = False\n",
+            "force_tty = True\n",
             "update_ms = 2000\n",
             "vim_keys = False\n",
             "save_config_on_exit = True\n",
             "use_fstab = True\n",
             "zfs_arc_cached = True\n",
             "proc_info_smaps = False\n",
-            "custom_unix_sensor = \"coretemp/Package id 0\"\n",
+            "custom_unix_sensor = \"coretemp/Package \"0\"\"\n",
         );
         let mut cfg = Config::parse(initial).expect("parse initial conf");
+        assert!(!cfg.truecolor);
+        assert!(cfg.force_tty);
         assert_eq!(cfg.preserved_unknown.len(), 4);
 
         // Mutate settings as a user would in Options / hotkeys.
@@ -792,7 +799,7 @@ mod tests {
         cfg.proc_tree = true;
         cfg.proc_per_core = true;
         cfg.proc_mem_bytes = false;
-        cfg.custom_gpu_names[0] = "RTX 5090".to_owned();
+        cfg.custom_gpu_names[0] = "RTX \"5090\"".to_owned();
 
         let unique = format!(
             "btop-windows-roundtrip-{}-{}.conf",
@@ -811,6 +818,8 @@ mod tests {
         let reloaded = Config::parse(&saved_text).expect("re-parse saved conf");
         assert_eq!(reloaded.color_theme, "tokyo-night");
         assert!(!reloaded.theme_background);
+        assert!(!reloaded.truecolor);
+        assert!(reloaded.force_tty);
         assert_eq!(reloaded.update_ms, 1200);
         assert!(reloaded.vim_keys);
         assert!(reloaded.disable_mouse);
@@ -820,7 +829,7 @@ mod tests {
         assert!(reloaded.proc_tree);
         assert!(reloaded.proc_per_core);
         assert!(!reloaded.proc_mem_bytes);
-        assert_eq!(reloaded.custom_gpu_name(0), Some("RTX 5090"));
+        assert_eq!(reloaded.custom_gpu_name(0), Some("RTX \"5090\""));
 
         // All unknown Unix keys must survive cleanly verbatim.
         assert_eq!(
@@ -849,7 +858,7 @@ mod tests {
                 .preserved_unknown
                 .get("custom_unix_sensor")
                 .map(String::as_str),
-            Some("coretemp/Package id 0")
+            Some("coretemp/Package \"0\"")
         );
     }
 

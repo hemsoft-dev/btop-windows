@@ -14,7 +14,7 @@ Legend:
 | Flag | Status | Target Milestone | Windows 11 v1 notes |
 | --- | --- | --- | --- |
 | `-c, --config <file>` | Parity | M1 | Overrides default `%APPDATA%\btop-windows\btop.conf` and portable exe-adjacent `btop.conf`. |
-| `-d, --debug` | Parity | M1 | Enables debug log level and frame/collector timing overlay. |
+| `-d, --debug` | Mapped | M1 | CLI flag accepted; live frame/collector debug overlay deferred post-v1. |
 | `-f, --filter <filter>` | Parity | M3 | Sets initial process/service filter (prefix `!` for regex). |
 | `--force-utf` | Deferred (post-v1) | Post-v1 | Windows 11 Terminal is UTF-8 by default; flag accepted as no-op. |
 | `-l, --low-color` | Deferred (post-v1) | Post-v1 | Windows 11 Terminal supports 24-bit TrueColor natively. |
@@ -92,12 +92,12 @@ All 48 upstream `.theme` keys from `src/btop_theme.cpp` are supported in 24-bit 
 
 ## 6. v1 parity verification sign-off
 
-Every v1-scoped row in Sections 1 through 5 has been verified on English Windows 11 x64 (`x86_64-pc-windows-msvc`) and in portable CI (`cargo test --workspace`):
+The implemented v1 behaviors in Sections 1 through 5 are covered by automated tests (`cargo test --workspace` on Linux portable CI and English Windows 11 x64 `x86_64-pc-windows-msvc`) and live Windows Terminal captures:
 
 | Area | Verification evidence |
 | --- | --- |
-| CLI flags & config (`-c`, `-d`, `-f`, `-p`, `-u`, `--themes-dir`, `--default-config`, `--record`, `--replay`) | `apps/btop-windows/src/main.rs`, `apps/btop-windows/tests/record_replay.rs`, `crates/btop-config/src/lib.rs` (portable exe-adjacent + `%APPDATA%\btop-windows\btop.conf` resolution and roundtrip unknown-key preservation). |
-| Panels (`cpu`, `mem` + `disks`/I/O, `net`, `proc` + `services`, `gpu0..gpu5`, battery) | `crates/btop-ui/tests/golden.rs` (53 deterministic golden snapshots across `80x24`, `120x40`, `200x60`) and live Windows Terminal captures across M1-M5. |
+| CLI flags & config (`-c`, `-f`, `-p`, `-u`, `--themes-dir`, `--default-config`, `--record`, `--replay`; `-d` accepted as CLI flag) | `apps/btop-windows/src/main.rs`, `apps/btop-windows/tests/record_replay.rs`, `crates/btop-config/src/lib.rs` (portable exe-adjacent + `%APPDATA%\btop-windows\btop.conf` resolution and roundtrip unknown-key and deferred-key preservation). |
+| Panels (`cpu`, `mem` + `disks`/I/O, `net`, `proc` + `services`, `gpu0..gpu5`, battery) | `crates/btop-ui/tests/golden.rs` (53 deterministic golden snapshots across `80x24`, `120x40`, `200x60`), `crates/btop-collect` unit tests, and live Windows Terminal captures across M1-M5. |
 | Overlay menus (`Esc`/`m`, `F2`/`o`, `F1`/`?`/`h`/`H`, `MessageBox`) & 48-key `.theme` engine | `crates/btop-ui/src/menu.rs`, `crates/btop-ui/src/menu_render.rs`, `crates/btop-config/src/theme.rs`, 10 bundled Apache-2.0 themes + `NOTICE`, and live theme-preview / transparent-background WT captures. |
-| Full mouse `HitMap` clicks, scroll wheel, `disable_mouse`, and `vim_keys` (`h/j/k/l/g/G`, `H`, `K`) | `apps/btop-windows/src/lib.rs` and `apps/btop-windows/src/menu_input.rs` unit tests covering every panel hotkey, sort header, process/service row, wheel scroll, and menu action, plus live Windows Terminal capture. |
+| Full mouse `HitMap` clicks, scroll wheel, `disable_mouse`, and `vim_keys` (`h/j/k/l/g/G`, `H`, `K`) | `apps/btop-windows/src/lib.rs` and `apps/btop-windows/src/menu_input.rs` unit tests covering panel hotkeys, sort headers, process/service rows, wheel scroll, and menu actions, plus live Windows Terminal capture. |
 | Safety invariants (no kernel drivers, terminal restore on exit/Ctrl+C/panic, `CreateTime` + `IsProcessCritical` kill guard, `unsafe` isolated to `btop-sys`) | `#![forbid(unsafe_code)]` on `btop-model`, `btop-config`, `btop-ui`; `crates/btop-sys` layout assertions and safety tests; `TerminalGuard` RAII restore verified on Windows 11 Terminal. |

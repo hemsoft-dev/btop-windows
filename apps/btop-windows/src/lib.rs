@@ -3278,9 +3278,17 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_nanos())
         ));
+        let snap = btop_model::fixtures::win11_16core_dual_gpu_desktop()[0].clone();
         let mut cfg = Config::parse("use_fstab = True\nsave_config_on_exit = True\n")
             .expect("parse initial conf");
         let mut state = UiState::from_config(&cfg);
+        state.net.observe_snapshot(&snap);
+        state.net.select_next(&snap);
+        let expected_iface = state
+            .net
+            .selected_iface_name
+            .clone()
+            .expect("selected adapter name after cycling");
         state.proc.toggle_tree();
         state.proc.toggle_reverse();
         state.net.toggle_auto();
@@ -3312,6 +3320,7 @@ mod tests {
         assert!(reloaded.proc_tree);
         assert!(reloaded.proc_reversed);
         assert!(!reloaded.net_auto);
+        assert_eq!(reloaded.net_iface, expected_iface);
         assert_eq!(
             reloaded
                 .preserved_unknown

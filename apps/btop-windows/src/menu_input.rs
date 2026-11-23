@@ -39,6 +39,9 @@ pub fn sync_config_from_ui_state(config: &mut Config, ui_state: &UiState) {
     config.mem_below_net = ui_state.layout.mem_below_net;
     config.show_disks = ui_state.show_disks;
     config.io_mode = ui_state.io_mode;
+    if let Some(ref iface) = ui_state.net.selected_iface_name {
+        iface.clone_into(&mut config.net_iface);
+    }
     config.net_auto = ui_state.net.auto_scale;
     config.net_sync = ui_state.net.synced_scale;
     ui_state
@@ -688,6 +691,7 @@ pub fn sync_option_to_runtime(
         OptionId::NetIface => {
             let trimmed = config.net_iface.trim();
             ui_state.net.preferred_iface = (!trimmed.is_empty()).then(|| trimmed.to_owned());
+            ui_state.net.selected_iface_name = None;
             ui_state.net.observe_snapshot(snapshot);
         }
         _ => {}
