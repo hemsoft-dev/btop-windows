@@ -9,7 +9,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
 use btop_collect::{CollectError, FreqMode, Sampler, SnapshotSource};
-use btop_config::{Config, ConfigError};
+use btop_config::{Config, ConfigError, ThemeSearchPaths};
 use btop_model::{DataState, RecordStats, SnapshotRecorder};
 use btop_sys::{
     PriorityClass, ServiceActionError, graceful_close_process, is_process_elevated,
@@ -22,8 +22,8 @@ use btop_term::{
 };
 use btop_ui::{
     BoxId, OverlayMenu, ProcActionModal, UiHistory, UiPriorityClass, UiState, build_visible_rows,
-    build_visible_service_rows, compute_layout, is_modal_visible, modal_rect, visible_proc_rows,
-    visible_service_rows,
+    build_visible_service_rows, compute_layout, is_modal_visible, modal_rect, theme::ThemePalette,
+    visible_proc_rows, visible_service_rows,
 };
 use menu_input::{LoopAction, handle_menu_key, handle_menu_mouse, try_open_menu_shortcut};
 use thiserror::Error;
@@ -52,6 +52,7 @@ pub struct ConfigOverrides {
     pub update_ms: Option<u32>,
     pub preset: Option<u8>,
     pub filter: Option<String>,
+    pub themes_dir: Option<PathBuf>,
     pub force_tty: bool,
     pub low_color: bool,
 }
@@ -191,6 +192,13 @@ impl Drop for ResetBoolOnDrop {
 
 fn build_ui_state(config: &Config, overrides: &ConfigOverrides) -> UiState {
     let mut ui_state = UiState::from_config(config);
+    let theme_paths = ThemeSearchPaths::resolve(overrides.themes_dir.as_deref());
+    ui_state.available_themes = theme_paths.discover_themes();
+    ui_state.resolved_theme = Some(ThemePalette::resolve(
+        &config.color_theme,
+        config.theme_background,
+        &theme_paths,
+    ));
     ui_state.tz_offset_secs = btop_sys::local_utc_offset_secs();
     ui_state.services.is_elevated = is_process_elevated();
     if let Some(preset) = overrides.preset {
@@ -458,6 +466,7 @@ fn handle_tui_event(
                 Some(sampler),
                 snapshot,
                 config,
+                overrides.themes_dir.as_deref(),
                 ui_state,
                 prev_grid,
             );
@@ -523,32 +532,47 @@ fn handle_tui_event(
             *prev_grid = None;
             LoopAction::Redraw
         }
-        TermEvent::Mouse(mouse) => {
-            if config.disable_mouse {
-                return LoopAction::None;
-            }
-            if ui_state.menu.is_some() {
-                let outcome = handle_menu_mouse(
-                    mouse,
-                    *size,
-                    Some(sampler),
-                    snapshot,
-                    config,
-                    ui_state,
-                    prev_grid,
-                );
-                sampler.set_services_active(should_poll_services(*size, ui_state));
-                return outcome;
-            }
-            bool_to_loop_action(handle_mouse_event(
-                mouse,
-                *size,
-                ui_state,
-                Some(sampler),
-                prev_grid,
-            ))
-        }
+        TermEvent::Mouse(mouse) => handle_tui_mouse(
+            mouse, *size, sampler, snapshot, config, overrides, ui_state, prev_grid,
+        ),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_tui_mouse(
+    mouse: btop_term::MouseEvent,
+    size: Size,
+    sampler: &Sampler,
+    snapshot: &btop_model::Snapshot,
+    config: &mut Config,
+    overrides: &ConfigOverrides,
+    ui_state: &mut UiState,
+    prev_grid: &mut Option<Grid>,
+) -> LoopAction {
+    if config.disable_mouse {
+        return LoopAction::None;
+    }
+    if ui_state.menu.is_some() {
+        let outcome = handle_menu_mouse(
+            mouse,
+            size,
+            Some(sampler),
+            snapshot,
+            config,
+            overrides.themes_dir.as_deref(),
+            ui_state,
+            prev_grid,
+        );
+        sampler.set_services_active(should_poll_services(size, ui_state));
+        return outcome;
+    }
+    bool_to_loop_action(handle_mouse_event(
+        mouse,
+        size,
+        ui_state,
+        Some(sampler),
+        prev_grid,
+    ))
 }
 
 const fn bool_to_loop_action(changed: bool) -> LoopAction {
@@ -1721,6 +1745,7 @@ mod tests {
             update_ms: Some(500),
             preset: Some(2),
             filter: Some("!rust".to_owned()),
+            themes_dir: None,
             force_tty: false,
             low_color: false,
         };
@@ -2079,6 +2104,7 @@ mod tests {
                 None,
                 &snap,
                 &mut cfg,
+                None,
                 &mut state,
                 &mut prev_grid,
             ),
@@ -2086,7 +2112,7 @@ mod tests {
         );
         assert!(matches!(state.menu, Some(OverlayMenu::Options(_))));
 
-        // Right arrow cycles color_theme live to Dracula.
+        // Right arrow cycles color_theme live to dracula.
         let plain_key = |code| btop_term::KeyEvent {
             code,
             ctrl: false,
@@ -2100,12 +2126,13 @@ mod tests {
                 None,
                 &snap,
                 &mut cfg,
+                None,
                 &mut state,
                 &mut prev_grid,
             ),
             LoopAction::Redraw
         );
-        assert_eq!(cfg.color_theme, "Dracula");
+        assert_eq!(cfg.color_theme, "dracula");
 
         // Pressing 'r' opens Reset Options MessageBox; toggling Left keeps return_to intact;
         // clicking Yes resets color_theme to Default and returns cleanly to Options.
@@ -2116,6 +2143,7 @@ mod tests {
                 None,
                 &snap,
                 &mut cfg,
+                None,
                 &mut state,
                 &mut prev_grid,
             ),
@@ -2128,6 +2156,7 @@ mod tests {
                 None,
                 &snap,
                 &mut cfg,
+                None,
                 &mut state,
                 &mut prev_grid,
             ),
@@ -2147,6 +2176,7 @@ mod tests {
                 None,
                 &snap,
                 &mut cfg,
+                None,
                 &mut state,
                 &mut prev_grid,
             ),
@@ -2209,12 +2239,13 @@ mod tests {
                 None,
                 &snap,
                 &mut cfg,
+                None,
                 &mut state,
                 &mut prev_grid,
             ),
             LoopAction::Redraw
         );
-        assert_eq!(cfg.color_theme, "Dracula");
+        assert_eq!(cfg.color_theme, "dracula");
 
         // All unrelated session state must remain completely intact!
         assert!(state.proc.paused);
