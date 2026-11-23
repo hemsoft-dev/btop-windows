@@ -6,6 +6,20 @@ inspired by and aiming for configuration, theme, and UX compatibility with
 btop++ (https://github.com/aristocratos/btop), Copyright 2021-2026 Aristocratos
 (Jakob P. Liljenberg), licensed under the Apache License, Version 2.0.
 
-Upstream theme files bundled from aristocratos/btop (when added in M5) retain
-their original Apache-2.0 license and attribution, with any Windows-specific
-adaptations clearly noted.
+Bundled Apache-2.0 Theme Files
+------------------------------
+The curated `.theme` files shipped under `themes/` and embedded into
+`btop-config` are adapted from upstream `aristocratos/btop` themes under the
+Apache License, Version 2.0, with v1.4 pause/follow banner keys populated for
+Windows 11 TrueColor rendering:
+
+- themes/dracula.theme
+- themes/tokyo-night.theme
+- themes/gruvbox_dark_v2.theme
+- themes/nord.theme
+- themes/onedark.theme
+- themes/kanagawa-wave.theme
+- themes/solarized_dark.theme
+- themes/monokai.theme
+- themes/everforest-dark-medium.theme
+- themes/adwaita-dark.theme

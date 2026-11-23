@@ -75,6 +75,11 @@ pub struct UiState {
     pub modal: Option<ProcActionModal>,
     /// Optional dimmed overlay menu (Main, Options, Help, or `MessageBox`).
     pub menu: Option<OverlayMenu>,
+    /// Pre-resolved `TrueColor` palette (loaded from `--themes-dir`, exe `themes\`, `%APPDATA%`, or bundle)
+    /// so `render_frame` stays pure with zero per-frame filesystem I/O.
+    pub resolved_theme: Option<ThemePalette>,
+    /// Available theme names discovered across search directories plus the built-in bundle.
+    pub available_themes: Vec<String>,
 }
 
 impl Default for UiState {
@@ -89,6 +94,11 @@ impl Default for UiState {
             tz_offset_secs: 0,
             modal: None,
             menu: None,
+            resolved_theme: None,
+            available_themes: theme::BUILTIN_THEME_NAMES
+                .iter()
+                .map(|&s| s.to_owned())
+                .collect(),
         }
     }
 }
@@ -105,6 +115,11 @@ impl UiState {
             tz_offset_secs: 0,
             modal: None,
             menu: None,
+            resolved_theme: None,
+            available_themes: theme::BUILTIN_THEME_NAMES
+                .iter()
+                .map(|&s| s.to_owned())
+                .collect(),
         }
     }
 
@@ -516,7 +531,9 @@ pub fn render_frame(
     size: Size,
 ) -> Grid {
     let mut grid = Grid::new(size);
-    let theme = ThemePalette::for_name(&config.color_theme, config.theme_background);
+    let theme = state
+        .resolved_theme
+        .unwrap_or_else(|| ThemePalette::for_name(&config.color_theme, config.theme_background));
 
     match compute_layout(size, &state.layout) {
         Ok(layout) => {

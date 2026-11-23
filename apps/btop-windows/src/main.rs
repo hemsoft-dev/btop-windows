@@ -84,6 +84,7 @@ fn main() -> ExitCode {
         update_ms: cli.update_ms,
         preset: cli.preset,
         filter: cli.filter,
+        themes_dir: cli.themes_dir,
         force_tty: cli.tty,
         low_color: cli.low_color,
     };

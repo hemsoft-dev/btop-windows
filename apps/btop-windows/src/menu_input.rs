@@ -1,14 +1,16 @@
 //! Keyboard, mouse, and live configuration synchronization for the overlay menu stack
 //! (Main, Options, Help, and `MessageBox`).
 
+use std::path::Path;
+
 use btop_collect::{FreqMode, Sampler};
-use btop_config::Config;
+use btop_config::{Config, ThemeSearchPaths};
 use btop_model::Snapshot;
 use btop_term::{Grid, HitAction, KeyCode, KeyEvent, MouseButton, MouseEvent, MouseKind, Size};
 use btop_ui::{
     LayoutState, MainMenuChoice, MessageBoxAction, MessageBoxResult, MessageBoxState, NetViewState,
     OptionCategory, OptionId, OptionKind, OverlayMenu, ProcSort, ProcViewState, UiState,
-    help_visible_rows, options_visible_rows, parse_shown_boxes,
+    help_visible_rows, options_visible_rows, parse_shown_boxes, theme::ThemePalette,
 };
 
 /// Result of handling an input event inside the main TUI event loop.
@@ -44,12 +46,14 @@ pub fn try_open_menu_shortcut(
 }
 
 /// Handles keyboard input while an [`OverlayMenu`] is active.
+#[allow(clippy::too_many_arguments)]
 pub fn handle_menu_key(
     key: KeyEvent,
     size: Size,
     sampler: Option<&Sampler>,
     snapshot: &Snapshot,
     config: &mut Config,
+    themes_dir: Option<&Path>,
     ui_state: &mut UiState,
     prev_grid: &mut Option<Grid>,
 ) -> LoopAction {
@@ -68,6 +72,7 @@ pub fn handle_menu_key(
             key.shift,
             size,
             config,
+            &ui_state.available_themes,
             state,
             &mut changed_option,
         ),
@@ -75,13 +80,13 @@ pub fn handle_menu_key(
         OverlayMenu::MessageBox { dialog, .. } => {
             let result = dialog.handle_key(key.code);
             return apply_messagebox_result(
-                result, sampler, snapshot, config, ui_state, prev_grid, menu,
+                result, sampler, snapshot, config, themes_dir, ui_state, prev_grid, menu,
             );
         }
     };
 
     if let Some(opt) = changed_option {
-        sync_option_to_runtime(opt, config, sampler, snapshot, ui_state);
+        sync_option_to_runtime(opt, config, sampler, snapshot, themes_dir, ui_state);
     }
 
     match action {
@@ -109,12 +114,14 @@ pub fn handle_menu_key(
 }
 
 /// Handles mouse click and scroll events while an [`OverlayMenu`] is active.
+#[allow(clippy::too_many_arguments)]
 pub fn handle_menu_mouse(
     mouse: MouseEvent,
     size: Size,
     sampler: Option<&Sampler>,
     snapshot: &Snapshot,
     config: &mut Config,
+    themes_dir: Option<&Path>,
     ui_state: &mut UiState,
     prev_grid: &mut Option<Grid>,
 ) -> LoopAction {
@@ -178,7 +185,7 @@ pub fn handle_menu_mouse(
                 if let Some(opt) = opts.selected_option() {
                     match opt.kind() {
                         OptionKind::Bool | OptionKind::Enum => {
-                            if opt.step(config, 1) {
+                            if opt.step_with_themes(config, 1, &ui_state.available_themes) {
                                 changed_opt = Some(opt);
                             }
                         }
@@ -192,7 +199,7 @@ pub fn handle_menu_mouse(
                 opts.select_index(idx, vis);
             }
             if let Some(opt) = changed_opt {
-                sync_option_to_runtime(opt, config, sampler, snapshot, ui_state);
+                sync_option_to_runtime(opt, config, sampler, snapshot, themes_dir, ui_state);
             }
             ui_state.menu = Some(menu);
             *prev_grid = None;
@@ -201,7 +208,7 @@ pub fn handle_menu_mouse(
         (OverlayMenu::MessageBox { dialog, .. }, HitAction::MessageBoxButton(confirm)) => {
             let result = dialog.handle_button_click(confirm);
             return apply_messagebox_result(
-                result, sampler, snapshot, config, ui_state, prev_grid, menu,
+                result, sampler, snapshot, config, themes_dir, ui_state, prev_grid, menu,
             );
         }
         _ => {}
@@ -322,6 +329,7 @@ fn handle_options_key(
     shift: bool,
     size: Size,
     config: &mut Config,
+    available_themes: &[String],
     state: &mut btop_ui::OptionsState,
     changed_option: &mut Option<OptionId>,
 ) -> MenuKeyOutcome {
@@ -383,7 +391,7 @@ fn handle_options_key(
         KeyCode::Left | KeyCode::Right => {
             let dir = if code == KeyCode::Right { 1 } else { -1 };
             let opt = state.selected_option();
-            let changed = opt.is_some_and(|o| o.step(config, dir));
+            let changed = opt.is_some_and(|o| o.step_with_themes(config, dir, available_themes));
             if changed {
                 state.validation_error = None;
                 *changed_option = opt;
@@ -391,7 +399,7 @@ fn handle_options_key(
             MenuKeyOutcome::KeepOpen(changed)
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
-            activate_selected_option(config, state, changed_option)
+            activate_selected_option(config, available_themes, state, changed_option)
         }
         KeyCode::Char('r' | 'R') => {
             let dialog = MessageBoxState::yes_no(
@@ -414,6 +422,7 @@ fn handle_options_key(
 
 fn activate_selected_option(
     config: &mut Config,
+    available_themes: &[String],
     state: &mut btop_ui::OptionsState,
     changed_option: &mut Option<OptionId>,
 ) -> MenuKeyOutcome {
@@ -422,7 +431,7 @@ fn activate_selected_option(
     };
     match opt.kind() {
         OptionKind::Bool | OptionKind::Enum => {
-            let changed = opt.step(config, 1);
+            let changed = opt.step_with_themes(config, 1, available_themes);
             if changed {
                 state.validation_error = None;
                 *changed_option = Some(opt);
@@ -489,6 +498,7 @@ fn apply_messagebox_result(
     sampler: Option<&Sampler>,
     snapshot: &Snapshot,
     config: &mut Config,
+    themes_dir: Option<&Path>,
     ui_state: &mut UiState,
     prev_grid: &mut Option<Grid>,
     current_menu: OverlayMenu,
@@ -507,7 +517,7 @@ fn apply_messagebox_result(
         MessageBoxResult::Confirmed(MessageBoxAction::QuitApp) => LoopAction::Quit,
         MessageBoxResult::Confirmed(MessageBoxAction::ResetOptionsToDefaults) => {
             *config = Config::default();
-            reset_runtime_from_defaults(config, sampler, snapshot, ui_state);
+            reset_runtime_from_defaults(config, sampler, snapshot, themes_dir, ui_state);
             ui_state.menu = parent;
             *prev_grid = None;
             LoopAction::Redraw
@@ -529,9 +539,18 @@ pub fn sync_option_to_runtime(
     config: &mut Config,
     sampler: Option<&Sampler>,
     snapshot: &Snapshot,
+    themes_dir: Option<&Path>,
     ui_state: &mut UiState,
 ) {
     match opt {
+        OptionId::ColorTheme | OptionId::ThemeBackground => {
+            let paths = ThemeSearchPaths::resolve(themes_dir);
+            ui_state.resolved_theme = Some(ThemePalette::resolve(
+                &config.color_theme,
+                config.theme_background,
+                &paths,
+            ));
+        }
         OptionId::UpdateMs => {
             if let Some(s) = sampler {
                 config.update_ms = s.set_update_ms(config.update_ms);
@@ -586,8 +605,16 @@ fn reset_runtime_from_defaults(
     config: &mut Config,
     sampler: Option<&Sampler>,
     snapshot: &Snapshot,
+    themes_dir: Option<&Path>,
     ui_state: &mut UiState,
 ) {
+    let paths = ThemeSearchPaths::resolve(themes_dir);
+    ui_state.available_themes = paths.discover_themes();
+    ui_state.resolved_theme = Some(ThemePalette::resolve(
+        &config.color_theme,
+        config.theme_background,
+        &paths,
+    ));
     if let Some(s) = sampler {
         config.update_ms = s.set_update_ms(config.update_ms);
         s.set_freq_mode(FreqMode::from_config_str(&config.freq_mode));

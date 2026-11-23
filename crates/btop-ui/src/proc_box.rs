@@ -1273,7 +1273,7 @@ fn render_proc_row(
     let cpu_fg = if highlighted {
         base_fg
     } else {
-        theme.cpu_gradient(cpu_display.min(100.0))
+        theme.process_gradient(cpu_display.min(100.0))
     };
 
     grid.write_str(cols.col_pid, y, &pid_str, base_fg, row_bg, highlighted);
@@ -1340,7 +1340,7 @@ fn draw_proc_sparkline(
         let ratio = (val / peak).clamp(0.0, 1.0);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let level = ((ratio * 7.0).round() as usize).min(7);
-        let fg = theme.cpu_gradient(val.min(100.0));
+        let fg = theme.process_gradient(val.min(100.0));
         grid.set(
             x.saturating_add(u16::try_from(col).unwrap_or(0)),
             y,

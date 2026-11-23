@@ -738,3 +738,67 @@ fn golden_menu_messagebox_120x40() {
         render_overlay_menu_golden(btop_ui::OverlayMenu::message_box(dialog, None), 120, 40);
     insta::assert_snapshot!("menu_messagebox_120x40", rendered);
 }
+
+fn render_theme_golden(theme_name: &str) -> String {
+    let snapshots =
+        parse_jsonl_file(&fixture_path("win11-16core-dual-gpu-desktop.jsonl")).expect("fixture");
+    let mut history = UiHistory::default();
+    for _ in 0..8 {
+        for snap in &snapshots {
+            history.push(snap);
+        }
+    }
+    let latest = snapshots.last().expect("non-empty fixture");
+    let config = Config {
+        color_theme: theme_name.to_owned(),
+        shown_boxes: "cpu mem net proc".to_owned(),
+        ..Config::default()
+    };
+    let grid = btop_ui::render_with_history(
+        latest,
+        &history,
+        &config,
+        Size {
+            width: 120,
+            height: 40,
+        },
+    );
+    let palette = btop_ui::theme::ThemePalette::for_name(theme_name, true);
+    let fmt_color = |c: btop_term::Color| match c {
+        btop_term::Color::Reset => "Reset".to_owned(),
+        btop_term::Color::Rgb(rgb) => format!("#{:02x}{:02x}{:02x}", rgb.r, rgb.g, rgb.b),
+        btop_term::Color::Indexed(i) => format!("idx({i})"),
+    };
+    format!(
+        "theme={} main_bg={} cpu_box={} mem_box={} net_box={} proc_box={} hi_fg={} cpu_grad=({},{},{})\n{}",
+        theme_name,
+        fmt_color(palette.main_bg),
+        fmt_color(palette.cpu_box),
+        fmt_color(palette.mem_box),
+        fmt_color(palette.net_box),
+        fmt_color(palette.proc_box),
+        fmt_color(palette.hi_fg),
+        fmt_color(palette.cpu_gradient(0.0)),
+        fmt_color(palette.cpu_gradient(50.0)),
+        fmt_color(palette.cpu_gradient(100.0)),
+        grid.to_plain_text()
+    )
+}
+
+#[test]
+fn golden_theme_default_120x40() {
+    insta::assert_snapshot!("theme_default_120x40", render_theme_golden("Default"));
+}
+
+#[test]
+fn golden_theme_dracula_120x40() {
+    insta::assert_snapshot!("theme_dracula_120x40", render_theme_golden("dracula"));
+}
+
+#[test]
+fn golden_theme_tokyo_night_120x40() {
+    insta::assert_snapshot!(
+        "theme_tokyo_night_120x40",
+        render_theme_golden("tokyo-night")
+    );
+}

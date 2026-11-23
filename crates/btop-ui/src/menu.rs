@@ -614,9 +614,19 @@ impl OptionId {
 
     /// Toggles booleans or steps enums/integers cleanly (`dir = -1` left, `+1` right).
     pub fn step(self, cfg: &mut Config, dir: i8) -> bool {
+        self.step_with_themes(cfg, dir, &[])
+    }
+
+    /// Like [`Self::step`], using `available_themes` when cycling [`OptionId::ColorTheme`].
+    pub fn step_with_themes(self, cfg: &mut Config, dir: i8, available_themes: &[String]) -> bool {
         match self {
             Self::ColorTheme => {
-                cfg.color_theme = cycle_str(&BUILTIN_THEME_NAMES, &cfg.color_theme, dir);
+                if available_themes.is_empty() {
+                    cfg.color_theme = cycle_str(&BUILTIN_THEME_NAMES, &cfg.color_theme, dir);
+                } else {
+                    let refs: Vec<&str> = available_themes.iter().map(String::as_str).collect();
+                    cfg.color_theme = cycle_str(&refs, &cfg.color_theme, dir);
+                }
             }
             Self::ThemeBackground => cfg.theme_background = !cfg.theme_background,
             Self::RoundedCorners => cfg.rounded_corners = !cfg.rounded_corners,
@@ -1168,7 +1178,7 @@ mod tests {
         // Cycle color_theme for instant live theme preview.
         assert_eq!(opts.selected_option(), Some(OptionId::ColorTheme));
         assert!(OptionId::ColorTheme.step(&mut cfg, 1));
-        assert_eq!(cfg.color_theme, "Dracula");
+        assert_eq!(cfg.color_theme, "dracula");
         assert!(OptionId::ColorTheme.step(&mut cfg, -1));
         assert_eq!(cfg.color_theme, "Default");
 

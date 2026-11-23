@@ -3,10 +3,17 @@
 
 #![forbid(unsafe_code)]
 
+pub mod theme;
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+pub use theme::{
+    ALL_THEME_KEYS, BUNDLED_THEMES, ThemeColor, ThemeError, ThemeGradient101, ThemeRgb,
+    ThemeSearchPaths, ThemeSpec, load_bundled_theme, parse_color_value, parse_theme,
+};
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
