@@ -9,6 +9,36 @@ Read [AGENTS.md](AGENTS.md) before contributing. To keep v1 focused and maintain
 - **Target baseline:** English Windows 11 x64 in Windows Terminal (24-bit TrueColor, UTF-8, Braille/Block graphs).
 - **Deferred post-v1:** Windows 10, non-English locales, legacy ConHost workarounds, ARM64, >64-LP multi-group CPUs, 256-color/16-color TTY fallback, AMD ADLX / Intel IGCL SDKs, external LHM/HWiNFO sensor bridges, and package-manager publishing.
 
+## Install and setup (Windows 11 x64)
+
+`btop-windows` ships as a portable static-CRT `.zip` archive with no Visual C++ Redistributable (`vc_redist`) or kernel driver installation required.
+
+1. Download `btop-windows-<tag>-x86_64-windows.zip` and `SHA256SUMS.txt` from [GitHub Releases](https://github.com/hemsoft-dev/btop-windows/releases).
+2. Verify the download checksum in PowerShell:
+
+   ```powershell
+   Get-FileHash .\btop-windows-<tag>-x86_64-windows.zip -Algorithm SHA256
+   Get-Content .\SHA256SUMS.txt
+   ```
+
+3. Extract the archive into a local folder such as `C:\Tools\btop-windows`:
+
+   ```powershell
+   Expand-Archive .\btop-windows-<tag>-x86_64-windows.zip -DestinationPath C:\Tools\btop-windows
+   ```
+
+   Optionally add `C:\Tools\btop-windows` to your user `PATH` so you can launch `btop-windows` from any directory.
+
+4. Open **Windows Terminal** (recommended font: **Cascadia Mono** or a Nerd Font with Unicode Braille and Block glyph coverage) and run:
+
+   ```powershell
+   btop-windows.exe
+   ```
+
+- **Themes:** Bundled Apache-2.0 `.theme` files live in the extracted `themes\` directory and can be selected live from `Esc` -> **Options** (`color_theme`).
+- **Configuration:** Place a `btop.conf` next to `btop-windows.exe` for portable mode, or let `btop-windows` load and save `%APPDATA%\btop-windows\btop.conf` automatically. Generate a starter config with `btop-windows.exe --default-config`.
+- **Services control:** Viewing Windows Services (`S`) works non-elevated; starting or stopping a service requires launching Windows Terminal as Administrator.
+
 ## Why btop-windows
 
 Upstream `aristocratos/btop` targets Linux, macOS, and BSDs. The separate `aristocratos/btop4win` port remains on the v1.0 codebase: it lacks modern multi-GPU boxes, requires the Visual C++ Redistributable, and depends on LibreHardwareMonitor's WinRing0 kernel driver, which triggers Windows Defender detections on Windows 11.
