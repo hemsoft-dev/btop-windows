@@ -24,8 +24,8 @@ expression: rendered
 │ Avail ■■■■│ b / n                    Select previous / next hardware network adapter                     │▅     5.3 ││
 │ Cache ■■■■│ a / y / z                Toggle auto-scale, sync scale, or reset session totals              │▄     4.2 ││
 │ Free  ■■■■│ ── Processes & Tree ──                                                                       │▄     4.2 ││
-│           │ Up / Down / PgUp / PgDn  Navigate process list (Home / End to jump)                          │▄     3.9 ││
-│           │ Left / Right / r         Cycle sort column / reverse sort order                              │▄     3.9 ││
+│           │ Up / Down / PgUp / PgDn  Navigate process list (j/k/g/G when vim_keys=True)                  │▄     3.9 ││
+│           │ Left / Right / r         Cycle sort column (h/l if vim_keys) / reverse sort                  │▄     3.9 ││
 │───────────│ e / Space / Shift+E      Toggle tree view / collapse branch / collapse all                   │▄     3.6 ││
 │ Commit ■■■│ f or / / Del             Edit process filter (prefix '!' for regex) / clear                  │▄     3.6 ││
 │ Swap   ■■■│ Enter / Esc              Open or close Selected Process Detail overlay                       │▄     3.6 ││
@@ -33,7 +33,7 @@ expression: rendered
 ╰───────────│ c / %                    Toggle per-core CPU% / memory bytes vs percent                      │▃     3.3 ││
 ╭─┐³net┌─┐au│ ── Safe Windows Process & Service Actions ──                                                 │▃     3.0 ││
 │302 Mbps   │ t                        Graceful close via WM_CLOSE (interactive GUI apps)                  │▃     3.0 ││
-│           │ k                        Guarded TerminateProcess (CreateTime + critical guard)              │▃     3.0 ││
+│           │ k (K if vim_keys)        Guarded TerminateProcess (CreateTime + critical guard)              │▃     3.0 ││
 │           │ Shift+N                  Open Windows Priority Class selector (SetPriorityClass)             │▃     2.7 ││
 │           │ Shift+S                  Toggle Windows Services (SCM) view inside PROC panel                │▃     2.7 ││
 │           │ s / x (Services)         Start / Stop selected service (requires Administrator)              │▃     2.4 ││

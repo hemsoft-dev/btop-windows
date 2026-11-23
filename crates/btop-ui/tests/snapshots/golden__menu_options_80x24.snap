@@ -11,17 +11,17 @@ expression: rendered
 │ │  rounded_corners        ◀ True ▶         │                               │ │
 │p│  terminal_sync          ◀ True ▶         │ Active color theme palette    │ │
 ╰─│  background_update      ◀ True ▶         │ with instant live preview.    │─╯
-╭─│  update_ms              2000             │                               │─╮
-│ │  shown_boxes            cpu mem net proc │ Theme preview: Default        │ │
-│ │  clock_format           %X               │ ████████████████              │█│
+╭─│  save_config_on_exit    ◀ True ▶         │                               │─╮
+│ │  update_ms              2000             │ Theme preview: Default        │ │
+│ │  shown_boxes            cpu mem net proc │ ████████████████              │█│
+│ │  clock_format           %X               │                               │││
 │ │  graph_symbol           ◀ braille ▶      │                               │││
 │ │  vim_keys               ◀ False ▶        │                               │││
 │ │  disable_mouse          ◀ False ▶        │                               │││
-│ │  cpu_bottom             ◀ False ▶        │                               │││
-╰─│  proc_left              ◀ False ▶        │                               │││
-╭─│  mem_below_net          ◀ False ▶        │                               │││
+╰─│  cpu_bottom             ◀ False ▶        │                               │││
+╭─│  proc_left              ◀ False ▶        │                               │││
+│ │  mem_below_net          ◀ False ▶        │                               │││
 │ │  show_battery           ◀ True ▶         │                               │││
-│ │                                          │                               │││
 │ │                                          │                               │││
 │ │ ↑↓ select  |  ←→/Enter edit  |  Tab category  |  R reset  |  Esc close   │││
 │ ╰──────────────────────────────────────────────────────────────────────────╯││

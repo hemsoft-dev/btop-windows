@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 
 use btop_config::{Config, DisablePresets};
 use btop_model::{BatterySnapshot, DataState, Snapshot};
-use btop_term::{Grid, Rect};
+use btop_term::{Grid, HitAction, Rect};
 
 use crate::UiState;
 use crate::cpu_box::format_uptime;
@@ -469,7 +469,7 @@ fn render_preset_badge(
     let preset_max = preset_x
         .saturating_add(tag_w)
         .min(span_end.saturating_sub(1));
-    let _ = draw_border_tag(
+    if let Some(preset_rect) = draw_border_tag(
         grid,
         preset_x,
         0,
@@ -480,7 +480,9 @@ fn render_preset_badge(
         theme.hi_fg,
         theme.hi_fg,
         theme.main_bg,
-    );
+    ) {
+        grid.hit_map.push(preset_rect, HitAction::CyclePreset);
+    }
 }
 
 /// Renders top header elements on row `0`: preset badge (`p0`), centered clock (`clock_format`),

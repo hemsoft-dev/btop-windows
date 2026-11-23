@@ -170,6 +170,10 @@ impl MessageBoxState {
     }
 
     pub fn handle_key(&mut self, code: KeyCode) -> MessageBoxResult {
+        self.handle_key_with_vim(code, false)
+    }
+
+    pub fn handle_key_with_vim(&mut self, code: KeyCode, vim_keys: bool) -> MessageBoxResult {
         match self.kind {
             MessageBoxKind::Ok => match code {
                 KeyCode::Enter | KeyCode::Char(' ') => MessageBoxResult::Confirmed(self.action),
@@ -178,6 +182,10 @@ impl MessageBoxState {
             },
             MessageBoxKind::YesNo => match code {
                 KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                    self.selected_confirm = !self.selected_confirm;
+                    MessageBoxResult::Pending
+                }
+                KeyCode::Char('h' | 'l') if vim_keys => {
                     self.selected_confirm = !self.selected_confirm;
                     MessageBoxResult::Pending
                 }
@@ -307,6 +315,7 @@ impl OptionCategory {
                 OptionId::RoundedCorners,
                 OptionId::TerminalSync,
                 OptionId::BackgroundUpdate,
+                OptionId::SaveConfigOnExit,
                 OptionId::UpdateMs,
                 OptionId::ShownBoxes,
                 OptionId::ClockFormat,
@@ -377,6 +386,7 @@ pub enum OptionId {
     RoundedCorners,
     TerminalSync,
     BackgroundUpdate,
+    SaveConfigOnExit,
     UpdateMs,
     ShownBoxes,
     ClockFormat,
@@ -439,6 +449,7 @@ impl OptionId {
             Self::RoundedCorners => "rounded_corners",
             Self::TerminalSync => "terminal_sync",
             Self::BackgroundUpdate => "background_update",
+            Self::SaveConfigOnExit => "save_config_on_exit",
             Self::UpdateMs => "update_ms",
             Self::ShownBoxes => "shown_boxes",
             Self::ClockFormat => "clock_format",
@@ -492,11 +503,12 @@ impl OptionId {
             Self::BackgroundUpdate => {
                 "Keep refreshing live telemetry while overlay menus are open."
             }
+            Self::SaveConfigOnExit => "Save updated settings to btop.conf cleanly on exit.",
             Self::UpdateMs => "Telemetry refresh interval in milliseconds (100..=60000).",
             Self::ShownBoxes => "Space-separated panels: cpu mem net proc gpu0..gpu5.",
             Self::ClockFormat => "Top bar clock format (strftime plus /host /user /uptime).",
             Self::GraphSymbol => "Default graph glyph set: braille, block, or tty.",
-            Self::VimKeys => "Enable h/j/k/l navigation (Help moves from h to Shift+H).",
+            Self::VimKeys => "Enable h/j/k/l/g/G navigation (Help -> Shift+H, Kill -> Shift+K).",
             Self::DisableMouse => "Ignore mouse clicks and wheel events in the TUI.",
             Self::CpuBottom => "Place the CPU box below MEM/NET/PROC panels.",
             Self::ProcLeft => "Place the process panel on the left half of the layout.",
@@ -565,6 +577,7 @@ impl OptionId {
             Self::RoundedCorners => fmt_bool(cfg.rounded_corners),
             Self::TerminalSync => fmt_bool(cfg.terminal_sync),
             Self::BackgroundUpdate => fmt_bool(cfg.background_update),
+            Self::SaveConfigOnExit => fmt_bool(cfg.save_config_on_exit),
             Self::UpdateMs => cfg.update_ms.to_string(),
             Self::ShownBoxes => cfg.shown_boxes.clone(),
             Self::ClockFormat => cfg.clock_format.clone(),
@@ -632,6 +645,7 @@ impl OptionId {
             Self::RoundedCorners => cfg.rounded_corners = !cfg.rounded_corners,
             Self::TerminalSync => cfg.terminal_sync = !cfg.terminal_sync,
             Self::BackgroundUpdate => cfg.background_update = !cfg.background_update,
+            Self::SaveConfigOnExit => cfg.save_config_on_exit = !cfg.save_config_on_exit,
             Self::UpdateMs => {
                 let delta: i32 = if dir >= 0 { 100 } else { -100 };
                 let next = i64::from(cfg.update_ms)
@@ -1033,9 +1047,12 @@ pub const HELP_BINDINGS: &[HelpEntry] = &[
     HelpEntry::section("Processes & Tree"),
     HelpEntry::bind(
         "Up / Down / PgUp / PgDn",
-        "Navigate process list (Home / End to jump)",
+        "Navigate process list (j/k/g/G when vim_keys=True)",
     ),
-    HelpEntry::bind("Left / Right / r", "Cycle sort column / reverse sort order"),
+    HelpEntry::bind(
+        "Left / Right / r",
+        "Cycle sort column (h/l if vim_keys) / reverse sort",
+    ),
     HelpEntry::bind(
         "e / Space / Shift+E",
         "Toggle tree view / collapse branch / collapse all",
@@ -1056,7 +1073,7 @@ pub const HELP_BINDINGS: &[HelpEntry] = &[
     HelpEntry::section("Safe Windows Process & Service Actions"),
     HelpEntry::bind("t", "Graceful close via WM_CLOSE (interactive GUI apps)"),
     HelpEntry::bind(
-        "k",
+        "k (K if vim_keys)",
         "Guarded TerminateProcess (CreateTime + critical guard)",
     ),
     HelpEntry::bind(

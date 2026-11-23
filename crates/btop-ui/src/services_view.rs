@@ -473,8 +473,8 @@ fn render_services_chrome(
     let sort_label = format!("< {} {arrow} >", view.sort.as_str());
     let sort_w = u16::try_from(sort_label.chars().count() + 2).unwrap_or(14);
     let sort_x = pos_x.saturating_sub(sort_w + 2);
-    if sort_x > left_bound.saturating_add(1) {
-        let _ = draw_border_tag(
+    if sort_x > left_bound.saturating_add(1)
+        && let Some(sort_rect) = draw_border_tag(
             grid,
             sort_x,
             rect.y,
@@ -485,7 +485,9 @@ fn render_services_chrome(
             theme.hi_fg,
             theme.hi_fg,
             theme.main_bg,
-        );
+        )
+    {
+        crate::proc_box::register_sort_tag_hits(grid, sort_rect);
     }
 
     render_services_filter_and_footer(grid, rect, left_bound, sort_x, max_top_x, view, theme);
@@ -508,8 +510,8 @@ fn render_services_filter_and_footer(
             let clipped = clip_text(&filter_tag, usize::from(max_filter_w.saturating_sub(2)));
             let filter_w = u16::try_from(clipped.chars().count() + 2).unwrap_or(6);
             let filter_x = sort_x.saturating_sub(filter_w + 1);
-            if filter_x > left_bound {
-                let _ = draw_border_tag(
+            if filter_x > left_bound
+                && let Some(filter_rect) = draw_border_tag(
                     grid,
                     filter_x,
                     rect.y,
@@ -520,7 +522,9 @@ fn render_services_filter_and_footer(
                     theme.hi_fg,
                     theme.hi_fg,
                     theme.main_bg,
-                );
+                )
+            {
+                grid.hit_map.push(filter_rect, HitAction::ProcBeginFilter);
             }
         }
     }
@@ -642,7 +646,17 @@ fn render_services_table(
         let row_idx = scroll + slot;
         let y = cur_y.saturating_add(u16::try_from(slot).unwrap_or(0));
         let is_selected = row_idx == selected;
-        render_service_row(grid, inner.x, y, inner.width, cols, row, is_selected, theme);
+        render_service_row(
+            grid,
+            inner.x,
+            y,
+            inner.width,
+            cols,
+            row,
+            row_idx,
+            is_selected,
+            theme,
+        );
     }
 }
 
@@ -752,90 +766,52 @@ fn render_header_row(
         }
     };
     let bg = theme.main_bg;
-    write_panel_col(
-        grid,
-        &mut cx,
-        y,
-        panel_right,
-        cols.name,
-        "Service",
-        false,
-        col_fg(ServiceSort::Name),
-        bg,
-        true,
-    );
-    write_panel_col(
-        grid,
-        &mut cx,
-        y,
-        panel_right,
-        cols.display,
-        "Display Name",
-        false,
-        col_fg(ServiceSort::DisplayName),
-        bg,
-        true,
-    );
-    write_panel_col(
-        grid,
-        &mut cx,
-        y,
-        panel_right,
-        cols.state,
-        "State",
-        false,
-        col_fg(ServiceSort::State),
-        bg,
-        true,
-    );
-    write_panel_col(
-        grid,
-        &mut cx,
-        y,
-        panel_right,
-        cols.start,
-        "Start",
-        false,
-        col_fg(ServiceSort::StartType),
-        bg,
-        true,
-    );
-    write_panel_col(
-        grid,
-        &mut cx,
-        y,
-        panel_right,
-        cols.pid,
-        "PID",
-        true,
-        col_fg(ServiceSort::Pid),
-        bg,
-        true,
-    );
-    write_panel_col(
-        grid,
-        &mut cx,
-        y,
-        panel_right,
-        cols.mem,
-        "Mem",
-        true,
-        col_fg(ServiceSort::Memory),
-        bg,
-        true,
-    );
-    write_panel_col(
-        grid,
-        &mut cx,
-        y,
-        panel_right,
-        cols.cpu,
-        "CPU%",
-        true,
-        col_fg(ServiceSort::Cpu),
-        bg,
-        true,
-    );
+    let specs = [
+        (cols.name, "Service", false, ServiceSort::Name, "name"),
+        (
+            cols.display,
+            "Display Name",
+            false,
+            ServiceSort::DisplayName,
+            "display",
+        ),
+        (cols.state, "State", false, ServiceSort::State, "state"),
+        (cols.start, "Start", false, ServiceSort::StartType, "start"),
+        (cols.pid, "PID", true, ServiceSort::Pid, "pid"),
+        (cols.mem, "Mem", true, ServiceSort::Memory, "memory"),
+        (cols.cpu, "CPU%", true, ServiceSort::Cpu, "cpu"),
+    ];
+    for (col_w, label, right_align, sort_kind, key) in specs {
+        let start_x = cx;
+        write_panel_col(
+            grid,
+            &mut cx,
+            y,
+            panel_right,
+            col_w,
+            label,
+            right_align,
+            col_fg(sort_kind),
+            bg,
+            true,
+        );
+        if col_w > 0 && start_x < panel_right {
+            let hit_w = u16::try_from(col_w)
+                .unwrap_or(0)
+                .min(panel_right.saturating_sub(start_x));
+            if hit_w > 0 {
+                grid.hit_map.push(
+                    Rect {
+                        x: start_x,
+                        y,
+                        width: hit_w,
+                        height: 1,
+                    },
+                    HitAction::ProcSortColumn(key.to_owned()),
+                );
+            }
+        }
+    }
 }
 
 fn service_state_fg(row: &ServiceRow<'_>, is_selected: bool, theme: &ThemePalette) -> Color {
@@ -860,6 +836,7 @@ fn render_service_row(
     width: u16,
     cols: ServiceColumns,
     row: &ServiceRow<'_>,
+    row_idx: usize,
     is_selected: bool,
     theme: &ThemePalette,
 ) {
@@ -947,6 +924,15 @@ fn render_service_row(
             bold,
         );
     }
+    grid.hit_map.push(
+        Rect {
+            x,
+            y,
+            width,
+            height: 1,
+        },
+        HitAction::SelectService(row_idx),
+    );
 }
 
 #[cfg(test)]

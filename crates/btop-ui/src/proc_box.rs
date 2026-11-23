@@ -687,8 +687,8 @@ fn render_proc_chrome(
     let sort_label = format!("< {} {arrow} >", view.sort.as_str());
     let sort_w = u16::try_from(sort_label.chars().count() + 2).unwrap_or(14);
     let sort_x = pos_x.saturating_sub(sort_w + 2);
-    if sort_x > left_bound.saturating_add(1) {
-        let _ = draw_border_tag(
+    if sort_x > left_bound.saturating_add(1)
+        && let Some(sort_rect) = draw_border_tag(
             grid,
             sort_x,
             rect.y,
@@ -699,7 +699,9 @@ fn render_proc_chrome(
             theme.hi_fg,
             theme.hi_fg,
             theme.main_bg,
-        );
+        )
+    {
+        register_sort_tag_hits(grid, sort_rect);
     }
 
     // Draw clickable `S:svc` tab right after `⁴proc` when there is room before the sort tag.
@@ -765,8 +767,8 @@ fn render_proc_filter_and_badges(
             let clipped = clip_text(&filter_tag, usize::from(max_filter_w.saturating_sub(2)));
             let tag_w = u16::try_from(clipped.chars().count() + 2).unwrap_or(6);
             let tag_x = right_cursor.saturating_sub(tag_w + 1);
-            if tag_x > left_bound {
-                let _ = draw_border_tag(
+            if tag_x > left_bound
+                && let Some(filter_rect) = draw_border_tag(
                     grid,
                     tag_x,
                     rect.y,
@@ -777,7 +779,9 @@ fn render_proc_filter_and_badges(
                     theme.hi_fg,
                     theme.hi_fg,
                     theme.main_bg,
-                );
+                )
+            {
+                grid.hit_map.push(filter_rect, HitAction::ProcBeginFilter);
                 right_cursor = tag_x;
             }
         }
@@ -985,6 +989,46 @@ fn compute_columns(
     }
 }
 
+pub(crate) fn register_sort_tag_hits(grid: &mut Grid, sort_rect: Rect) {
+    let side_w = 3.min(sort_rect.width / 2);
+    if side_w == 0 {
+        return;
+    }
+    grid.hit_map.push(
+        Rect {
+            x: sort_rect.x,
+            y: sort_rect.y,
+            width: side_w,
+            height: 1,
+        },
+        HitAction::ProcPrevSort,
+    );
+    let mid_x = sort_rect.x.saturating_add(side_w);
+    let mid_w = sort_rect.width.saturating_sub(side_w.saturating_mul(2));
+    if mid_w > 0 {
+        grid.hit_map.push(
+            Rect {
+                x: mid_x,
+                y: sort_rect.y,
+                width: mid_w,
+                height: 1,
+            },
+            HitAction::ProcToggleReverse,
+        );
+    }
+    grid.hit_map.push(
+        Rect {
+            x: sort_rect
+                .x
+                .saturating_add(sort_rect.width.saturating_sub(side_w)),
+            y: sort_rect.y,
+            width: side_w,
+            height: 1,
+        },
+        HitAction::ProcNextSort,
+    );
+}
+
 fn render_table_header(
     grid: &mut Grid,
     y: u16,
@@ -1001,6 +1045,15 @@ fn render_table_header(
         theme.main_bg,
         true,
     );
+    grid.hit_map.push(
+        Rect {
+            x: cols.col_pid,
+            y,
+            width: cols.pid_w,
+            height: 1,
+        },
+        HitAction::ProcSortColumn("pid".to_owned()),
+    );
     grid.write_str(
         cols.col_prog,
         y,
@@ -1008,6 +1061,15 @@ fn render_table_header(
         hdr_fg(view.sort == ProcSort::Program),
         theme.main_bg,
         true,
+    );
+    grid.hit_map.push(
+        Rect {
+            x: cols.col_prog,
+            y,
+            width: cols.prog_w,
+            height: 1,
+        },
+        HitAction::ProcSortColumn("program".to_owned()),
     );
     if cols.thr_w > 0 {
         grid.write_str(
@@ -1018,6 +1080,15 @@ fn render_table_header(
             theme.main_bg,
             true,
         );
+        grid.hit_map.push(
+            Rect {
+                x: cols.col_thr,
+                y,
+                width: cols.thr_w,
+                height: 1,
+            },
+            HitAction::ProcSortColumn("threads".to_owned()),
+        );
     }
     let mem_hdr = if view.mem_bytes { "MemB" } else { "Mem%" };
     grid.write_str(
@@ -1027,6 +1098,15 @@ fn render_table_header(
         hdr_fg(view.sort == ProcSort::Memory),
         theme.main_bg,
         true,
+    );
+    grid.hit_map.push(
+        Rect {
+            x: cols.col_mem,
+            y,
+            width: cols.mem_w,
+            height: 1,
+        },
+        HitAction::ProcSortColumn("memory".to_owned()),
     );
     if cols.spark_w > 0 {
         grid.write_str(
@@ -1046,6 +1126,15 @@ fn render_table_header(
         hdr_fg(matches!(view.sort, ProcSort::CpuLazy | ProcSort::CpuDirect)),
         theme.main_bg,
         true,
+    );
+    grid.hit_map.push(
+        Rect {
+            x: cols.col_cpu,
+            y,
+            width: cols.cpu_w,
+            height: 1,
+        },
+        HitAction::ProcSortColumn("cpu".to_owned()),
     );
 }
 

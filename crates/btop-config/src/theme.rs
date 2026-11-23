@@ -699,7 +699,7 @@ impl ThemeSearchPaths {
         }
 
         // Safe relative theme stem lookup across ordered search directories (reject traversal).
-        let stem = trimmed.strip_suffix(".theme").unwrap_or(trimmed);
+        let stem = strip_theme_ext(trimmed);
         if is_safe_theme_stem(stem) {
             let file_name = format!("{stem}.theme");
             for dir in self.ordered_dirs() {
@@ -728,13 +728,25 @@ impl ThemeSearchPaths {
 /// Loads one of the embedded curated Apache-2.0 themes by stem (case-insensitive).
 pub fn load_bundled_theme(name: &str) -> Result<Option<ThemeSpec>, ThemeError> {
     let trimmed = name.trim();
-    let stem = trimmed.strip_suffix(".theme").unwrap_or(trimmed);
+    let stem = strip_theme_ext(trimmed);
     for (bundled_name, content) in BUNDLED_THEMES {
         if bundled_name.eq_ignore_ascii_case(stem) {
             return parse_theme(content).map(Some);
         }
     }
     Ok(None)
+}
+
+fn strip_theme_ext(name: &str) -> &str {
+    let ext_len = ".theme".len();
+    if name.len() >= ext_len
+        && let Some(tail) = name.get(name.len() - ext_len..)
+        && tail.eq_ignore_ascii_case(".theme")
+    {
+        &name[..name.len() - ext_len]
+    } else {
+        name
+    }
 }
 
 fn is_safe_theme_stem(stem: &str) -> bool {

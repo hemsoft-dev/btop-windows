@@ -138,8 +138,8 @@ fn render_cpu_chrome(
     let cadence_label = format!("- {}ms +", config.update_ms);
     let cadence_w = u16::try_from(cadence_label.chars().count() + 2).unwrap_or(10);
     let cadence_x = max_top_x.saturating_sub(cadence_w + 1);
-    if cadence_x > rect.x.saturating_add(10) {
-        let _ = draw_border_tag(
+    if cadence_x > rect.x.saturating_add(10)
+        && let Some(cadence_rect) = draw_border_tag(
             grid,
             cadence_x,
             rect.y,
@@ -150,7 +150,9 @@ fn render_cpu_chrome(
             theme.title,
             theme.hi_fg,
             theme.main_bg,
-        );
+        )
+    {
+        register_cadence_hits(grid, cadence_rect);
     }
 
     // Embedded CPU model name when room allows without colliding with top-row header clock/preset.
@@ -199,6 +201,33 @@ fn render_cpu_chrome(
         theme.inactive_fg,
         theme.hi_fg,
         theme.main_bg,
+    );
+}
+
+fn register_cadence_hits(grid: &mut Grid, cadence_rect: Rect) {
+    let side_w = 3.min(cadence_rect.width / 2);
+    if side_w == 0 {
+        return;
+    }
+    grid.hit_map.push(
+        Rect {
+            x: cadence_rect.x,
+            y: cadence_rect.y,
+            width: side_w,
+            height: 1,
+        },
+        HitAction::AdjustUpdateMs(-100),
+    );
+    grid.hit_map.push(
+        Rect {
+            x: cadence_rect
+                .x
+                .saturating_add(cadence_rect.width.saturating_sub(side_w)),
+            y: cadence_rect.y,
+            width: side_w,
+            height: 1,
+        },
+        HitAction::AdjustUpdateMs(100),
     );
 }
 

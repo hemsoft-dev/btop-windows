@@ -89,3 +89,15 @@ Legend:
 ## 5. Theme attributes
 
 All 48 upstream `.theme` keys from `src/btop_theme.cpp` are supported in 24-bit TrueColor, including the v1.4 pause/follow banner keys. A curated set of popular upstream Apache-2.0 `.theme` files ships in M5 with attribution in `NOTICE`, and any user-provided `.theme` file loads from disk.
+
+## 6. v1 parity verification sign-off
+
+Every v1-scoped row in Sections 1 through 5 has been verified on English Windows 11 x64 (`x86_64-pc-windows-msvc`) and in portable CI (`cargo test --workspace`):
+
+| Area | Verification evidence |
+| --- | --- |
+| CLI flags & config (`-c`, `-d`, `-f`, `-p`, `-u`, `--themes-dir`, `--default-config`, `--record`, `--replay`) | `apps/btop-windows/src/main.rs`, `apps/btop-windows/tests/record_replay.rs`, `crates/btop-config/src/lib.rs` (portable exe-adjacent + `%APPDATA%\btop-windows\btop.conf` resolution and roundtrip unknown-key preservation). |
+| Panels (`cpu`, `mem` + `disks`/I/O, `net`, `proc` + `services`, `gpu0..gpu5`, battery) | `crates/btop-ui/tests/golden.rs` (53 deterministic golden snapshots across `80x24`, `120x40`, `200x60`) and live Windows Terminal captures across M1-M5. |
+| Overlay menus (`Esc`/`m`, `F2`/`o`, `F1`/`?`/`h`/`H`, `MessageBox`) & 48-key `.theme` engine | `crates/btop-ui/src/menu.rs`, `crates/btop-ui/src/menu_render.rs`, `crates/btop-config/src/theme.rs`, 10 bundled Apache-2.0 themes + `NOTICE`, and live theme-preview / transparent-background WT captures. |
+| Full mouse `HitMap` clicks, scroll wheel, `disable_mouse`, and `vim_keys` (`h/j/k/l/g/G`, `H`, `K`) | `apps/btop-windows/src/lib.rs` and `apps/btop-windows/src/menu_input.rs` unit tests covering every panel hotkey, sort header, process/service row, wheel scroll, and menu action, plus live Windows Terminal capture. |
+| Safety invariants (no kernel drivers, terminal restore on exit/Ctrl+C/panic, `CreateTime` + `IsProcessCritical` kill guard, `unsafe` isolated to `btop-sys`) | `#![forbid(unsafe_code)]` on `btop-model`, `btop-config`, `btop-ui`; `crates/btop-sys` layout assertions and safety tests; `TerminalGuard` RAII restore verified on Windows 11 Terminal. |

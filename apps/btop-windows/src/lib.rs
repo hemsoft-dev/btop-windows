@@ -9,7 +9,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
 use btop_collect::{CollectError, FreqMode, Sampler, SnapshotSource};
-use btop_config::{Config, ConfigError, ThemeSearchPaths};
+use btop_config::{Config, ConfigError, ConfigLocation, ThemeSearchPaths, resolve_config_location};
 use btop_model::{DataState, RecordStats, SnapshotRecorder};
 use btop_sys::{
     PriorityClass, ServiceActionError, graceful_close_process, is_process_elevated,
@@ -21,11 +21,14 @@ use btop_term::{
     TermEvent, TerminalGuard,
 };
 use btop_ui::{
-    BoxId, OverlayMenu, ProcActionModal, UiHistory, UiPriorityClass, UiState, build_visible_rows,
-    build_visible_service_rows, compute_layout, is_modal_visible, modal_rect, theme::ThemePalette,
-    visible_proc_rows, visible_service_rows,
+    BoxId, OverlayMenu, ProcActionModal, ProcSort, ServiceSort, UiHistory, UiPriorityClass,
+    UiState, build_visible_rows, build_visible_service_rows, compute_layout, is_modal_visible,
+    modal_rect, theme::ThemePalette, visible_proc_rows, visible_service_rows,
 };
-use menu_input::{LoopAction, handle_menu_key, handle_menu_mouse, try_open_menu_shortcut};
+use menu_input::{
+    LoopAction, handle_menu_key, handle_menu_mouse, sync_config_from_ui_state,
+    try_open_menu_shortcut,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -57,23 +60,26 @@ pub struct ConfigOverrides {
     pub low_color: bool,
 }
 
-/// Loads `btop.conf` from an explicit path (erroring if missing/invalid) or from `./btop.conf`
-/// when present, then applies CLI overrides.
+/// Loads `btop.conf` using strict precedence (`-c` explicit -> portable exe-adjacent
+/// `btop.conf` -> `%APPDATA%\btop-windows\btop.conf`), then applies CLI overrides.
 pub fn load_config(
     explicit_path: Option<&Path>,
     overrides: &ConfigOverrides,
 ) -> Result<Config, AppError> {
-    let mut cfg = if let Some(path) = explicit_path {
-        let content = std::fs::read_to_string(path)?;
-        Config::parse(&content)?
-    } else {
-        let default_path = PathBuf::from("btop.conf");
-        if default_path.exists() {
-            let content = std::fs::read_to_string(&default_path)?;
+    let mut cfg = match resolve_config_location(explicit_path) {
+        Some(ConfigLocation::Explicit(path)) => {
+            let content = std::fs::read_to_string(&path)?;
             Config::parse(&content)?
-        } else {
-            Config::default()
         }
+        Some(ConfigLocation::Portable(path) | ConfigLocation::AppData(path)) => {
+            if path.is_file() {
+                let content = std::fs::read_to_string(&path)?;
+                Config::parse(&content)?
+            } else {
+                Config::default()
+            }
+        }
+        None => Config::default(),
     };
 
     if let Some(ms) = overrides.update_ms {
@@ -86,6 +92,25 @@ pub fn load_config(
         cfg.truecolor = false;
     }
     Ok(cfg)
+}
+
+/// Persists `config` (synchronized with live `ui_state`) to the resolved `btop.conf` path
+/// when `allow_live_actions && config.save_config_on_exit` are both `true`.
+pub fn save_config_if_enabled(
+    config: &mut Config,
+    ui_state: &UiState,
+    explicit_path: Option<&Path>,
+    allow_live_actions: bool,
+) -> Result<Option<PathBuf>, AppError> {
+    if !allow_live_actions || !config.save_config_on_exit {
+        return Ok(None);
+    }
+    let Some(location) = resolve_config_location(explicit_path) else {
+        return Ok(None);
+    };
+    sync_config_from_ui_state(config, ui_state);
+    config.save_to_path(location.path())?;
+    Ok(Some(location.path().to_path_buf()))
 }
 
 /// Validates recorder completion statistics and fails clearly if any snapshots were dropped.
@@ -225,15 +250,14 @@ pub fn run_tui_loop(
     let sampler = Sampler::spawn(source, config.update_ms, recorder)?;
     config.update_ms = sampler.update_ms();
     let mut guard = TerminalGuard::enter()?;
-
     let mut size = guard.size().unwrap_or(Size {
         width: 80,
         height: 24,
     });
     let mut history = UiHistory::default();
     let mut ui_state = build_ui_state(&config, overrides);
-    let mut last_generation = sampler.generation();
-    let mut last_telemetry_generation = sampler.telemetry_generation();
+    let (mut last_generation, mut last_telemetry_generation) =
+        (sampler.generation(), sampler.telemetry_generation());
     let mut current_snapshot = sampler.latest();
     history.push_with_util_mode(&current_snapshot, is_utility_mode(&config));
     ui_state.net.observe_snapshot(&current_snapshot);
@@ -324,7 +348,19 @@ pub fn run_tui_loop(
 
     drop(guard);
     finish_sampler_and_recording(sampler, run_result)?;
+    warn_on_exit_save(&mut config, &ui_state, config_path, allow_live_actions);
     Ok(frames_rendered)
+}
+
+fn warn_on_exit_save(
+    config: &mut Config,
+    ui_state: &UiState,
+    config_path: Option<&Path>,
+    allow_live_actions: bool,
+) {
+    if let Err(err) = save_config_if_enabled(config, ui_state, config_path, allow_live_actions) {
+        eprintln!("warning: failed to save btop.conf on exit: {err}");
+    }
 }
 
 fn is_quit_key(k: btop_term::KeyEvent, ui_state: &UiState) -> bool {
@@ -474,9 +510,8 @@ fn handle_tui_event(
             outcome
         }
         TermEvent::Key(k) if ui_state.modal.is_some() => bool_to_loop_action(handle_modal_key(
-            k.code,
-            k.ctrl,
-            k.alt,
+            k,
+            config.vim_keys,
             *size,
             allow_live_actions,
             service_dispatch,
@@ -515,9 +550,8 @@ fn handle_tui_event(
             prev_grid,
         ),
         TermEvent::Key(k) => bool_to_loop_action(handle_unmodified_proc_key(
-            k.code,
-            k.ctrl,
-            k.alt,
+            k,
+            config.vim_keys,
             snapshot,
             history,
             *size,
@@ -533,7 +567,17 @@ fn handle_tui_event(
             LoopAction::Redraw
         }
         TermEvent::Mouse(mouse) => handle_tui_mouse(
-            mouse, *size, sampler, snapshot, config, overrides, ui_state, prev_grid,
+            mouse,
+            *size,
+            sampler,
+            snapshot,
+            history,
+            config,
+            overrides,
+            ui_state,
+            proc_rows,
+            service_rows,
+            prev_grid,
         ),
     }
 }
@@ -544,9 +588,12 @@ fn handle_tui_mouse(
     size: Size,
     sampler: &Sampler,
     snapshot: &btop_model::Snapshot,
+    history: &mut UiHistory,
     config: &mut Config,
     overrides: &ConfigOverrides,
     ui_state: &mut UiState,
+    proc_rows: usize,
+    service_rows: usize,
     prev_grid: &mut Option<Grid>,
 ) -> LoopAction {
     if config.disable_mouse {
@@ -569,8 +616,13 @@ fn handle_tui_mouse(
     bool_to_loop_action(handle_mouse_event(
         mouse,
         size,
+        snapshot,
+        history,
+        config,
         ui_state,
         Some(sampler),
+        proc_rows,
+        service_rows,
         prev_grid,
     ))
 }
@@ -679,24 +731,340 @@ fn toggle_services_view(
     true
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn handle_mouse_event(
     mouse: btop_term::MouseEvent,
     size: Size,
+    snapshot: &btop_model::Snapshot,
+    history: &mut UiHistory,
+    config: &mut Config,
     ui_state: &mut UiState,
     sampler: Option<&Sampler>,
+    proc_rows: usize,
+    service_rows: usize,
     prev_grid: &mut Option<Grid>,
 ) -> bool {
-    if ui_state.modal.is_some() || mouse.kind != MouseKind::Down(MouseButton::Left) {
+    if config.disable_mouse || ui_state.modal.is_some() {
         return false;
     }
+
+    if matches!(mouse.kind, MouseKind::ScrollUp | MouseKind::ScrollDown) {
+        return handle_dashboard_wheel(mouse, size, snapshot, ui_state, proc_rows, service_rows);
+    }
+
+    let is_left = mouse.kind == MouseKind::Down(MouseButton::Left);
+    let is_right = mouse.kind == MouseKind::Down(MouseButton::Right);
+    if !is_left && !is_right {
+        return false;
+    }
+
     let hit = prev_grid
         .as_ref()
         .and_then(|g| g.hit_map.hit_test(mouse.col, mouse.row))
         .cloned();
-    if hit == Some(HitAction::ToggleServicesView) {
-        return toggle_services_view(size, ui_state, sampler, prev_grid);
+    let Some(hit) = hit else {
+        return false;
+    };
+
+    if is_right {
+        return match hit {
+            HitAction::CyclePreset if ui_state.layout.cycle_preset_prev() => {
+                if let Some(s) = sampler {
+                    s.set_services_active(should_poll_services(size, ui_state));
+                }
+                *prev_grid = None;
+                true
+            }
+            _ => false,
+        };
     }
-    false
+
+    match hit {
+        HitAction::ToggleBox(name) => {
+            let Some(box_id) = BoxId::parse(&name) else {
+                return false;
+            };
+            if ui_state.layout.toggle_box(box_id) {
+                if let Some(s) = sampler {
+                    s.set_services_active(should_poll_services(size, ui_state));
+                }
+                *prev_grid = None;
+                true
+            } else {
+                false
+            }
+        }
+        HitAction::CyclePreset => {
+            if ui_state.layout.cycle_preset_next() {
+                if let Some(s) = sampler {
+                    s.set_services_active(should_poll_services(size, ui_state));
+                }
+                *prev_grid = None;
+                true
+            } else {
+                false
+            }
+        }
+        HitAction::AdjustUpdateMs(delta) => {
+            if let Some(s) = sampler {
+                config.update_ms = s.adjust_update_ms(delta);
+            } else {
+                let next = i64::from(config.update_ms)
+                    .saturating_add(i64::from(delta))
+                    .clamp(100, 60_000);
+                config.update_ms = u32::try_from(next).unwrap_or(100);
+            }
+            true
+        }
+        HitAction::ToggleDisks => {
+            ui_state.toggle_disks();
+            *prev_grid = None;
+            true
+        }
+        HitAction::ToggleIoMode => {
+            ui_state.toggle_io_mode();
+            *prev_grid = None;
+            true
+        }
+        HitAction::NetPrevIface => {
+            ui_state.net.select_prev(snapshot);
+            true
+        }
+        HitAction::NetNextIface => {
+            ui_state.net.select_next(snapshot);
+            true
+        }
+        HitAction::NetToggleAuto => {
+            ui_state.net.toggle_auto();
+            true
+        }
+        HitAction::NetToggleSync => {
+            ui_state.net.toggle_sync();
+            true
+        }
+        HitAction::NetResetTotals => {
+            ui_state.net.reset_session_totals(snapshot, history);
+            true
+        }
+        HitAction::ToggleServicesView => toggle_services_view(size, ui_state, sampler, prev_grid),
+        HitAction::ProcPrevSort => {
+            if ui_state.services.active {
+                ui_state.services.prev_sort();
+            } else {
+                ui_state.proc.prev_sort();
+            }
+            true
+        }
+        HitAction::ProcNextSort => {
+            if ui_state.services.active {
+                ui_state.services.next_sort();
+            } else {
+                ui_state.proc.next_sort();
+            }
+            true
+        }
+        HitAction::ProcToggleReverse => {
+            if ui_state.services.active {
+                ui_state.services.toggle_reverse();
+            } else {
+                ui_state.proc.toggle_reverse();
+            }
+            true
+        }
+        HitAction::ProcSortColumn(col) => handle_mouse_sort_column(&col, ui_state),
+        HitAction::ProcBeginFilter => {
+            if ui_state.services.active {
+                ui_state.services.begin_filter_edit();
+            } else {
+                ui_state.proc.begin_filter_edit();
+            }
+            true
+        }
+        HitAction::SelectProcess(pid) => {
+            handle_select_process_click(pid, snapshot, ui_state, proc_rows)
+        }
+        HitAction::SelectService(row_idx) => {
+            handle_select_service_click(row_idx, snapshot, ui_state, service_rows)
+        }
+        HitAction::OpenMenu(name) => {
+            let menu = match name.as_str() {
+                "options" => {
+                    sync_config_from_ui_state(config, ui_state);
+                    OverlayMenu::options()
+                }
+                "help" => OverlayMenu::help(),
+                _ => OverlayMenu::main(),
+            };
+            ui_state.menu = Some(menu);
+            *prev_grid = None;
+            true
+        }
+        HitAction::MenuItem(_)
+        | HitAction::MenuCategory(_)
+        | HitAction::MenuClose
+        | HitAction::MessageBoxButton(_) => false,
+    }
+}
+
+fn handle_dashboard_wheel(
+    mouse: btop_term::MouseEvent,
+    size: Size,
+    snapshot: &btop_model::Snapshot,
+    ui_state: &mut UiState,
+    proc_rows: usize,
+    service_rows: usize,
+) -> bool {
+    let Some(proc_rect) = compute_layout(size, &ui_state.layout)
+        .ok()
+        .and_then(|layout| layout.proc())
+    else {
+        return false;
+    };
+    if !proc_rect.contains(mouse.col, mouse.row) {
+        return false;
+    }
+    let up = mouse.kind == MouseKind::ScrollUp;
+    if ui_state.services.active {
+        let services = match &snapshot.services {
+            DataState::Available(list) | DataState::Stale { value: list, .. } => {
+                Some(list.as_slice())
+            }
+            _ => None,
+        };
+        let procs = match &snapshot.processes {
+            DataState::Available(list) | DataState::Stale { value: list, .. } => {
+                Some(list.as_slice())
+            }
+            _ => None,
+        };
+        let count = services.map_or(0, |svcs| {
+            build_visible_service_rows(svcs, procs, &ui_state.services)
+                .0
+                .len()
+        });
+        if count == 0 {
+            return false;
+        }
+        if up {
+            ui_state.services.move_up(count, service_rows);
+        } else {
+            ui_state.services.move_down(count, service_rows);
+        }
+        return true;
+    }
+
+    let Some(procs) = ui_state.proc.active_processes(snapshot).map(<[_]>::to_vec) else {
+        return false;
+    };
+    let (rows, _) = build_visible_rows(&procs, &ui_state.proc);
+    if rows.is_empty() {
+        return false;
+    }
+    if up {
+        ui_state.proc.move_up(rows.len(), proc_rows);
+    } else {
+        ui_state.proc.move_down(rows.len(), proc_rows);
+    }
+    ui_state.proc.sync_detail_after_navigation(&rows);
+    true
+}
+
+fn handle_mouse_sort_column(col: &str, ui_state: &mut UiState) -> bool {
+    if ui_state.services.active {
+        let target = match col {
+            "name" => ServiceSort::Name,
+            "display" => ServiceSort::DisplayName,
+            "state" => ServiceSort::State,
+            "start" => ServiceSort::StartType,
+            "pid" => ServiceSort::Pid,
+            "memory" => ServiceSort::Memory,
+            "cpu" => ServiceSort::Cpu,
+            _ => return false,
+        };
+        if ui_state.services.sort == target {
+            ui_state.services.toggle_reverse();
+        } else {
+            ui_state.services.sort = target;
+            ui_state.services.reversed = false;
+        }
+        return true;
+    }
+
+    match col {
+        "pid" => apply_proc_sort_click(ProcSort::Pid, ui_state),
+        "program" => apply_proc_sort_click(ProcSort::Program, ui_state),
+        "threads" => apply_proc_sort_click(ProcSort::Threads, ui_state),
+        "memory" => apply_proc_sort_click(ProcSort::Memory, ui_state),
+        "cpu" => {
+            if matches!(ui_state.proc.sort, ProcSort::CpuLazy | ProcSort::CpuDirect) {
+                ui_state.proc.toggle_reverse();
+            } else {
+                ui_state.proc.sort = ProcSort::CpuLazy;
+                ui_state.proc.reversed = false;
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn apply_proc_sort_click(target: ProcSort, ui_state: &mut UiState) -> bool {
+    if ui_state.proc.sort == target {
+        ui_state.proc.toggle_reverse();
+    } else {
+        ui_state.proc.sort = target;
+        ui_state.proc.reversed = false;
+    }
+    true
+}
+
+fn handle_select_process_click(
+    pid: u32,
+    snapshot: &btop_model::Snapshot,
+    ui_state: &mut UiState,
+    proc_rows: usize,
+) -> bool {
+    let Some(procs) = ui_state.proc.active_processes(snapshot).map(<[_]>::to_vec) else {
+        return false;
+    };
+    let (rows, _) = build_visible_rows(&procs, &ui_state.proc);
+    let Some(idx) = rows.iter().position(|r| r.entry.identity.pid == pid) else {
+        return false;
+    };
+    if ui_state.proc.selected == idx {
+        return ui_state.proc.toggle_detail_selected(&rows, proc_rows);
+    }
+    ui_state.proc.selected = idx;
+    ui_state.proc.clamp(rows.len(), proc_rows);
+    ui_state.proc.sync_detail_after_navigation(&rows);
+    true
+}
+
+fn handle_select_service_click(
+    row_idx: usize,
+    snapshot: &btop_model::Snapshot,
+    ui_state: &mut UiState,
+    service_rows: usize,
+) -> bool {
+    let services = match &snapshot.services {
+        DataState::Available(list) | DataState::Stale { value: list, .. } => Some(list.as_slice()),
+        _ => None,
+    };
+    let procs = match &snapshot.processes {
+        DataState::Available(list) | DataState::Stale { value: list, .. } => Some(list.as_slice()),
+        _ => None,
+    };
+    let count = services.map_or(0, |svcs| {
+        build_visible_service_rows(svcs, procs, &ui_state.services)
+            .0
+            .len()
+    });
+    if count == 0 || row_idx >= count {
+        return false;
+    }
+    ui_state.services.selected = row_idx;
+    ui_state.services.clamp(count, service_rows);
+    true
 }
 
 fn cancel_invisible_modal(
@@ -732,9 +1100,8 @@ fn try_open_modal(size: Size, ui_state: &mut UiState, modal: ProcActionModal) ->
 
 #[allow(clippy::too_many_arguments)]
 fn handle_modal_key(
-    code: KeyCode,
-    ctrl: bool,
-    alt: bool,
+    key: btop_term::KeyEvent,
+    vim_keys: bool,
     size: Size,
     allow_live_actions: bool,
     service_dispatch: Option<&ServiceDispatch<'_>>,
@@ -744,9 +1111,10 @@ fn handle_modal_key(
     if cancel_invisible_modal(size, ui_state, prev_grid) {
         return true;
     }
-    if ctrl || alt {
+    if key.ctrl || key.alt {
         return false;
     }
+    let code = key.code;
     let Some(modal) = ui_state.modal.clone() else {
         return false;
     };
@@ -799,29 +1167,14 @@ fn handle_modal_key(
             ui_state,
             prev_grid,
         ),
-        ProcActionModal::PrioritySelector { .. } => match code {
-            KeyCode::Up => {
-                if let Some(ref mut m) = ui_state.modal {
-                    m.move_priority_up();
-                }
-                true
-            }
-            KeyCode::Down => {
-                if let Some(ref mut m) = ui_state.modal {
-                    m.move_priority_down();
-                }
-                true
-            }
-            KeyCode::Enter => {
-                apply_priority_modal_selection(&modal, allow_live_actions, ui_state, prev_grid)
-            }
-            KeyCode::Esc => {
-                ui_state.modal = None;
-                *prev_grid = None;
-                true
-            }
-            _ => false,
-        },
+        ProcActionModal::PrioritySelector { .. } => handle_priority_modal_key(
+            code,
+            vim_keys,
+            &modal,
+            allow_live_actions,
+            ui_state,
+            prev_grid,
+        ),
         ProcActionModal::ActionNotice { .. } => match code {
             KeyCode::Enter | KeyCode::Esc | KeyCode::Char(' ') => {
                 ui_state.modal = None;
@@ -830,6 +1183,51 @@ fn handle_modal_key(
             }
             _ => false,
         },
+    }
+}
+
+fn handle_priority_modal_key(
+    code: KeyCode,
+    vim_keys: bool,
+    modal: &ProcActionModal,
+    allow_live_actions: bool,
+    ui_state: &mut UiState,
+    prev_grid: &mut Option<Grid>,
+) -> bool {
+    match code {
+        KeyCode::Up => {
+            if let Some(ref mut m) = ui_state.modal {
+                m.move_priority_up();
+            }
+            true
+        }
+        KeyCode::Down => {
+            if let Some(ref mut m) = ui_state.modal {
+                m.move_priority_down();
+            }
+            true
+        }
+        KeyCode::Char('k') if vim_keys => {
+            if let Some(ref mut m) = ui_state.modal {
+                m.move_priority_up();
+            }
+            true
+        }
+        KeyCode::Char('j') if vim_keys => {
+            if let Some(ref mut m) = ui_state.modal {
+                m.move_priority_down();
+            }
+            true
+        }
+        KeyCode::Enter => {
+            apply_priority_modal_selection(modal, allow_live_actions, ui_state, prev_grid)
+        }
+        KeyCode::Esc => {
+            ui_state.modal = None;
+            *prev_grid = None;
+            true
+        }
+        _ => false,
     }
 }
 
@@ -1173,6 +1571,7 @@ fn handle_panel_key(
         }
         other if ui_state.services.active => handle_services_key(
             other,
+            config.vim_keys,
             snapshot,
             size,
             ui_state,
@@ -1181,6 +1580,7 @@ fn handle_panel_key(
         ),
         other => handle_proc_key(
             other,
+            config.vim_keys,
             snapshot,
             history,
             size,
@@ -1193,6 +1593,7 @@ fn handle_panel_key(
 
 fn handle_services_key(
     code: KeyCode,
+    vim_keys: bool,
     snapshot: &btop_model::Snapshot,
     size: Size,
     state: &mut UiState,
@@ -1214,12 +1615,18 @@ fn handle_services_key(
     match code {
         KeyCode::Up => state.services.move_up(count, service_rows),
         KeyCode::Down => state.services.move_down(count, service_rows),
+        KeyCode::Char('k') if vim_keys => state.services.move_up(count, service_rows),
+        KeyCode::Char('j') if vim_keys => state.services.move_down(count, service_rows),
         KeyCode::PageUp => state.services.page_up(count, service_rows),
         KeyCode::PageDown => state.services.page_down(count, service_rows),
         KeyCode::Home => state.services.home(count, service_rows),
         KeyCode::End => state.services.end(count, service_rows),
+        KeyCode::Char('g') if vim_keys => state.services.home(count, service_rows),
+        KeyCode::Char('G') if vim_keys => state.services.end(count, service_rows),
         KeyCode::Left => state.services.prev_sort(),
         KeyCode::Right => state.services.next_sort(),
+        KeyCode::Char('h') if vim_keys => state.services.prev_sort(),
+        KeyCode::Char('l') if vim_keys => state.services.next_sort(),
         KeyCode::Char('r') => state.services.toggle_reverse(),
         KeyCode::Char('f' | '/') => state.services.begin_filter_edit(),
         KeyCode::Delete => return state.services.clear_filter(),
@@ -1295,9 +1702,8 @@ fn handle_service_action_shortcut(
 
 #[allow(clippy::too_many_arguments)]
 fn handle_unmodified_proc_key(
-    code: KeyCode,
-    ctrl: bool,
-    alt: bool,
+    key: btop_term::KeyEvent,
+    vim_keys: bool,
     snapshot: &btop_model::Snapshot,
     history: &UiHistory,
     size: Size,
@@ -1305,11 +1711,12 @@ fn handle_unmodified_proc_key(
     proc_rows: usize,
     allow_live_actions: bool,
 ) -> bool {
-    if ctrl || alt {
+    if key.ctrl || key.alt {
         return false;
     }
     handle_proc_key(
-        code,
+        key.code,
+        vim_keys,
         snapshot,
         history,
         size,
@@ -1319,8 +1726,10 @@ fn handle_unmodified_proc_key(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_proc_key(
     code: KeyCode,
+    vim_keys: bool,
     snapshot: &btop_model::Snapshot,
     history: &UiHistory,
     size: Size,
@@ -1334,7 +1743,14 @@ fn handle_proc_key(
         .map(|procs| build_visible_rows(procs, &state.proc).0);
     let proc_count = rows_built.as_ref().map_or(0, Vec::len);
 
-    if handle_proc_nav_key(code, rows_built.as_deref(), proc_count, proc_rows, state) {
+    if handle_proc_nav_key(
+        code,
+        vim_keys,
+        rows_built.as_deref(),
+        proc_count,
+        proc_rows,
+        state,
+    ) {
         return true;
     }
     match code {
@@ -1352,7 +1768,7 @@ fn handle_proc_key(
             }
             return state.proc.action_status.take().is_some();
         }
-        KeyCode::Char('t' | 'k' | 'N') => {
+        KeyCode::Char('t' | 'N') => {
             return handle_proc_action_shortcut(
                 code,
                 rows_built.as_deref(),
@@ -1362,8 +1778,30 @@ fn handle_proc_key(
                 state,
             );
         }
+        KeyCode::Char('k') if !vim_keys => {
+            return handle_proc_action_shortcut(
+                KeyCode::Char('k'),
+                rows_built.as_deref(),
+                size,
+                proc_rows,
+                allow_live_actions,
+                state,
+            );
+        }
+        KeyCode::Char('K') if vim_keys => {
+            return handle_proc_action_shortcut(
+                KeyCode::Char('k'),
+                rows_built.as_deref(),
+                size,
+                proc_rows,
+                allow_live_actions,
+                state,
+            );
+        }
         KeyCode::Left => state.proc.prev_sort(),
         KeyCode::Right => state.proc.next_sort(),
+        KeyCode::Char('h') if vim_keys => state.proc.prev_sort(),
+        KeyCode::Char('l') if vim_keys => state.proc.next_sort(),
         KeyCode::Char('r') => state.proc.toggle_reverse(),
         KeyCode::Char('c') => state.proc.toggle_per_core(),
         KeyCode::Char('%') => state.proc.toggle_mem_bytes(),
@@ -1401,6 +1839,7 @@ fn handle_proc_key(
 
 fn handle_proc_nav_key(
     code: KeyCode,
+    vim_keys: bool,
     rows_built: Option<&[btop_ui::DisplayProcRow<'_>]>,
     proc_count: usize,
     proc_rows: usize,
@@ -1409,10 +1848,14 @@ fn handle_proc_nav_key(
     match code {
         KeyCode::Up => state.proc.move_up(proc_count, proc_rows),
         KeyCode::Down => state.proc.move_down(proc_count, proc_rows),
+        KeyCode::Char('k') if vim_keys => state.proc.move_up(proc_count, proc_rows),
+        KeyCode::Char('j') if vim_keys => state.proc.move_down(proc_count, proc_rows),
         KeyCode::PageUp => state.proc.page_up(proc_count, proc_rows),
         KeyCode::PageDown => state.proc.page_down(proc_count, proc_rows),
         KeyCode::Home => state.proc.home(proc_count, proc_rows),
         KeyCode::End => state.proc.end(proc_count, proc_rows),
+        KeyCode::Char('g') if vim_keys => state.proc.home(proc_count, proc_rows),
+        KeyCode::Char('G') if vim_keys => state.proc.end(proc_count, proc_rows),
         _ => return false,
     }
     if let Some(rows) = rows_built {
@@ -1559,6 +2002,7 @@ mod tests {
 
         assert!(!handle_proc_key(
             KeyCode::Char('t'),
+            false,
             &snap,
             &history,
             size,
@@ -1568,6 +2012,7 @@ mod tests {
         ));
         assert!(!handle_proc_key(
             KeyCode::Char('k'),
+            false,
             &snap,
             &history,
             size,
@@ -1577,6 +2022,7 @@ mod tests {
         ));
         assert!(!handle_proc_key(
             KeyCode::Char('N'),
+            false,
             &snap,
             &history,
             size,
@@ -1607,6 +2053,7 @@ mod tests {
         // Pressing `k` at 80x7 must NOT arm an invisible ConfirmTerminate modal.
         let _ = handle_proc_key(
             KeyCode::Char('k'),
+            false,
             &snap,
             &history,
             tiny,
@@ -1631,6 +2078,7 @@ mod tests {
         let normal_rows = visible_proc_rows(normal, &state);
         let _ = handle_proc_key(
             KeyCode::Char('k'),
+            false,
             &snap,
             &history,
             normal,
@@ -1667,7 +2115,19 @@ mod tests {
             (KeyCode::Char('N'), false, true),
         ] {
             let handled = handle_unmodified_proc_key(
-                code, ctrl, alt, &snap, &history, size, &mut state, proc_rows, true,
+                btop_term::KeyEvent {
+                    code,
+                    ctrl,
+                    alt,
+                    shift: false,
+                },
+                false,
+                &snap,
+                &history,
+                size,
+                &mut state,
+                proc_rows,
+                true,
             );
             assert!(!handled);
             assert!(state.modal.is_none());
@@ -1695,7 +2155,7 @@ mod tests {
         for key in [KeyCode::Char('t'), KeyCode::Char('k'), KeyCode::Char('N')] {
             state.modal = None;
             assert!(handle_proc_key(
-                key, &snap, &history, size, &mut state, proc_rows, false,
+                key, false, &snap, &history, size, &mut state, proc_rows, false,
             ));
             assert!(matches!(
                 state.modal,
@@ -1779,6 +2239,7 @@ mod tests {
         state.services.is_elevated = false;
         assert!(handle_services_key(
             KeyCode::Char('x'),
+            false,
             &snap,
             size,
             &mut state,
@@ -1796,6 +2257,7 @@ mod tests {
         state.services.is_elevated = true;
         assert!(handle_services_key(
             KeyCode::Char('x'),
+            false,
             &snap,
             size,
             &mut state,
@@ -1812,6 +2274,7 @@ mod tests {
         state.modal = None;
         assert!(handle_services_key(
             KeyCode::Char('x'),
+            false,
             &snap,
             size,
             &mut state,
@@ -1834,6 +2297,7 @@ mod tests {
         assert_eq!(hidden_rows, 0);
         assert!(!handle_services_key(
             KeyCode::Char('s'),
+            false,
             &snap,
             size,
             &mut state,
@@ -1846,8 +2310,8 @@ mod tests {
     #[test]
     fn services_tab_click_toggles_view_and_filter_edit_updates_services_filter() {
         let snap = sample_snapshot_with_proc();
-        let history = UiHistory::default();
-        let cfg = Config::default();
+        let mut history = UiHistory::default();
+        let mut cfg = Config::default();
         let size = Size {
             width: 120,
             height: 40,
@@ -1875,8 +2339,13 @@ mod tests {
                 kind: MouseKind::Down(MouseButton::Left),
             },
             size,
+            &snap,
+            &mut history,
+            &mut cfg,
             &mut state,
             None,
+            10,
+            10,
             &mut prev_grid,
         ));
         assert!(state.services.active);
@@ -1920,8 +2389,12 @@ mod tests {
             start: false,
         });
         assert!(handle_modal_key(
-            KeyCode::Enter,
-            false,
+            btop_term::KeyEvent {
+                code: KeyCode::Enter,
+                ctrl: false,
+                alt: false,
+                shift: false,
+            },
             false,
             size,
             true,
@@ -2016,7 +2489,7 @@ mod tests {
         // `h` opens Help when vim_keys=False; `H` opens Help when vim_keys=True.
         assert!(try_open_menu_shortcut(
             KeyCode::Char('h'),
-            &cfg,
+            &mut cfg,
             &mut state,
             &mut prev_grid
         ));
@@ -2025,13 +2498,13 @@ mod tests {
         cfg.vim_keys = true;
         assert!(!try_open_menu_shortcut(
             KeyCode::Char('h'),
-            &cfg,
+            &mut cfg,
             &mut state,
             &mut prev_grid
         ));
         assert!(try_open_menu_shortcut(
             KeyCode::Char('H'),
-            &cfg,
+            &mut cfg,
             &mut state,
             &mut prev_grid
         ));
@@ -2259,5 +2732,592 @@ mod tests {
             Some(&(1000, 500))
         );
         assert!(state.layout.shown_boxes.contains(&BoxId::Gpu(0)));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn mouse_hit_testing_covers_all_panel_hotkeys_rows_headers_wheel_and_disable_mouse() {
+        let mut snap = btop_model::fixtures::win11_16core_dual_gpu_desktop()[0].clone();
+        snap.services = DataState::Available(vec![
+            btop_model::ServiceEntry {
+                name: "W32Time".to_owned(),
+                display_name: "Windows Time".to_owned(),
+                state: "Running".to_owned(),
+                start_type: "Auto".to_owned(),
+                pid: Some(1204),
+            },
+            btop_model::ServiceEntry {
+                name: "Spooler".to_owned(),
+                display_name: "Print Spooler".to_owned(),
+                state: "Stopped".to_owned(),
+                start_type: "Manual".to_owned(),
+                pid: None,
+            },
+        ]);
+        let mut history = UiHistory::from_snapshot(&snap);
+        let size = Size {
+            width: 140,
+            height: 44,
+        };
+        let mut cfg = Config {
+            shown_boxes: "cpu mem net proc".to_owned(),
+            update_ms: 2000,
+            ..Config::default()
+        };
+        let mut state = UiState::from_config(&cfg);
+        state.net.observe_snapshot(&snap);
+
+        let click_action = |action: &HitAction,
+                            button: MouseButton,
+                            cfg: &mut Config,
+                            state: &mut UiState,
+                            history: &mut UiHistory| {
+            let grid = btop_ui::render_frame(&snap, history, state, cfg, size);
+            let (col, row) = find_hit(&grid, action);
+            let mut prev = Some(grid);
+            let proc_rows = visible_proc_rows(size, state);
+            let service_rows = visible_service_rows(size, state);
+            assert!(
+                handle_mouse_event(
+                    btop_term::MouseEvent {
+                        col,
+                        row,
+                        kind: MouseKind::Down(button),
+                    },
+                    size,
+                    &snap,
+                    history,
+                    cfg,
+                    state,
+                    None,
+                    proc_rows,
+                    service_rows,
+                    &mut prev,
+                ),
+                "expected click on {action:?} to be handled"
+            );
+        };
+
+        // CPU cadence `-` and `+` buttons.
+        click_action(
+            &HitAction::AdjustUpdateMs(-100),
+            MouseButton::Left,
+            &mut cfg,
+            &mut state,
+            &mut history,
+        );
+        assert_eq!(cfg.update_ms, 1900);
+        click_action(
+            &HitAction::AdjustUpdateMs(100),
+            MouseButton::Left,
+            &mut cfg,
+            &mut state,
+            &mut history,
+        );
+        assert_eq!(cfg.update_ms, 2000);
+
+        // MEM `disks` and `io` hotkeys.
+        assert!(state.show_disks);
+        click_action(
+            &HitAction::ToggleIoMode,
+            MouseButton::Left,
+            &mut cfg,
+            &mut state,
+            &mut history,
+        );
+        assert!(state.io_mode);
+        click_action(
+            &HitAction::ToggleDisks,
+            MouseButton::Left,
+            &mut cfg,
+            &mut state,
+            &mut history,
+        );
+        assert!(!state.show_disks);
+        assert!(!state.io_mode);
+
+        // NET `auto`, `ysync`, `zero`, `<b`, `n>` controls.
+        let initial_net_idx = state.net.selected_index;
+        click_action(
+            &HitAction::NetToggleAuto,
+            MouseButton::Left,
+            &mut cfg,
+            &mut state,
+            &mut history,
+        );
+        assert!(!state.net.auto_scale);
+        click_action(
+            &HitAction::NetToggleSync,
+            MouseButton::Left,
+            &mut cfg,
+            &mut state,
+            &mut history,
+        );
+        assert!(!state.net.synced_scale);
+        click_action(
+            &HitAction::NetResetTotals,
+            MouseButton::Left,
+            &mut cfg,
+            &mut state,
+            &mut history,
+        );
+        click_action(
+            &HitAction::NetNextIface,
+            MouseButton::Left,
+            &mut cfg,
+            &mut state,
+            &mut history,
+        );
+        assert_ne!(state.net.selected_index, initial_net_idx);
+        click_action(
+            &HitAction::NetPrevIface,
+            MouseButton::Left,
+            &mut cfg,
+            &mut state,
+            &mut history,
+        );
+        assert_eq!(state.net.selected_index, initial_net_idx);
+
+        // PROC sort tag (`<`, middle reverse, `>`) and column headers (`Pid`, `Memory`).
+        let before_sort = state.proc.sort;
+        click_action(
+            &HitAction::ProcNextSort,
+            MouseButton::Left,
+            &mut cfg,
+            &mut state,
+            &mut history,
+        );
+        assert_eq!(state.proc.sort, before_sort.next());
+        click_action(
+            &HitAction::ProcPrevSort,
+            MouseButton::Left,
+            &mut cfg,
+            &mut state,
+            &mut history,
+        );
+        assert_eq!(state.proc.sort, before_sort);
+        click_action(
+            &HitAction::ProcToggleReverse,
+            MouseButton::Left,
+            &mut cfg,
+            &mut state,
+            &mut history,
+        );
+        assert!(state.proc.reversed);
+        click_action(
+            &HitAction::ProcSortColumn("memory".to_owned()),
+            MouseButton::Left,
+            &mut cfg,
+            &mut state,
+            &mut history,
+        );
+        assert_eq!(state.proc.sort, ProcSort::Memory);
+        assert!(!state.proc.reversed);
+        click_action(
+            &HitAction::ProcSortColumn("memory".to_owned()),
+            MouseButton::Left,
+            &mut cfg,
+            &mut state,
+            &mut history,
+        );
+        assert!(state.proc.reversed);
+
+        // Process row click selects a row; clicking an already-selected row toggles detail overlay.
+        let procs = state
+            .proc
+            .active_processes(&snap)
+            .expect("processes")
+            .to_vec();
+        let (rows, _) = build_visible_rows(&procs, &state.proc);
+        assert!(rows.len() >= 2);
+        let second_pid = rows[1].entry.identity.pid;
+        click_action(
+            &HitAction::SelectProcess(second_pid),
+            MouseButton::Left,
+            &mut cfg,
+            &mut state,
+            &mut history,
+        );
+        assert_eq!(state.proc.selected, 1);
+        assert!(state.proc.detailed.is_none());
+        click_action(
+            &HitAction::SelectProcess(second_pid),
+            MouseButton::Left,
+            &mut cfg,
+            &mut state,
+            &mut history,
+        );
+        assert_eq!(state.proc.detailed, Some(rows[1].entry.identity));
+        click_action(
+            &HitAction::SelectProcess(second_pid),
+            MouseButton::Left,
+            &mut cfg,
+            &mut state,
+            &mut history,
+        );
+        assert!(state.proc.detailed.is_none());
+
+        // Mouse wheel scrolls inside the PROC panel.
+        let proc_rect = compute_layout(size, &state.layout)
+            .expect("layout")
+            .proc()
+            .expect("proc rect");
+        let proc_rows = visible_proc_rows(size, &state);
+        let mut prev = None;
+        assert!(handle_mouse_event(
+            btop_term::MouseEvent {
+                col: proc_rect.x + 2,
+                row: proc_rect.y + 3,
+                kind: MouseKind::ScrollDown,
+            },
+            size,
+            &snap,
+            &mut history,
+            &mut cfg,
+            &mut state,
+            None,
+            proc_rows,
+            10,
+            &mut prev,
+        ));
+        assert_eq!(state.proc.selected, 2);
+        assert!(handle_mouse_event(
+            btop_term::MouseEvent {
+                col: proc_rect.x + 2,
+                row: proc_rect.y + 3,
+                kind: MouseKind::ScrollUp,
+            },
+            size,
+            &snap,
+            &mut history,
+            &mut cfg,
+            &mut state,
+            None,
+            proc_rows,
+            10,
+            &mut prev,
+        ));
+        assert_eq!(state.proc.selected, 1);
+
+        // Toggle to Services via click, click column sort & service row, and wheel scroll.
+        click_action(
+            &HitAction::ToggleServicesView,
+            MouseButton::Left,
+            &mut cfg,
+            &mut state,
+            &mut history,
+        );
+        assert!(state.services.active);
+        click_action(
+            &HitAction::ProcSortColumn("name".to_owned()),
+            MouseButton::Left,
+            &mut cfg,
+            &mut state,
+            &mut history,
+        );
+        assert_eq!(state.services.sort, ServiceSort::Name);
+        click_action(
+            &HitAction::SelectService(1),
+            MouseButton::Left,
+            &mut cfg,
+            &mut state,
+            &mut history,
+        );
+        assert_eq!(state.services.selected, 1);
+
+        // ToggleBox (`net`) sets manual layout (`None`); CyclePreset clicks cycle None -> 0 -> 1 -> 0.
+        click_action(
+            &HitAction::ToggleBox("net".to_owned()),
+            MouseButton::Left,
+            &mut cfg,
+            &mut state,
+            &mut history,
+        );
+        assert!(!state.layout.shown_boxes.contains(&BoxId::Net));
+        assert_eq!(state.layout.active_preset, None);
+        click_action(
+            &HitAction::CyclePreset,
+            MouseButton::Left,
+            &mut cfg,
+            &mut state,
+            &mut history,
+        );
+        assert_eq!(state.layout.active_preset, Some(0));
+        click_action(
+            &HitAction::CyclePreset,
+            MouseButton::Left,
+            &mut cfg,
+            &mut state,
+            &mut history,
+        );
+        assert_eq!(state.layout.active_preset, Some(1));
+        click_action(
+            &HitAction::CyclePreset,
+            MouseButton::Right,
+            &mut cfg,
+            &mut state,
+            &mut history,
+        );
+        assert_eq!(state.layout.active_preset, Some(0));
+
+        // `disable_mouse = true` blocks clicks and scroll events completely.
+        cfg.disable_mouse = true;
+        let grid = btop_ui::render_frame(&snap, &history, &state, &cfg, size);
+        let (col, row) = find_hit(&grid, &HitAction::ToggleBox("cpu".to_owned()));
+        let mut prev_disabled = Some(grid);
+        assert!(!handle_mouse_event(
+            btop_term::MouseEvent {
+                col,
+                row,
+                kind: MouseKind::Down(MouseButton::Left),
+            },
+            size,
+            &snap,
+            &mut history,
+            &mut cfg,
+            &mut state,
+            None,
+            proc_rows,
+            10,
+            &mut prev_disabled,
+        ));
+        assert!(state.layout.shown_boxes.contains(&BoxId::Cpu));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn vim_keys_enables_hjkl_g_and_remaps_help_and_kill() {
+        let snap = btop_model::fixtures::win11_16core_dual_gpu_desktop()[0].clone();
+        let history = UiHistory::from_snapshot(&snap);
+        let size = Size {
+            width: 120,
+            height: 40,
+        };
+        let mut cfg = Config {
+            vim_keys: true,
+            ..Config::default()
+        };
+        let mut state = UiState::from_config(&cfg);
+        let proc_rows = visible_proc_rows(size, &state);
+        let total = state.proc.active_processes(&snap).expect("procs").len();
+        assert!(total >= 3);
+
+        // `j` moves down, `k` moves up and MUST NOT open ConfirmTerminate!
+        assert!(handle_proc_key(
+            KeyCode::Char('j'),
+            true,
+            &snap,
+            &history,
+            size,
+            &mut state,
+            proc_rows,
+            true,
+        ));
+        assert_eq!(state.proc.selected, 1);
+        assert!(handle_proc_key(
+            KeyCode::Char('k'),
+            true,
+            &snap,
+            &history,
+            size,
+            &mut state,
+            proc_rows,
+            true,
+        ));
+        assert_eq!(state.proc.selected, 0);
+        assert!(
+            state.modal.is_none(),
+            "k must move up rather than arming Terminate when vim_keys = true"
+        );
+
+        // `G` jumps to end, `g` jumps to top.
+        assert!(handle_proc_key(
+            KeyCode::Char('G'),
+            true,
+            &snap,
+            &history,
+            size,
+            &mut state,
+            proc_rows,
+            true,
+        ));
+        assert_eq!(state.proc.selected, total - 1);
+        assert!(handle_proc_key(
+            KeyCode::Char('g'),
+            true,
+            &snap,
+            &history,
+            size,
+            &mut state,
+            proc_rows,
+            true,
+        ));
+        assert_eq!(state.proc.selected, 0);
+
+        // `l` / `h` cycle sort column forward / backward.
+        let orig_sort = state.proc.sort;
+        assert!(handle_proc_key(
+            KeyCode::Char('l'),
+            true,
+            &snap,
+            &history,
+            size,
+            &mut state,
+            proc_rows,
+            true,
+        ));
+        assert_eq!(state.proc.sort, orig_sort.next());
+        assert!(handle_proc_key(
+            KeyCode::Char('h'),
+            true,
+            &snap,
+            &history,
+            size,
+            &mut state,
+            proc_rows,
+            true,
+        ));
+        assert_eq!(state.proc.sort, orig_sort);
+
+        // `K` triggers Terminate confirmation when vim_keys = true.
+        assert!(handle_proc_key(
+            KeyCode::Char('K'),
+            true,
+            &snap,
+            &history,
+            size,
+            &mut state,
+            proc_rows,
+            true,
+        ));
+        assert!(matches!(
+            state.modal,
+            Some(ProcActionModal::ConfirmTerminate { .. })
+        ));
+        state.modal = None;
+
+        // `h` / `l` / `g` / `G` also work in Options and Help menus under vim_keys.
+        let mut prev_grid = None;
+        state.menu = Some(OverlayMenu::options());
+        let plain = |code| btop_term::KeyEvent {
+            code,
+            ctrl: false,
+            alt: false,
+            shift: false,
+        };
+        assert_eq!(
+            handle_menu_key(
+                plain(KeyCode::Char('l')),
+                size,
+                None,
+                &snap,
+                &mut cfg,
+                None,
+                &mut state,
+                &mut prev_grid,
+            ),
+            LoopAction::Redraw
+        );
+        assert_eq!(cfg.color_theme, "dracula");
+        assert_eq!(
+            handle_menu_key(
+                plain(KeyCode::Char('h')),
+                size,
+                None,
+                &snap,
+                &mut cfg,
+                None,
+                &mut state,
+                &mut prev_grid,
+            ),
+            LoopAction::Redraw
+        );
+        assert_eq!(cfg.color_theme, "Default");
+
+        let compact_help = Size {
+            width: 80,
+            height: 24,
+        };
+        state.menu = Some(OverlayMenu::help());
+        assert_eq!(
+            handle_menu_key(
+                plain(KeyCode::Char('G')),
+                compact_help,
+                None,
+                &snap,
+                &mut cfg,
+                None,
+                &mut state,
+                &mut prev_grid,
+            ),
+            LoopAction::Redraw
+        );
+        assert!(matches!(state.menu, Some(OverlayMenu::Help(ref h)) if h.scroll_offset > 0));
+        assert_eq!(
+            handle_menu_key(
+                plain(KeyCode::Char('g')),
+                compact_help,
+                None,
+                &snap,
+                &mut cfg,
+                None,
+                &mut state,
+                &mut prev_grid,
+            ),
+            LoopAction::Redraw
+        );
+        assert!(matches!(state.menu, Some(OverlayMenu::Help(ref h)) if h.scroll_offset == 0));
+    }
+
+    #[test]
+    fn save_config_if_enabled_syncs_ui_state_and_respects_flags() {
+        let path = std::env::temp_dir().join(format!(
+            "btop-save-exit-{}-{}.conf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let mut cfg = Config::parse("use_fstab = True\nsave_config_on_exit = True\n")
+            .expect("parse initial conf");
+        let mut state = UiState::from_config(&cfg);
+        state.proc.toggle_tree();
+        state.proc.toggle_reverse();
+        state.net.toggle_auto();
+
+        // Replay mode (`allow_live_actions = false`) never writes to disk.
+        assert_eq!(
+            save_config_if_enabled(&mut cfg, &state, Some(&path), false).expect("replay no-op"),
+            None
+        );
+        assert!(!path.exists());
+
+        // `save_config_on_exit = false` never writes to disk.
+        cfg.save_config_on_exit = false;
+        assert_eq!(
+            save_config_if_enabled(&mut cfg, &state, Some(&path), true).expect("disabled no-op"),
+            None
+        );
+        assert!(!path.exists());
+
+        // Enabled live exit persists synchronized UI state and unknown Unix keys cleanly.
+        cfg.save_config_on_exit = true;
+        let saved = save_config_if_enabled(&mut cfg, &state, Some(&path), true)
+            .expect("save live conf")
+            .expect("saved path");
+        assert_eq!(saved, path);
+
+        let reloaded = load_config(Some(&path), &ConfigOverrides::default()).expect("reload conf");
+        let _ = std::fs::remove_file(&path);
+        assert!(reloaded.proc_tree);
+        assert!(reloaded.proc_reversed);
+        assert!(!reloaded.net_auto);
+        assert_eq!(
+            reloaded
+                .preserved_unknown
+                .get("use_fstab")
+                .map(String::as_str),
+            Some("True")
+        );
     }
 }
