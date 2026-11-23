@@ -352,4 +352,61 @@ mod tests {
         assert_eq!(tokyo_corner.bg, rgb_color(0x1a, 0x1b, 0x26));
         assert_eq!(transp_corner.bg, Color::Reset);
     }
+
+    #[test]
+    fn process_rows_use_process_gradient_distinct_from_cpu_gradient() {
+        let snap = win11_16core_dual_gpu_desktop()[0].clone();
+        let cfg = Config {
+            shown_boxes: "proc".to_owned(),
+            ..Config::default()
+        };
+        let spec = btop_config::parse_theme(concat!(
+            "theme[cpu_start]=\"#00ff00\"\n",
+            "theme[cpu_mid]=\"#00ff00\"\n",
+            "theme[cpu_end]=\"#00ff00\"\n",
+            "theme[process_start]=\"#ff00ff\"\n",
+            "theme[process_mid]=\"#ff00ff\"\n",
+            "theme[process_end]=\"#ff00ff\"\n",
+        ))
+        .expect("parse custom process gradient theme");
+        let palette = ThemePalette::from_spec(&spec, true);
+        let hist = crate::UiHistory::from_snapshot(&snap);
+        let mut state = crate::UiState::from_config(&cfg);
+        state.resolved_theme = Some(palette);
+
+        let grid = crate::render_frame(
+            &snap,
+            &hist,
+            &state,
+            &cfg,
+            Size {
+                width: 120,
+                height: 24,
+            },
+        );
+        let magenta = rgb_color(0xFF, 0x00, 0xFF);
+        let green = rgb_color(0x00, 0xFF, 0x00);
+        let mut saw_magenta = false;
+        let mut saw_green = false;
+        for y in 0..24 {
+            for x in 0..120 {
+                if let Some(cell) = grid.get(x, y) {
+                    if cell.fg == magenta {
+                        saw_magenta = true;
+                    }
+                    if cell.fg == green {
+                        saw_green = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_magenta,
+            "expected process rows/sparklines to render with process_gradient (#ff00ff)"
+        );
+        assert!(
+            !saw_green,
+            "process-only panel should not fall back to cpu_gradient (#00ff00)"
+        );
+    }
 }

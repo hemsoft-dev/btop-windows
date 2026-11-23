@@ -338,7 +338,7 @@ fn render_detail_top_band(
         grid,
         cpu_rect,
         &cpu_hdr,
-        theme.cpu_gradient(entry.cpu_pct.min(100.0)),
+        theme.process_gradient(entry.cpu_pct.min(100.0)),
         &scaled_cpu,
         config.graph_symbol,
         theme.cpu_stops(),

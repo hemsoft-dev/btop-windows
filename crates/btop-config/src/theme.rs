@@ -486,6 +486,12 @@ pub fn parse_color_value(key: &str, value: &str) -> Result<ThemeColor, ThemeErro
         return Ok(ThemeColor::Transparent);
     }
     if let Some(hex) = trimmed.strip_prefix('#') {
+        if !hex.is_ascii() {
+            return Err(ThemeError::InvalidColor {
+                key: key.to_owned(),
+                value: trimmed.to_owned(),
+            });
+        }
         return match hex.len() {
             2 => {
                 let g = u8::from_str_radix(hex, 16).map_err(|_| ThemeError::InvalidColor {
@@ -841,9 +847,13 @@ theme[process_end]="#424242"
         assert_eq!(minimal.proc_pause_bg, defaults.proc_pause_bg);
         assert_eq!(minimal.followed_bg, defaults.followed_bg);
 
-        // Invalid color fails cleanly with ThemeError::InvalidColor.
+        // Invalid ASCII and multi-byte Unicode hex strings fail cleanly without panicking.
         assert!(matches!(
             parse_theme("theme[title]=\"#ZZZZZZ\"\n"),
+            Err(ThemeError::InvalidColor { ref key, .. }) if key == "title"
+        ));
+        assert!(matches!(
+            parse_theme("theme[title]=\"#a€bc\"\n"),
             Err(ThemeError::InvalidColor { ref key, .. }) if key == "title"
         ));
     }
