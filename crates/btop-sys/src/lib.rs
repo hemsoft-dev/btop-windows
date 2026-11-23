@@ -421,8 +421,11 @@ mod win {
     use std::time::Duration;
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, GetLastError, HANDLE,
+        CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, FILETIME, GetLastError, HANDLE,
         STATUS_INFO_LENGTH_MISMATCH, WAIT_OBJECT_0,
+    };
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX2,
     };
     use windows_sys::Win32::System::Registry::{
         HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegGetValueW,
@@ -433,8 +436,8 @@ mod win {
         SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
     };
     use windows_sys::Win32::System::Threading::{
-        CreateEventW, CreateWaitableTimerW, INFINITE, ResetEvent, SetEvent, SetWaitableTimer,
-        WaitForMultipleObjects,
+        CreateEventW, CreateWaitableTimerW, GetCurrentProcess, GetProcessTimes, INFINITE,
+        ResetEvent, SetEvent, SetWaitableTimer, WaitForMultipleObjects,
     };
 
     use super::{
@@ -625,6 +628,71 @@ mod win {
             .trim()
             .to_owned();
         if name.is_empty() { None } else { Some(name) }
+    }
+
+    /// Returns total kernel + user CPU time consumed by the current process in 100-nanosecond ticks.
+    pub fn query_self_cpu_time_100ns() -> Result<u64, String> {
+        let mut creation = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut exit = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut kernel = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut user = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        // SAFETY: `GetCurrentProcess` returns a valid pseudo-handle and all FILETIME outputs are writable.
+        let ok = unsafe {
+            GetProcessTimes(
+                GetCurrentProcess(),
+                &raw mut creation,
+                &raw mut exit,
+                &raw mut kernel,
+                &raw mut user,
+            )
+        };
+        if ok == 0 {
+            return Err("GetProcessTimes(GetCurrentProcess) failed".to_owned());
+        }
+        let to_u64 =
+            |ft: FILETIME| (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime);
+        Ok(to_u64(kernel).saturating_add(to_u64(user)))
+    }
+
+    /// Returns the current process private working set in bytes via Windows 11
+    /// `GetProcessMemoryInfo(PROCESS_MEMORY_COUNTERS_EX2::PrivateWorkingSetSize)`,
+    /// falling back to `NtQuerySystemInformation(SystemProcessInformation)` on older builds.
+    pub fn query_self_private_working_set_bytes() -> Result<u64, String> {
+        // SAFETY: `PROCESS_MEMORY_COUNTERS_EX2` is plain-old-data with a `cb` size header.
+        let mut counters: PROCESS_MEMORY_COUNTERS_EX2 = unsafe { core::mem::zeroed() };
+        let cb = u32::try_from(size_of::<PROCESS_MEMORY_COUNTERS_EX2>())
+            .map_err(|_| "PROCESS_MEMORY_COUNTERS_EX2 size overflow".to_owned())?;
+        counters.cb = cb;
+        // SAFETY: `GetCurrentProcess` returns a valid pseudo-handle and `counters` is writable for `cb` bytes.
+        let ok = unsafe {
+            GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                (&raw mut counters).cast::<PROCESS_MEMORY_COUNTERS>(),
+                cb,
+            )
+        };
+        if ok != 0 {
+            return Ok(counters.PrivateWorkingSetSize as u64);
+        }
+        let pid = std::process::id();
+        let mut scratch = Vec::new();
+        query_process_information(&mut scratch)?
+            .into_iter()
+            .find(|row| row.pid == pid)
+            .map(|row| row.working_set_private_bytes)
+            .ok_or_else(|| "current process missing from SystemProcessInformation".to_owned())
     }
 
     /// Returns system uptime in whole seconds from `GetTickCount64`.
@@ -875,6 +943,14 @@ mod stub {
         None
     }
 
+    pub fn query_self_cpu_time_100ns() -> Result<u64, String> {
+        Err("Windows process timing is only available on Windows".to_owned())
+    }
+
+    pub fn query_self_private_working_set_bytes() -> Result<u64, String> {
+        Err("Windows process memory telemetry is only available on Windows".to_owned())
+    }
+
     pub fn system_uptime_secs() -> u64 {
         0
     }
@@ -955,14 +1031,16 @@ mod stub {
 #[cfg(not(windows))]
 pub use stub::{
     TimerWake, TimerWaker, WaitableWakeTimer, query_core_efficiency_classes,
-    query_process_information, query_processor_performance, read_cpu_model_name,
-    read_cpu_nominal_mhz, system_uptime_secs, total_physical_memory_bytes,
+    query_process_information, query_processor_performance, query_self_cpu_time_100ns,
+    query_self_private_working_set_bytes, read_cpu_model_name, read_cpu_nominal_mhz,
+    system_uptime_secs, total_physical_memory_bytes,
 };
 #[cfg(windows)]
 pub use win::{
     TimerWake, TimerWaker, WaitableWakeTimer, query_core_efficiency_classes,
-    query_process_information, query_processor_performance, read_cpu_model_name,
-    read_cpu_nominal_mhz, system_uptime_secs, total_physical_memory_bytes,
+    query_process_information, query_processor_performance, query_self_cpu_time_100ns,
+    query_self_private_working_set_bytes, read_cpu_model_name, read_cpu_nominal_mhz,
+    system_uptime_secs, total_physical_memory_bytes,
 };
 
 #[cfg(test)]

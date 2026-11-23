@@ -25,6 +25,8 @@ jobs:
         run: cargo clippy -p btop-model -p btop-config -p btop-collect -p btop-term -p btop-ui --all-targets -- -D warnings
       - name: Test portable crates
         run: cargo test -p btop-model -p btop-config -p btop-collect -p btop-term -p btop-ui
+      - name: Run 200x60 render+diff performance budget (release)
+        run: cargo test --release -p btop-ui --test perf_budget -- --ignored --nocapture
 
   windows-x64:
     name: Windows 11 x64 (fmt, clippy, tests, CLI smoke)
@@ -40,8 +42,12 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy workspace
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Test workspace
+      - name: Test workspace (including live Windows 11 telemetry invariants)
         run: cargo test --workspace
+      - name: Run 200x60 render+diff performance budget (release)
+        run: cargo test --release -p btop-ui --test perf_budget -- --ignored --nocapture
+      - name: Run live Windows 11 self-overhead RSS and CPU budget (release)
+        run: cargo test --release -p btop-windows --test live_budgets -- --ignored --nocapture
       - name: Build binary and run CLI smoke checks
         shell: pwsh
         run: |
