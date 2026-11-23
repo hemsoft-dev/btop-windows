@@ -22,6 +22,8 @@ pub struct NetViewState {
     /// Stable `NET_LUID` of the selected adapter so enumeration reordering never switches adapters.
     pub selected_luid: Option<u64>,
     pub preferred_iface: Option<String>,
+    /// Explicitly chosen adapter name after interactive cycling (`b`/`n` or mouse `<b`/`n>`).
+    pub selected_iface_name: Option<String>,
     pub auto_scale: bool,
     pub synced_scale: bool,
     /// Per-interface `(rx_total_bytes, tx_total_bytes)` session baselines keyed by `NET_LUID`.
@@ -34,6 +36,7 @@ impl Default for NetViewState {
             selected_index: 0,
             selected_luid: None,
             preferred_iface: None,
+            selected_iface_name: None,
             auto_scale: true,
             synced_scale: true,
             session_baselines: BTreeMap::new(),
@@ -77,6 +80,7 @@ impl NetViewState {
             selected_index: 0,
             selected_luid: None,
             preferred_iface,
+            selected_iface_name: None,
             auto_scale: config.net_auto,
             synced_scale: config.net_sync,
             session_baselines: BTreeMap::new(),
@@ -137,6 +141,7 @@ impl NetViewState {
         self.preferred_iface = None;
         self.selected_index = next;
         self.selected_luid = Some(ifaces[next].luid);
+        self.selected_iface_name = Some(ifaces[next].name.clone());
     }
 
     /// Cycles to the next hardware interface (`n`).
@@ -152,6 +157,7 @@ impl NetViewState {
         self.preferred_iface = None;
         self.selected_index = next;
         self.selected_luid = Some(ifaces[next].luid);
+        self.selected_iface_name = Some(ifaces[next].name.clone());
     }
 
     /// Toggles auto-scaling (`a`).
@@ -438,12 +444,12 @@ fn render_net_chrome(
     let mid_limit = right_limit.saturating_sub(right_reserved);
 
     // Optional `[a]uto`, `[y]sync`, `[z]ero` mode tags only when they fit intact before interface tag.
-    let tags: [(char, &str, bool); 3] = [
-        ('a', "uto", state.auto_scale),
-        ('y', "sync", state.synced_scale),
-        ('z', "ero", false),
+    let tags: [(char, &str, bool, HitAction); 3] = [
+        ('a', "uto", state.auto_scale, HitAction::NetToggleAuto),
+        ('y', "sync", state.synced_scale, HitAction::NetToggleSync),
+        ('z', "ero", false, HitAction::NetResetTotals),
     ];
-    for (hk, suffix, active) in tags {
+    for (hk, suffix, active, action) in tags {
         let needed = u16::try_from(suffix.chars().count() + 3).unwrap_or(8);
         if cursor.saturating_add(needed) > mid_limit {
             break;
@@ -465,6 +471,7 @@ fn render_net_chrome(
             theme.hi_fg,
             theme.main_bg,
         ) {
+            grid.hit_map.push(t_rect, action);
             cursor = t_rect.x.saturating_add(t_rect.width).saturating_add(1);
         }
     }
@@ -473,7 +480,7 @@ fn render_net_chrome(
         let tag_width = u16::try_from(iface_tag.chars().count() + 2).unwrap_or(0);
         if right_limit > cursor.saturating_add(tag_width) {
             let tag_x = right_limit.saturating_sub(tag_width);
-            let _ = draw_border_tag(
+            if let Some(iface_rect) = draw_border_tag(
                 grid,
                 tag_x,
                 rect.y,
@@ -484,8 +491,37 @@ fn render_net_chrome(
                 theme.title,
                 theme.hi_fg,
                 theme.main_bg,
-            );
+            ) {
+                register_iface_cycle_hits(grid, iface_rect);
+            }
         }
+    }
+}
+
+fn register_iface_cycle_hits(grid: &mut Grid, iface_rect: Rect) {
+    let left_w = iface_rect.width / 2;
+    let right_w = iface_rect.width.saturating_sub(left_w);
+    if left_w > 0 {
+        grid.hit_map.push(
+            Rect {
+                x: iface_rect.x,
+                y: iface_rect.y,
+                width: left_w,
+                height: 1,
+            },
+            HitAction::NetPrevIface,
+        );
+    }
+    if right_w > 0 {
+        grid.hit_map.push(
+            Rect {
+                x: iface_rect.x.saturating_add(left_w),
+                y: iface_rect.y,
+                width: right_w,
+                height: 1,
+            },
+            HitAction::NetNextIface,
+        );
     }
 }
 

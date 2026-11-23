@@ -308,6 +308,7 @@ fn render_mem_chrome(
             theme.main_bg,
         )
     {
+        grid.hit_map.push(d_rect, HitAction::ToggleDisks);
         cursor = d_rect.x.saturating_add(d_rect.width).saturating_add(1);
     }
     let io_fg = if state.io_mode {
@@ -329,6 +330,7 @@ fn render_mem_chrome(
             theme.main_bg,
         )
     {
+        grid.hit_map.push(i_rect, HitAction::ToggleIoMode);
         cursor = i_rect.x.saturating_add(i_rect.width).saturating_add(1);
     }
 

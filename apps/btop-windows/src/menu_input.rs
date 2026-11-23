@@ -21,16 +21,55 @@ pub enum LoopAction {
     Quit,
 }
 
+/// Synchronizes live interactive `UiState` mutations back into `Config` so opening Options
+/// or saving `btop.conf` on exit reflects hotkey changes made during the session.
+pub fn sync_config_from_ui_state(config: &mut Config, ui_state: &UiState) {
+    let boxes = ui_state
+        .layout
+        .shown_boxes
+        .iter()
+        .map(|id| id.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !boxes.is_empty() {
+        config.shown_boxes = boxes;
+    }
+    config.cpu_bottom = ui_state.layout.cpu_bottom;
+    config.proc_left = ui_state.layout.proc_left;
+    config.mem_below_net = ui_state.layout.mem_below_net;
+    config.show_disks = ui_state.show_disks;
+    config.io_mode = ui_state.io_mode;
+    if let Some(ref iface) = ui_state.net.selected_iface_name {
+        iface.clone_into(&mut config.net_iface);
+    }
+    config.net_auto = ui_state.net.auto_scale;
+    config.net_sync = ui_state.net.synced_scale;
+    ui_state
+        .proc
+        .sort
+        .as_str()
+        .clone_into(&mut config.proc_sorting);
+    config.proc_reversed = ui_state.proc.reversed;
+    config.proc_tree = ui_state.proc.tree_mode;
+    config.proc_aggregate = ui_state.proc.aggregate;
+    config.proc_follow_detailed = ui_state.proc.follow_detailed;
+    config.proc_per_core = ui_state.proc.per_core_cpu;
+    config.proc_mem_bytes = ui_state.proc.mem_bytes;
+}
+
 /// Checks if an unmodified shortcut opens an overlay menu (`m`, `F2`/`o`, `F1`/`?`/`h` or `H`).
 pub fn try_open_menu_shortcut(
     code: KeyCode,
-    config: &Config,
+    config: &mut Config,
     ui_state: &mut UiState,
     prev_grid: &mut Option<Grid>,
 ) -> bool {
     let opened = match code {
         KeyCode::Char('m') => Some(OverlayMenu::main()),
-        KeyCode::F(2) | KeyCode::Char('o') => Some(OverlayMenu::options()),
+        KeyCode::F(2) | KeyCode::Char('o') => {
+            sync_config_from_ui_state(config, ui_state);
+            Some(OverlayMenu::options())
+        }
         KeyCode::F(1) | KeyCode::Char('?') => Some(OverlayMenu::help()),
         KeyCode::Char('h') if !config.vim_keys => Some(OverlayMenu::help()),
         KeyCode::Char('H') if config.vim_keys => Some(OverlayMenu::help()),
@@ -78,7 +117,7 @@ pub fn handle_menu_key(
         ),
         OverlayMenu::Help(state) => handle_help_key(key.code, config.vim_keys, size, state),
         OverlayMenu::MessageBox { dialog, .. } => {
-            let result = dialog.handle_key(key.code);
+            let result = dialog.handle_key_with_vim(key.code, config.vim_keys);
             return apply_messagebox_result(
                 result, sampler, snapshot, config, themes_dir, ui_state, prev_grid, menu,
             );
@@ -100,6 +139,9 @@ pub fn handle_menu_key(
             }
         }
         MenuKeyOutcome::Replace(next_menu) => {
+            if matches!(next_menu, OverlayMenu::Options(_)) {
+                sync_config_from_ui_state(config, ui_state);
+            }
             ui_state.menu = Some(next_menu);
             *prev_grid = None;
             LoopAction::Redraw
@@ -158,6 +200,7 @@ pub fn handle_menu_mouse(
     match (&mut menu, hit) {
         (OverlayMenu::Main(_), HitAction::MenuItem(idx)) => match MainMenuChoice::ALL.get(idx) {
             Some(MainMenuChoice::Options) => {
+                sync_config_from_ui_state(config, ui_state);
                 ui_state.menu = Some(OverlayMenu::options());
                 *prev_grid = None;
                 return LoopAction::Redraw;
@@ -282,8 +325,26 @@ fn handle_main_menu_key(
             state.move_down();
             MenuKeyOutcome::KeepOpen(true)
         }
+        KeyCode::Home => {
+            state.selected = 0;
+            MenuKeyOutcome::KeepOpen(true)
+        }
+        KeyCode::End => {
+            state.selected = MainMenuChoice::ALL.len().saturating_sub(1);
+            MenuKeyOutcome::KeepOpen(true)
+        }
+        KeyCode::Char('g') if vim_keys => {
+            state.selected = 0;
+            MenuKeyOutcome::KeepOpen(true)
+        }
+        KeyCode::Char('G') if vim_keys => {
+            state.selected = MainMenuChoice::ALL.len().saturating_sub(1);
+            MenuKeyOutcome::KeepOpen(true)
+        }
         KeyCode::F(2) | KeyCode::Char('o') => MenuKeyOutcome::Replace(OverlayMenu::options()),
-        KeyCode::F(1) | KeyCode::Char('?' | 'h') => MenuKeyOutcome::Replace(OverlayMenu::help()),
+        KeyCode::F(1) | KeyCode::Char('?') => MenuKeyOutcome::Replace(OverlayMenu::help()),
+        KeyCode::Char('h') if !vim_keys => MenuKeyOutcome::Replace(OverlayMenu::help()),
+        KeyCode::Char('H') if vim_keys => MenuKeyOutcome::Replace(OverlayMenu::help()),
         KeyCode::Char('q') => MenuKeyOutcome::Quit,
         KeyCode::Enter | KeyCode::Char(' ') => match state.selected_choice() {
             MainMenuChoice::Options => MenuKeyOutcome::Replace(OverlayMenu::options()),
@@ -388,16 +449,28 @@ fn handle_options_key(
             state.select_index(state.options().len().saturating_sub(1), vis);
             MenuKeyOutcome::KeepOpen(true)
         }
-        KeyCode::Left | KeyCode::Right => {
-            let dir = if code == KeyCode::Right { 1 } else { -1 };
-            let opt = state.selected_option();
-            let changed = opt.is_some_and(|o| o.step_with_themes(config, dir, available_themes));
-            if changed {
-                state.validation_error = None;
-                *changed_option = opt;
-            }
-            MenuKeyOutcome::KeepOpen(changed)
+        KeyCode::Char('g') if config.vim_keys => {
+            state.select_index(0, vis);
+            MenuKeyOutcome::KeepOpen(true)
         }
+        KeyCode::Char('G') if config.vim_keys => {
+            state.select_index(state.options().len().saturating_sub(1), vis);
+            MenuKeyOutcome::KeepOpen(true)
+        }
+        KeyCode::Left | KeyCode::Right => step_selected_option(
+            if code == KeyCode::Right { 1 } else { -1 },
+            config,
+            available_themes,
+            state,
+            changed_option,
+        ),
+        KeyCode::Char('h' | 'l') if config.vim_keys => step_selected_option(
+            if code == KeyCode::Char('l') { 1 } else { -1 },
+            config,
+            available_themes,
+            state,
+            changed_option,
+        ),
         KeyCode::Enter | KeyCode::Char(' ') => {
             activate_selected_option(config, available_themes, state, changed_option)
         }
@@ -418,6 +491,22 @@ fn handle_options_key(
         }
         _ => MenuKeyOutcome::KeepOpen(false),
     }
+}
+
+fn step_selected_option(
+    dir: i8,
+    config: &mut Config,
+    available_themes: &[String],
+    state: &mut btop_ui::OptionsState,
+    changed_option: &mut Option<OptionId>,
+) -> MenuKeyOutcome {
+    let opt = state.selected_option();
+    let changed = opt.is_some_and(|o| o.step_with_themes(config, dir, available_themes));
+    if changed {
+        state.validation_error = None;
+        *changed_option = opt;
+    }
+    MenuKeyOutcome::KeepOpen(changed)
 }
 
 fn activate_selected_option(
@@ -485,6 +574,14 @@ fn handle_help_key(
             MenuKeyOutcome::KeepOpen(true)
         }
         KeyCode::End => {
+            state.end(vis);
+            MenuKeyOutcome::KeepOpen(true)
+        }
+        KeyCode::Char('g') if vim_keys => {
+            state.home();
+            MenuKeyOutcome::KeepOpen(true)
+        }
+        KeyCode::Char('G') if vim_keys => {
             state.end(vis);
             MenuKeyOutcome::KeepOpen(true)
         }
@@ -594,6 +691,7 @@ pub fn sync_option_to_runtime(
         OptionId::NetIface => {
             let trimmed = config.net_iface.trim();
             ui_state.net.preferred_iface = (!trimmed.is_empty()).then(|| trimmed.to_owned());
+            ui_state.net.selected_iface_name = None;
             ui_state.net.observe_snapshot(snapshot);
         }
         _ => {}

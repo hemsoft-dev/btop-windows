@@ -13,17 +13,17 @@ expression: rendered
 │       │  rounded_corners        ◀ True ▶                          │                                          │  37%  │
 │0%     │  terminal_sync          ◀ True ▶                          │ Active color theme palette with instant  │  13%  │
 │       │  background_update      ◀ True ▶                          │ live preview.                            │       │
-│       │  update_ms              2000                              │                                          │       │
-│       │  shown_boxes            cpu mem net proc                  │ Theme preview: Default                   │       │
-│       │  clock_format           %X                                │ ████████████████                         │       │
-│pk     │  graph_symbol           ◀ braille ▶                       │                                          │512M   │
-╰─┐WIN11│  vim_keys               ◀ False ▶                         │                                          │───────╯
-╭─┐²mem┌│  disable_mouse          ◀ False ▶                         │                                          │┐1/52┌─╮
-│ RAM ■■│  cpu_bottom             ◀ False ▶                         │                                          │ Cpu%  │
-│ Used  │  proc_left              ◀ False ▶                         │                                          │ 12.8 █│
-│ Avail │  mem_below_net          ◀ False ▶                         │                                          │  5.3 ││
-│ Cache │  show_battery           ◀ True ▶                          │                                          │  4.2 ││
-│ Free  │                                                           │                                          │  4.2 ││
+│       │  save_config_on_exit    ◀ True ▶                          │                                          │       │
+│       │  update_ms              2000                              │ Theme preview: Default                   │       │
+│       │  shown_boxes            cpu mem net proc                  │ ████████████████                         │       │
+│pk     │  clock_format           %X                                │                                          │512M   │
+╰─┐WIN11│  graph_symbol           ◀ braille ▶                       │                                          │───────╯
+╭─┐²mem┌│  vim_keys               ◀ False ▶                         │                                          │┐1/52┌─╮
+│ RAM ■■│  disable_mouse          ◀ False ▶                         │                                          │ Cpu%  │
+│ Used  │  cpu_bottom             ◀ False ▶                         │                                          │ 12.8 █│
+│ Avail │  proc_left              ◀ False ▶                         │                                          │  5.3 ││
+│ Cache │  mem_below_net          ◀ False ▶                         │                                          │  4.2 ││
+│ Free  │  show_battery           ◀ True ▶                          │                                          │  4.2 ││
 │       │                                                           │                                          │  3.9 ││
 │       │                                                           │                                          │  3.9 ││
 │───────│                                                           │                                          │  3.6 ││

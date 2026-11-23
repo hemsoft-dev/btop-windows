@@ -6,6 +6,8 @@
 pub mod theme;
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -14,6 +16,65 @@ pub use theme::{
     ALL_THEME_KEYS, BUNDLED_THEMES, ThemeColor, ThemeError, ThemeGradient101, ThemeRgb,
     ThemeSearchPaths, ThemeSpec, load_bundled_theme, parse_color_value, parse_theme,
 };
+
+/// Resolved `btop.conf` file path and discovery mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigLocation {
+    /// Explicitly specified via `-c` / `--config <file>`.
+    Explicit(PathBuf),
+    /// Portable mode: `btop.conf` adjacent to `btop-windows.exe`.
+    Portable(PathBuf),
+    /// Standard Windows user config: `%APPDATA%\btop-windows\btop.conf`.
+    AppData(PathBuf),
+}
+
+impl ConfigLocation {
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Explicit(p) | Self::Portable(p) | Self::AppData(p) => p.as_path(),
+        }
+    }
+}
+
+/// Resolves the active `btop.conf` location using strict precedence:
+/// 1. Explicit `-c` / `--config <file>`
+/// 2. Portable mode: exe-adjacent `btop.conf` when that file already exists
+/// 3. Standard Windows path: `%APPDATA%\btop-windows\btop.conf`
+/// 4. Fallback to exe-adjacent `btop.conf` when `%APPDATA%` is unavailable
+pub fn resolve_config_location(explicit_path: Option<&Path>) -> Option<ConfigLocation> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+    let appdata = std::env::var_os("APPDATA")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    resolve_config_location_with(explicit_path, exe_dir.as_deref(), appdata.as_deref())
+}
+
+/// Pure, testable variant of [`resolve_config_location`] accepting injected directories.
+pub fn resolve_config_location_with(
+    explicit_path: Option<&Path>,
+    exe_dir: Option<&Path>,
+    appdata: Option<&Path>,
+) -> Option<ConfigLocation> {
+    if let Some(path) = explicit_path {
+        return Some(ConfigLocation::Explicit(path.to_path_buf()));
+    }
+    if let Some(dir) = exe_dir {
+        let portable = dir.join("btop.conf");
+        if portable.is_file() {
+            return Some(ConfigLocation::Portable(portable));
+        }
+    }
+    if let Some(ad) = appdata
+        && !ad.as_os_str().is_empty()
+    {
+        return Some(ConfigLocation::AppData(
+            ad.join("btop-windows").join("btop.conf"),
+        ));
+    }
+    exe_dir.map(|dir| ConfigLocation::Portable(dir.join("btop.conf")))
+}
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -117,6 +178,7 @@ pub struct Config {
     pub rounded_corners: bool,
     pub terminal_sync: bool,
     pub background_update: bool,
+    pub save_config_on_exit: bool,
     pub vim_keys: bool,
     pub disable_mouse: bool,
     pub graph_symbol: GraphSymbol,
@@ -174,6 +236,7 @@ impl Default for Config {
             rounded_corners: true,
             terminal_sync: true,
             background_update: true,
+            save_config_on_exit: true,
             vim_keys: false,
             disable_mouse: false,
             graph_symbol: GraphSymbol::Braille,
@@ -236,7 +299,12 @@ impl Config {
 
     /// Renders a default `btop.conf` compatible with upstream `aristocratos/btop`.
     pub fn render_default_conf() -> String {
-        let cfg = Self::default();
+        Self::default().render_conf()
+    }
+
+    /// Serializes this [`Config`] to upstream-compatible `key = value` `btop.conf` format,
+    /// preserving any unknown or deferred upstream keys in [`Self::preserved_unknown`].
+    pub fn render_conf(&self) -> String {
         let mut out = format!(
             concat!(
                 "#? Config file for btop-windows (English Windows 11 x64)\n\n",
@@ -244,12 +312,21 @@ impl Config {
                 "color_theme = \"{color_theme}\"\n\n",
                 "#* Show theme background color; set False for terminal transparency.\n",
                 "theme_background = {theme_background}\n\n",
+                "#* Preserved upstream display flags (Windows 11 Terminal is TrueColor natively).\n",
+                "truecolor = {truecolor}\n",
+                "force_tty = {force_tty}\n\n",
                 "#* Rounded corners on boxes.\n",
                 "rounded_corners = {rounded_corners}\n\n",
                 "#* Use DEC 2026 synchronized output sequences to prevent tearing.\n",
                 "terminal_sync = {terminal_sync}\n\n",
                 "#* Continue updating live telemetry in the background while overlay menus are open.\n",
                 "background_update = {background_update}\n\n",
+                "#* Save updated settings to btop.conf cleanly on exit.\n",
+                "save_config_on_exit = {save_config_on_exit}\n\n",
+                "#* Enable h/j/k/l/g/G vim navigation (moves Help to H and Terminate to K).\n",
+                "vim_keys = {vim_keys}\n\n",
+                "#* Disable mouse click and scroll wheel handling.\n",
+                "disable_mouse = {disable_mouse}\n\n",
                 "#* Default graph symbol: \"braille\" or \"block\".\n",
                 "graph_symbol = \"{graph_symbol}\"\n\n",
                 "#* Shown panels: \"cpu mem net proc\" and \"gpu0\" through \"gpu5\".\n",
@@ -272,32 +349,78 @@ impl Config {
                 "proc_aggregate = {proc_aggregate}\n",
                 "proc_cpu_graphs = {proc_cpu_graphs}\n",
                 "proc_follow_detailed = {proc_follow_detailed}\n",
+                "proc_per_core = {proc_per_core}\n",
+                "proc_mem_bytes = {proc_mem_bytes}\n",
             ),
-            color_theme = cfg.color_theme,
-            theme_background = bool_title(cfg.theme_background),
-            rounded_corners = bool_title(cfg.rounded_corners),
-            terminal_sync = bool_title(cfg.terminal_sync),
-            background_update = bool_title(cfg.background_update),
-            graph_symbol = cfg.graph_symbol.as_str(),
-            shown_boxes = cfg.shown_boxes,
-            presets = cfg.presets,
-            disable_presets = cfg.disable_presets.as_str(),
-            cpu_bottom = bool_title(cfg.cpu_bottom),
-            proc_left = bool_title(cfg.proc_left),
-            mem_below_net = bool_title(cfg.mem_below_net),
-            show_battery = bool_title(cfg.show_battery),
-            update_ms = cfg.update_ms,
-            clock_format = cfg.clock_format,
-            proc_sorting = cfg.proc_sorting,
-            proc_reversed = bool_title(cfg.proc_reversed),
-            proc_tree = bool_title(cfg.proc_tree),
-            proc_aggregate = bool_title(cfg.proc_aggregate),
-            proc_cpu_graphs = bool_title(cfg.proc_cpu_graphs),
-            proc_follow_detailed = bool_title(cfg.proc_follow_detailed),
+            color_theme = sanitize_conf_str(&self.color_theme),
+            theme_background = bool_title(self.theme_background),
+            truecolor = bool_title(self.truecolor),
+            force_tty = bool_title(self.force_tty),
+            rounded_corners = bool_title(self.rounded_corners),
+            terminal_sync = bool_title(self.terminal_sync),
+            background_update = bool_title(self.background_update),
+            save_config_on_exit = bool_title(self.save_config_on_exit),
+            vim_keys = bool_title(self.vim_keys),
+            disable_mouse = bool_title(self.disable_mouse),
+            graph_symbol = self.graph_symbol.as_str(),
+            shown_boxes = sanitize_conf_str(&self.shown_boxes),
+            presets = sanitize_conf_str(&self.presets),
+            disable_presets = self.disable_presets.as_str(),
+            cpu_bottom = bool_title(self.cpu_bottom),
+            proc_left = bool_title(self.proc_left),
+            mem_below_net = bool_title(self.mem_below_net),
+            show_battery = bool_title(self.show_battery),
+            update_ms = self.update_ms,
+            clock_format = sanitize_conf_str(&self.clock_format),
+            proc_sorting = sanitize_conf_str(&self.proc_sorting),
+            proc_reversed = bool_title(self.proc_reversed),
+            proc_tree = bool_title(self.proc_tree),
+            proc_aggregate = bool_title(self.proc_aggregate),
+            proc_cpu_graphs = bool_title(self.proc_cpu_graphs),
+            proc_follow_detailed = bool_title(self.proc_follow_detailed),
+            proc_per_core = bool_title(self.proc_per_core),
+            proc_mem_bytes = bool_title(self.proc_mem_bytes),
         );
-        out.push_str(&render_mem_net_cpu_defaults(&cfg));
-        out.push_str(&render_gpu_defaults(&cfg));
+        out.push_str(&render_mem_net_cpu_defaults(self));
+        out.push_str(&render_gpu_defaults(self));
+        if !self.preserved_unknown.is_empty() {
+            out.push_str("\n#* Preserved upstream / unknown keys.\n");
+            for (key, val) in &self.preserved_unknown {
+                let clean_key = sanitize_conf_key(key);
+                if clean_key.is_empty() {
+                    continue;
+                }
+                let clean_val = sanitize_conf_str(val);
+                if is_bare_conf_literal(&clean_val) {
+                    let _ = writeln!(out, "{clean_key} = {clean_val}");
+                } else {
+                    let _ = writeln!(out, "{clean_key} = \"{clean_val}\"");
+                }
+            }
+        }
         out
+    }
+
+    /// Atomically writes `self.render_conf()` to `path`, creating parent directories if needed.
+    pub fn save_to_path(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let content = self.render_conf();
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("btop.conf");
+        let tmp_name = format!("{file_name}.tmp.{}", std::process::id());
+        let tmp_path = path.with_file_name(tmp_name);
+        std::fs::write(&tmp_path, content.as_bytes())?;
+        if let Err(err) = std::fs::rename(&tmp_path, path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// Parses an upstream-style `key = value` config string while preserving unknown keys.
@@ -352,21 +475,21 @@ fn render_mem_net_cpu_defaults(cfg: &Config) -> String {
         mem_graphs = bool_title(cfg.mem_graphs),
         show_swap = bool_title(cfg.show_swap),
         base_10_sizes = bool_title(cfg.base_10_sizes),
-        disks_filter = cfg.disks_filter,
+        disks_filter = sanitize_conf_str(&cfg.disks_filter),
         show_disks = bool_title(cfg.show_disks),
         show_io_stat = bool_title(cfg.show_io_stat),
         io_mode = bool_title(cfg.io_mode),
         io_graph_combined = bool_title(cfg.io_graph_combined),
-        io_graph_speeds = cfg.io_graph_speeds,
-        net_iface = cfg.net_iface,
+        io_graph_speeds = sanitize_conf_str(&cfg.io_graph_speeds),
+        net_iface = sanitize_conf_str(&cfg.net_iface),
         net_download = cfg.net_download,
         net_upload = cfg.net_upload,
         net_auto = bool_title(cfg.net_auto),
         net_sync = bool_title(cfg.net_sync),
         swap_upload_download = bool_title(cfg.swap_upload_download),
         base_10_bitrate = bool_title(cfg.base_10_bitrate),
-        cpu_util_mode = cfg.cpu_util_mode,
-        freq_mode = cfg.freq_mode,
+        cpu_util_mode = sanitize_conf_str(&cfg.cpu_util_mode),
+        freq_mode = sanitize_conf_str(&cfg.freq_mode),
     )
 }
 
@@ -378,17 +501,23 @@ fn render_gpu_defaults(cfg: &Config) -> String {
             "gpu_mirror_graph = {gpu_mirror_graph}\n",
             "graph_symbol_gpu = \"{graph_symbol_gpu}\"\n",
             "nvml_measure_pcie_speeds = {nvml_measure_pcie_speeds}\n",
-            "custom_gpu_name0 = \"\"\n",
-            "custom_gpu_name1 = \"\"\n",
-            "custom_gpu_name2 = \"\"\n",
-            "custom_gpu_name3 = \"\"\n",
-            "custom_gpu_name4 = \"\"\n",
-            "custom_gpu_name5 = \"\"\n",
+            "custom_gpu_name0 = \"{gpu0}\"\n",
+            "custom_gpu_name1 = \"{gpu1}\"\n",
+            "custom_gpu_name2 = \"{gpu2}\"\n",
+            "custom_gpu_name3 = \"{gpu3}\"\n",
+            "custom_gpu_name4 = \"{gpu4}\"\n",
+            "custom_gpu_name5 = \"{gpu5}\"\n",
         ),
         show_gpu_info = cfg.show_gpu_info.as_str(),
         gpu_mirror_graph = bool_title(cfg.gpu_mirror_graph),
         graph_symbol_gpu = cfg.graph_symbol_gpu.map_or("default", GraphSymbol::as_str),
         nvml_measure_pcie_speeds = bool_title(cfg.nvml_measure_pcie_speeds),
+        gpu0 = sanitize_conf_str(&cfg.custom_gpu_names[0]),
+        gpu1 = sanitize_conf_str(&cfg.custom_gpu_names[1]),
+        gpu2 = sanitize_conf_str(&cfg.custom_gpu_names[2]),
+        gpu3 = sanitize_conf_str(&cfg.custom_gpu_names[3]),
+        gpu4 = sanitize_conf_str(&cfg.custom_gpu_names[4]),
+        gpu5 = sanitize_conf_str(&cfg.custom_gpu_names[5]),
     )
 }
 
@@ -404,6 +533,7 @@ fn apply_config_entry(cfg: &mut Config, key: &str, val: String) -> Result<(), Co
         "rounded_corners" => cfg.rounded_corners = parse_bool(key, &val)?,
         "terminal_sync" => cfg.terminal_sync = parse_bool(key, &val)?,
         "background_update" => cfg.background_update = parse_bool(key, &val)?,
+        "save_config_on_exit" => cfg.save_config_on_exit = parse_bool(key, &val)?,
         "vim_keys" => cfg.vim_keys = parse_bool(key, &val)?,
         "disable_mouse" => cfg.disable_mouse = parse_bool(key, &val)?,
         "shown_boxes" => cfg.shown_boxes = val,
@@ -507,6 +637,28 @@ fn parse_graph_symbol(key: &str, val: &str) -> Result<GraphSymbol, ConfigError> 
 
 fn bool_title(v: bool) -> &'static str {
     if v { "True" } else { "False" }
+}
+
+fn sanitize_conf_str(s: &str) -> String {
+    s.chars().filter(|&ch| !matches!(ch, '\r' | '\n')).collect()
+}
+
+fn sanitize_conf_key(s: &str) -> String {
+    s.trim()
+        .chars()
+        .filter(|&ch| !matches!(ch, '\r' | '\n' | '=' | '#'))
+        .collect()
+}
+
+fn is_bare_conf_literal(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    if matches!(s, "True" | "False" | "true" | "false") {
+        return true;
+    }
+    let rest = s.strip_prefix('-').unwrap_or(s);
+    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn unquote(s: &str) -> String {
@@ -615,5 +767,138 @@ mod tests {
         assert_eq!(parsed.custom_gpu_name(0), Some("Primary 5090"));
         assert_eq!(parsed.custom_gpu_name(1), Some("Radeon iGPU"));
         assert_eq!(parsed.custom_gpu_name(2), None);
+    }
+
+    #[test]
+    fn roundtrip_save_preserves_unknown_unix_keys_and_mutated_settings() {
+        let initial = concat!(
+            "color_theme = \"Default\"\n",
+            "truecolor = False\n",
+            "force_tty = True\n",
+            "update_ms = 2000\n",
+            "vim_keys = False\n",
+            "save_config_on_exit = True\n",
+            "use_fstab = True\n",
+            "zfs_arc_cached = True\n",
+            "proc_info_smaps = False\n",
+            "custom_unix_sensor = \"coretemp/Package \"0\"\"\n",
+        );
+        let mut cfg = Config::parse(initial).expect("parse initial conf");
+        assert!(!cfg.truecolor);
+        assert!(cfg.force_tty);
+        assert_eq!(cfg.preserved_unknown.len(), 4);
+
+        // Mutate settings as a user would in Options / hotkeys.
+        cfg.color_theme = "tokyo-night".to_owned();
+        cfg.theme_background = false;
+        cfg.update_ms = 1200;
+        cfg.vim_keys = true;
+        cfg.disable_mouse = true;
+        cfg.proc_sorting = "memory".to_owned();
+        cfg.proc_reversed = true;
+        cfg.proc_tree = true;
+        cfg.proc_per_core = true;
+        cfg.proc_mem_bytes = false;
+        cfg.custom_gpu_names[0] = "RTX \"5090\"".to_owned();
+
+        let unique = format!(
+            "btop-windows-roundtrip-{}-{}.conf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        );
+        let path = std::env::temp_dir().join("btop-roundtrip-dir").join(unique);
+        cfg.save_to_path(&path).expect("save btop.conf to disk");
+
+        let saved_text = std::fs::read_to_string(&path).expect("read saved conf");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(path.parent().expect("parent dir"));
+
+        let reloaded = Config::parse(&saved_text).expect("re-parse saved conf");
+        assert_eq!(reloaded.color_theme, "tokyo-night");
+        assert!(!reloaded.theme_background);
+        assert!(!reloaded.truecolor);
+        assert!(reloaded.force_tty);
+        assert_eq!(reloaded.update_ms, 1200);
+        assert!(reloaded.vim_keys);
+        assert!(reloaded.disable_mouse);
+        assert!(reloaded.save_config_on_exit);
+        assert_eq!(reloaded.proc_sorting, "memory");
+        assert!(reloaded.proc_reversed);
+        assert!(reloaded.proc_tree);
+        assert!(reloaded.proc_per_core);
+        assert!(!reloaded.proc_mem_bytes);
+        assert_eq!(reloaded.custom_gpu_name(0), Some("RTX \"5090\""));
+
+        // All unknown Unix keys must survive cleanly verbatim.
+        assert_eq!(
+            reloaded
+                .preserved_unknown
+                .get("use_fstab")
+                .map(String::as_str),
+            Some("True")
+        );
+        assert_eq!(
+            reloaded
+                .preserved_unknown
+                .get("zfs_arc_cached")
+                .map(String::as_str),
+            Some("True")
+        );
+        assert_eq!(
+            reloaded
+                .preserved_unknown
+                .get("proc_info_smaps")
+                .map(String::as_str),
+            Some("False")
+        );
+        assert_eq!(
+            reloaded
+                .preserved_unknown
+                .get("custom_unix_sensor")
+                .map(String::as_str),
+            Some("coretemp/Package \"0\"")
+        );
+    }
+
+    #[test]
+    fn resolves_explicit_portable_and_appdata_config_locations() {
+        let root = std::env::temp_dir().join(format!(
+            "btop-cfg-loc-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let exe_dir = root.join("bin");
+        let appdata = root.join("appdata");
+        std::fs::create_dir_all(&exe_dir).expect("mkdir exe_dir");
+        std::fs::create_dir_all(&appdata).expect("mkdir appdata");
+
+        // 1. Without exe-adjacent btop.conf, falls back to %APPDATA%\btop-windows\btop.conf.
+        assert_eq!(
+            resolve_config_location_with(None, Some(&exe_dir), Some(&appdata)),
+            Some(ConfigLocation::AppData(
+                appdata.join("btop-windows").join("btop.conf")
+            ))
+        );
+
+        // 2. When exe-adjacent btop.conf exists, portable mode takes precedence over %APPDATA%.
+        let portable_conf = exe_dir.join("btop.conf");
+        std::fs::write(&portable_conf, "update_ms = 1000\n").expect("write portable conf");
+        assert_eq!(
+            resolve_config_location_with(None, Some(&exe_dir), Some(&appdata)),
+            Some(ConfigLocation::Portable(portable_conf.clone()))
+        );
+
+        // 3. Explicit -c path always overrides both portable and %APPDATA%.
+        let explicit = root.join("custom.conf");
+        assert_eq!(
+            resolve_config_location_with(Some(&explicit), Some(&exe_dir), Some(&appdata)),
+            Some(ConfigLocation::Explicit(explicit))
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

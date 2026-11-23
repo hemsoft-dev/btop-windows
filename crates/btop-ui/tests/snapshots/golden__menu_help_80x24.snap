@@ -22,7 +22,7 @@ expression: rendered
 ╭─│ b / n                    Select previous / next hardware network adapter │││
 │ │ a / y / z                Toggle auto-scale, sync scale, or reset sessio… │││
 │ │ ── Processes & Tree ──                                                   │││
-│ │ Up / Down / PgUp / PgDn  Navigate process list (Home / End to jump)      │││
+│ │ Up / Down / PgUp / PgDn  Navigate process list (j/k/g/G when vim_keys=T… │││
 │ │ ↑↓ / PgUp / PgDn scroll (1-17 of 29)  |  Esc / q close                   │││
 │ ╰──────────────────────────────────────────────────────────────────────────╯││
 ╰───────────────────────────────╯╰─┐↑↓ sel | e tree | f filter | u pause | F f┌╯
