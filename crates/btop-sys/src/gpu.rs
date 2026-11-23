@@ -86,16 +86,27 @@ pub fn filter_hardware_adapters(adapters: Vec<RawGpuAdapter>) -> Vec<RawGpuAdapt
         .collect()
 }
 
+fn find_ascii_case_insensitive(haystack: &str, needle_lower: &[u8]) -> Option<usize> {
+    let bytes = haystack.as_bytes();
+    if needle_lower.is_empty() || bytes.len() < needle_lower.len() {
+        return None;
+    }
+    bytes
+        .windows(needle_lower.len())
+        .position(|w| w.eq_ignore_ascii_case(needle_lower))
+}
+
 /// Extracts the `luid_0x{HIGH}_0x{LOW}` token from a WDDM PDH counter instance name.
 ///
 /// Examples:
 /// - `pid_4216_luid_0x00000000_0x000189EF_phys_0_eng_0_engtype_3D` -> `Some(0x00000000_000189EF)`
 /// - `luid_0x00000000_0x0001E8E2_phys_0` -> `Some(0x00000000_0001E8E2)`
 pub fn parse_gpu_pdh_luid(instance: &str) -> Option<u64> {
-    let lower = instance.to_ascii_lowercase();
-    let idx = lower.find("luid_0x")?;
-    let rest = &lower[idx + "luid_0x".len()..];
-    let (hi_hex, after_hi) = rest.split_once("_0x")?;
+    let idx = find_ascii_case_insensitive(instance, b"luid_0x")?;
+    let rest = &instance[idx + "luid_0x".len()..];
+    let sep = find_ascii_case_insensitive(rest, b"_0x")?;
+    let hi_hex = &rest[..sep];
+    let after_hi = &rest[sep + "_0x".len()..];
     let lo_hex = after_hi
         .split('_')
         .next()
@@ -108,10 +119,11 @@ pub fn parse_gpu_pdh_luid(instance: &str) -> Option<u64> {
 /// Extracts `(luid, engine_key)` from a `\GPU Engine(*)` instance name, stripping the leading
 /// `pid_<N>_` prefix so utilization across all processes on the same physical engine sums cleanly.
 pub fn parse_gpu_engine_key(instance: &str) -> Option<(u64, String)> {
-    let lower = instance.to_ascii_lowercase();
-    let idx = lower.find("luid_0x")?;
-    let rest = &lower[idx + "luid_0x".len()..];
-    let (hi_hex, after_hi) = rest.split_once("_0x")?;
+    let idx = find_ascii_case_insensitive(instance, b"luid_0x")?;
+    let rest = &instance[idx + "luid_0x".len()..];
+    let sep = find_ascii_case_insensitive(rest, b"_0x")?;
+    let hi_hex = &rest[..sep];
+    let after_hi = &rest[sep + "_0x".len()..];
     let (lo_hex, engine_suffix) = after_hi.split_once('_')?;
     if engine_suffix.is_empty() {
         return None;
@@ -119,7 +131,7 @@ pub fn parse_gpu_engine_key(instance: &str) -> Option<(u64, String)> {
     let high = u32::from_str_radix(hi_hex, 16).ok()?;
     let low = u32::from_str_radix(lo_hex, 16).ok()?;
     let luid = (u64::from(high) << 32) | u64::from(low);
-    Some((luid, engine_suffix.to_owned()))
+    Some((luid, engine_suffix.to_ascii_lowercase()))
 }
 
 /// Computes Task Manager's headline GPU utilization per adapter LUID:
@@ -477,13 +489,13 @@ mod win {
             {
                 continue;
             }
-            let name = decode_wide_in_buffer(item.szName, buf_start, buf_end);
-            if name.is_empty() {
-                continue;
-            }
             // SAFETY: `PDH_FMT_DOUBLE` populates `doubleValue`.
             let val = unsafe { item.FmtValue.Anonymous.doubleValue };
-            if val.is_finite() {
+            if !val.is_finite() {
+                continue;
+            }
+            let name = decode_wide_in_buffer(item.szName, buf_start, buf_end);
+            if !name.is_empty() {
                 out.push((name, val));
             }
         }
@@ -507,13 +519,13 @@ mod win {
             {
                 continue;
             }
-            let name = decode_wide_in_buffer(item.szName, buf_start, buf_end);
-            if name.is_empty() {
-                continue;
-            }
             // SAFETY: `PDH_FMT_LARGE` populates `largeValue`.
             let val = unsafe { item.FmtValue.Anonymous.largeValue };
-            if val >= 0 {
+            if val < 0 {
+                continue;
+            }
+            let name = decode_wide_in_buffer(item.szName, buf_start, buf_end);
+            if !name.is_empty() {
                 out.push((name, val.cast_unsigned()));
             }
         }
@@ -529,16 +541,18 @@ mod win {
             return String::new();
         }
         let max_units = ((buf_end - addr) / size_of::<u16>()).min(512);
-        let mut units = Vec::new();
-        for idx in 0..max_units {
-            // SAFETY: `addr + (idx + 1) * 2 <= buf_end`, strictly inside the PDH output buffer.
-            let ch = unsafe { ptr.add(idx).read_unaligned() };
+        let mut units = [0u16; 512];
+        let mut len = 0usize;
+        for ch_slot in units.iter_mut().take(max_units) {
+            // SAFETY: `addr + (len + 1) * 2 <= buf_end`, strictly inside the PDH output buffer.
+            let ch = unsafe { ptr.add(len).read_unaligned() };
             if ch == 0 {
                 break;
             }
-            units.push(ch);
+            *ch_slot = ch;
+            len += 1;
         }
-        String::from_utf16_lossy(&units)
+        String::from_utf16_lossy(&units[..len])
     }
 }
 

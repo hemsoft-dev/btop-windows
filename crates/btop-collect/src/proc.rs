@@ -123,12 +123,13 @@ impl ProcessDeltaTracker {
     }
 }
 
-/// Stateful Windows 11 read-only process collector reusing its NT query buffer across ticks
-/// and caching immutable per-process metadata keyed by `(pid, create_time_100ns)` plus a local
+/// Stateful Windows 11 read-only process collector sizing its transient NT query buffer from
+/// the last observed snapshot size (releasing large buffers back to the OS between ticks) and
+/// caching immutable per-process metadata keyed by `(pid, create_time_100ns)` plus a local
 /// SID-to-account cache.
 #[derive(Debug, Default)]
 pub struct ProcessCollector {
-    scratch: Vec<u8>,
+    last_scratch_bytes: usize,
     tracker: ProcessDeltaTracker,
     meta_cache: HashMap<ProcessIdentity, CachedProcessMeta>,
     sid_cache: SidAccountCache,
@@ -137,9 +138,11 @@ pub struct ProcessCollector {
 }
 
 impl ProcessCollector {
+    const INITIAL_SCRATCH_BYTES: usize = 256 * 1024;
+
     pub fn new() -> Self {
         Self {
-            scratch: Vec::with_capacity(256 * 1024),
+            last_scratch_bytes: Self::INITIAL_SCRATCH_BYTES,
             tracker: ProcessDeltaTracker::default(),
             meta_cache: HashMap::new(),
             sid_cache: SidAccountCache::new(),
@@ -166,7 +169,9 @@ impl ProcessCollector {
         logical_cpus: usize,
     ) -> Result<(Vec<ProcessEntry>, u32), CollectError> {
         let now = Instant::now();
-        let raw = query_process_information(&mut self.scratch).map_err(CollectError::Platform)?;
+        let mut scratch = vec![0u8; self.last_scratch_bytes.max(Self::INITIAL_SCRATCH_BYTES)];
+        let raw = query_process_information(&mut scratch).map_err(CollectError::Platform)?;
+        self.last_scratch_bytes = scratch.len();
         let elapsed_100ns = self.last_sample.map_or(0, |prev| {
             u64::try_from(now.saturating_duration_since(prev).as_nanos() / 100).unwrap_or(u64::MAX)
         });
@@ -209,7 +214,7 @@ impl ProcessCollector {
         }
 
         if !pending_recheck.is_empty() {
-            let post_live: HashSet<ProcessIdentity> = query_process_information(&mut self.scratch)
+            let post_live: HashSet<ProcessIdentity> = query_process_information(&mut scratch)
                 .map(|rows| {
                     rows.into_iter()
                         .map(|r| ProcessIdentity {
@@ -219,6 +224,7 @@ impl ProcessCollector {
                         .collect()
                 })
                 .unwrap_or_default();
+            self.last_scratch_bytes = scratch.len();
 
             for (idx, mut meta) in pending_recheck {
                 let entry = &mut entries[idx];
