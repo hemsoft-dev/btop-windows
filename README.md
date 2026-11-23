@@ -87,6 +87,15 @@ docs/
 ## Local development
 
 ```powershell
+# Build (if needed) and launch from the repo root
+.\run.ps1
+
+# Useful run.ps1 options
+.\run.ps1 -Build                  # Force a fresh release build
+.\run.ps1 -DebugBuild             # Build and run the debug binary
+.\run.ps1 -Replay                 # Run against the dual-GPU replay fixture
+.\run.ps1 --update-ms 1000        # Forward CLI flags to btop-windows.exe
+
 # Format check
 cargo fmt --all -- --check
 
@@ -95,10 +104,6 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 # Run tests
 cargo test --workspace
-
-# Run CLI help / default config
-cargo run -p btop-windows -- --help
-cargo run -p btop-windows -- --default-config
 ```
 
 ## Milestones
