@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
-/// Interval after which the TUI forces a full-grid repaint (`prev_grid = None`) so web/PWA
-/// terminals (such as `xterm.js` reconnecting or resuming after a tab/window switch)
-/// self-heal missing borders and static labels even when no focus or resize event arrives.
+/// Interval after which the TUI forces a full-grid cell repaint (`prev_grid = None`) so terminals
+/// or web/PWA panes that dropped earlier incremental diff frames recover static box borders and
+/// labels even when no focus or resize event arrives.
 const FULL_REDRAW_INTERVAL: Duration = Duration::from_secs(5);
 
 use btop_collect::{CollectError, FreqMode, Sampler, SnapshotSource};
