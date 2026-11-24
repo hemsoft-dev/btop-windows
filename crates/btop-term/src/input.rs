@@ -70,6 +70,7 @@ pub enum TermEvent {
     Key(KeyEvent),
     Mouse(MouseEvent),
     Resize(Size),
+    FocusGained,
 }
 
 /// Abstracts keyboard, mouse, and resize event polling for live terminals and tests.
@@ -144,6 +145,7 @@ fn translate_crossterm_event(raw: &Event) -> Option<TermEvent> {
             width: *width,
             height: *height,
         })),
+        Event::FocusGained => Some(TermEvent::FocusGained),
         _ => None,
     }
 }
@@ -252,5 +254,14 @@ mod tests {
             }))
         );
         assert_eq!(src.poll(Duration::from_millis(1)).expect("empty"), None);
+    }
+
+    #[test]
+    fn translates_focus_gained_and_ignores_focus_lost() {
+        assert_eq!(
+            translate_crossterm_event(&Event::FocusGained),
+            Some(TermEvent::FocusGained)
+        );
+        assert_eq!(translate_crossterm_event(&Event::FocusLost), None);
     }
 }

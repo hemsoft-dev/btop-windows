@@ -78,7 +78,7 @@ checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
 name = "btop-collect"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arc-swap",
  "btop-model",
@@ -88,7 +88,7 @@ dependencies = [
 
 [[package]]
 name = "btop-config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "thiserror",
@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "btop-model"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -105,7 +105,7 @@ dependencies = [
 
 [[package]]
 name = "btop-sys"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "windows",
  "windows-sys 0.61.2",
@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "btop-term"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "crossterm",
  "thiserror",
@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "btop-ui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "btop-config",
  "btop-model",
@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "btop-windows"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "btop-collect",
  "btop-config",

@@ -19,10 +19,10 @@ pub enum TermError {
     UnsupportedPlatform,
 }
 
-/// Escape sequence to enter alternate screen, hide cursor, and enable SGR mouse tracking.
-pub const ENTER_SEQUENCE: &str = "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h";
-/// Escape sequence to disable mouse tracking, reset SGR, show cursor, and leave alternate screen.
-pub const LEAVE_SEQUENCE: &str = "\x1b[?1006l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l";
+/// Escape sequence to enter alternate screen, hide cursor, and enable SGR mouse and focus tracking.
+pub const ENTER_SEQUENCE: &str = "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h\x1b[?1004h";
+/// Escape sequence to disable focus and mouse tracking, reset SGR, show cursor, and leave alternate screen.
+pub const LEAVE_SEQUENCE: &str = "\x1b[?1004l\x1b[?1006l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l";
 
 #[cfg(windows)]
 mod win {
@@ -334,3 +334,37 @@ mod stub {
 pub use stub::{TerminalGuard, restore_terminal_now};
 #[cfg(windows)]
 pub use win::{TerminalGuard, restore_terminal_now};
+
+#[cfg(test)]
+mod sequence_tests {
+    use super::{ENTER_SEQUENCE, LEAVE_SEQUENCE};
+
+    #[test]
+    fn enter_and_leave_sequences_toggle_alt_screen_cursor_mouse_and_focus() {
+        for seq in [
+            "\x1b[?1049h",
+            "\x1b[?25l",
+            "\x1b[?1000h",
+            "\x1b[?1006h",
+            "\x1b[?1004h",
+        ] {
+            assert!(
+                ENTER_SEQUENCE.contains(seq),
+                "ENTER_SEQUENCE missing {seq:?}"
+            );
+        }
+        for seq in [
+            "\x1b[?1004l",
+            "\x1b[?1006l",
+            "\x1b[?1000l",
+            "\x1b[0m",
+            "\x1b[?25h",
+            "\x1b[?1049l",
+        ] {
+            assert!(
+                LEAVE_SEQUENCE.contains(seq),
+                "LEAVE_SEQUENCE missing {seq:?}"
+            );
+        }
+    }
+}

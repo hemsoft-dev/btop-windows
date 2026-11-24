@@ -242,6 +242,11 @@ impl DiffEncoder {
         }
 
         let same_size = prev.is_some_and(|p| p.size == next.size);
+        if !same_size {
+            // Re-hide cursor and reset SGR on full redraws so web/PWA terminals that
+            // reconnected or dropped frames recover cleanly without stale attributes.
+            out.push_str("\x1b[?25l\x1b[0m");
+        }
         let mut active_foreground = Color::Reset;
         let mut active_background = Color::Reset;
         let mut active_bold = false;
@@ -389,6 +394,7 @@ mod tests {
             match (params, final_byte) {
                 ("?2026", 'h') => self.sync_depth += 1,
                 ("?2026", 'l') => self.sync_depth -= 1,
+                ("?25", 'l') => {}
                 (_, 'H') => {
                     let mut parts = params.split(';');
                     let row: u16 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1);
@@ -475,8 +481,15 @@ mod tests {
         let frame = encoder.encode(Some(&a), &b);
         assert!(frame.starts_with("\x1b[?2026h"));
         assert!(frame.ends_with("\x1b[?2026l"));
+        assert!(!frame.contains("\x1b[?25l"));
         assert!(!frame.contains("cpu"));
         assert!(frame.contains("mem"));
+
+        let full_frame = encoder.encode(None, &b);
+        assert!(full_frame.starts_with("\x1b[?2026h\x1b[?25l\x1b[0m"));
+        assert!(full_frame.ends_with("\x1b[?2026l"));
+        assert!(full_frame.contains("cpu"));
+        assert!(full_frame.contains("mem"));
     }
 
     #[test]
