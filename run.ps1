@@ -19,7 +19,7 @@
     Launches against the representative 16-core dual-GPU replay fixture.
 
 .EXAMPLE
-    .\run.ps1 --update-ms 1000 --preset 2
+    .\run.ps1 --update 1000 --preset 2
     Forwards arbitrary CLI flags directly to btop.exe.
 #>
 [CmdletBinding()]

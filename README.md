@@ -72,7 +72,7 @@ For contributor scope boundaries and planned post-v1 items, see [AGENTS.md](AGEN
 .\run.ps1 -Build                  # Force a fresh release build
 .\run.ps1 -DebugBuild             # Build and run the debug binary
 .\run.ps1 -Replay                 # Run against the dual-GPU replay fixture
-.\run.ps1 --update-ms 1000        # Forward CLI flags to btop.exe
+.\run.ps1 --update 1000           # Forward CLI flags to btop.exe
 
 # Quality gates
 cargo fmt --all -- --check
