@@ -47,6 +47,23 @@ To uninstall later:
 
 For contributor scope boundaries and planned post-v1 items, see [AGENTS.md](AGENTS.md).
 
+## Why btop-windows
+
+If you already know [btop4win](https://github.com/aristocratos/btop4win) (frozen at v1.0.5), here is an honest comparison of where `btop-windows` improves on it and where `btop4win` still has an edge.
+
+### Where btop-windows is better
+
+- **Multi-GPU telemetry without a kernel driver.** Standard `btop4win` has no GPU panels, and its LHM build relies on LibreHardwareMonitor (`WinRing0`), which requires Administrator privileges and triggers Windows Defender and game anti-cheat (Vanguard, EAC). `btop-windows` renders dedicated multi-GPU boxes (`5`..`0`) across Intel, AMD, and NVIDIA using user-mode DXGI + WDDM PDH, plus automatic `System32\nvml.dll` enrichment on NVIDIA (temperature, power, clocks, fan), with zero kernel drivers and no Admin prompt.
+- **Modern `btop++` v1.4.8 UX on Windows 11.** Brings newer upstream features (`btop++` v1.4.8 layout presets, GPU boxes, live theme preview in Options, regex process filter, follow/pause) natively to Windows 11.
+- **Windows-first workflows.** Adds a toggleable Windows Services (`S`) view with Start/Stop/Restart controls, hybrid P/E-core CPU labeling (`GetSystemCpuSetInformation`), Task Manager utility mode, guarded process termination (`CreateTime` PID-reuse verification and `IsProcessCritical` protection), and deterministic `--record` / `--replay` JSONL traces.
+- **Minimal, audited runtime footprint.** Written in Rust (`#![forbid(unsafe_code)]` on model, config, and UI), statically linked against the MSVC CRT (`+crt-static`, audited in CI to 11 inbox Windows DLLs), hardened with `LOAD_LIBRARY_SEARCH_SYSTEM32`, and distributed with a SHA-256-verified installer (`~3.0 MiB` binary, `~1.3 MiB` zip).
+
+### Where `btop4win` still has an edge
+
+- **CPU die temperatures and motherboard fan RPMs.** Windows does not expose reliable Intel/AMD CPU die sensors or motherboard fan RPMs in user mode. Because `btop-windows` refuses to bundle a kernel driver (`WinRing0`), CPU temperature and motherboard fan readings are unavailable on most desktops until an optional external sensor bridge is added post-v1.
+- **Legacy OS and terminal coverage.** `btop4win` supports Windows 10, legacy `conhost.exe`, non-English locales, and >64 logical cores. `btop-windows` v1 intentionally focuses on English Windows 11 x64 in Windows Terminal.
+- **Longer field history.** `btop4win` has years of community mileage across edge-case hardware. `btop-windows` is new and actively developed, so real-world feedback on diverse setups is welcome.
+
 ## Highlights
 
 - **Zero kernel drivers and zero runtime installers.** Every core metric uses user-mode Windows APIs plus optional safe loading of `System32\nvml.dll`. No WinRing0, no `vc_redist.x64.exe`, no Defender false positives.
