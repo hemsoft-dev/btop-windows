@@ -6,7 +6,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Interval after which the TUI forces a full-grid cell repaint (`prev_grid = None`) so terminals
+/// or web/PWA panes that dropped earlier incremental diff frames recover static box borders and
+/// labels even when no focus or resize event arrives.
+const FULL_REDRAW_INTERVAL: Duration = Duration::from_secs(5);
 
 use btop_collect::{CollectError, FreqMode, Sampler, SnapshotSource};
 use btop_config::{Config, ConfigError, ConfigLocation, ThemeSearchPaths, resolve_config_location};
@@ -254,8 +259,7 @@ pub fn run_tui_loop(
         width: 80,
         height: 24,
     });
-    let mut history = UiHistory::default();
-    let mut ui_state = build_ui_state(&config, overrides);
+    let (mut history, mut ui_state) = (UiHistory::default(), build_ui_state(&config, overrides));
     let (mut last_generation, mut last_telemetry_generation) =
         (sampler.generation(), sampler.telemetry_generation());
     let mut current_snapshot = sampler.latest();
@@ -265,6 +269,7 @@ pub fn run_tui_loop(
     let (svc_tx, svc_rx) = mpsc::channel::<ServiceActionOutcome>();
     let svc_in_flight = Arc::new(AtomicBool::new(false));
     let mut prev_grid: Option<Grid> = None;
+    let mut last_full_redraw = Instant::now();
     let mut dirty = true;
     let mut frames_rendered = 0u64;
 
@@ -281,6 +286,7 @@ pub fn run_tui_loop(
                 &mut history,
                 &mut ui_state,
                 &mut prev_grid,
+                last_full_redraw.elapsed(),
             );
             dirty |= state_dirty;
 
@@ -293,6 +299,7 @@ pub fn run_tui_loop(
                     &config,
                     size,
                     &mut prev_grid,
+                    &mut last_full_redraw,
                 )?;
                 frames_rendered += 1;
                 dirty = false;
@@ -384,6 +391,7 @@ fn sync_loop_state(
     history: &mut UiHistory,
     ui_state: &mut UiState,
     prev_grid: &mut Option<Grid>,
+    since_full_redraw: Duration,
 ) -> (usize, usize, bool) {
     let mut dirty = poll_sampler_updates(
         sampler,
@@ -402,6 +410,7 @@ fn sync_loop_state(
         sync_services_selection(current_snapshot, ui_state, service_rows);
     }
     dirty |= cancel_invisible_modal(size, ui_state, prev_grid);
+    dirty |= should_force_periodic_full_redraw(since_full_redraw, FULL_REDRAW_INTERVAL, prev_grid);
     (proc_rows, service_rows, dirty)
 }
 
@@ -453,6 +462,7 @@ fn finish_sampler_and_recording(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_dirty_frame(
     guard: &mut TerminalGuard,
     snapshot: &btop_model::Snapshot,
@@ -461,19 +471,54 @@ fn render_dirty_frame(
     config: &Config,
     size: Size,
     prev_grid: &mut Option<Grid>,
+    last_full_redraw: &mut Instant,
 ) -> Result<(), AppError> {
+    let is_full_redraw = prev_grid.is_none();
     let encoder = DiffEncoder {
         sync_output: config.terminal_sync,
     };
     let next_grid = btop_ui::render_frame(snapshot, history, ui_state, config, size);
     let payload = encoder.encode(prev_grid.as_ref(), &next_grid);
     guard.write_frame(&payload)?;
+    if is_full_redraw {
+        *last_full_redraw = Instant::now();
+    }
     *prev_grid = Some(next_grid);
     Ok(())
 }
 
 fn is_utility_mode(config: &Config) -> bool {
     config.cpu_util_mode.eq_ignore_ascii_case("utility")
+}
+
+fn should_force_periodic_full_redraw(
+    elapsed: Duration,
+    interval: Duration,
+    prev_grid: &mut Option<Grid>,
+) -> bool {
+    if elapsed >= interval {
+        *prev_grid = None;
+        true
+    } else {
+        false
+    }
+}
+
+fn try_handle_force_redraw(event: TermEvent, prev_grid: &mut Option<Grid>) -> bool {
+    let force = matches!(
+        event,
+        TermEvent::FocusGained
+            | TermEvent::Key(btop_term::KeyEvent {
+                code: KeyCode::Char('l' | 'L'),
+                ctrl: true,
+                alt: false,
+                ..
+            })
+    );
+    if force {
+        *prev_grid = None;
+    }
+    force
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -494,7 +539,11 @@ fn handle_tui_event(
     service_dispatch: Option<&ServiceDispatch<'_>>,
     prev_grid: &mut Option<Grid>,
 ) -> LoopAction {
+    if try_handle_force_redraw(event, prev_grid) {
+        return LoopAction::Redraw;
+    }
     match event {
+        TermEvent::FocusGained => unreachable!("handled by try_handle_force_redraw"),
         TermEvent::Key(k) if ui_state.menu.is_some() => {
             let outcome = handle_menu_key(
                 k,
@@ -3328,5 +3377,79 @@ mod tests {
                 .map(String::as_str),
             Some("True")
         );
+    }
+
+    #[test]
+    fn focus_gained_ctrl_l_and_periodic_interval_force_full_redraw() {
+        let size = Size {
+            width: 80,
+            height: 24,
+        };
+        let mut prev_grid = Some(Grid::new(size));
+        assert!(try_handle_force_redraw(
+            TermEvent::FocusGained,
+            &mut prev_grid
+        ));
+        assert!(prev_grid.is_none());
+
+        prev_grid = Some(Grid::new(size));
+        let ctrl_l = btop_term::KeyEvent {
+            code: KeyCode::Char('l'),
+            ctrl: true,
+            alt: false,
+            shift: false,
+        };
+        assert!(try_handle_force_redraw(
+            TermEvent::Key(ctrl_l),
+            &mut prev_grid
+        ));
+        assert!(prev_grid.is_none());
+
+        // Plain 'l' and Alt+Ctrl+L do not hijack navigation or AltGr combinations.
+        prev_grid = Some(Grid::new(size));
+        let plain_l = btop_term::KeyEvent {
+            code: KeyCode::Char('l'),
+            ctrl: false,
+            alt: false,
+            shift: false,
+        };
+        assert!(!try_handle_force_redraw(
+            TermEvent::Key(plain_l),
+            &mut prev_grid
+        ));
+        assert!(prev_grid.is_some());
+
+        let alt_ctrl_l = btop_term::KeyEvent {
+            code: KeyCode::Char('l'),
+            ctrl: true,
+            alt: true,
+            shift: false,
+        };
+        assert!(!try_handle_force_redraw(
+            TermEvent::Key(alt_ctrl_l),
+            &mut prev_grid
+        ));
+        assert!(prev_grid.is_some());
+
+        prev_grid = Some(Grid::new(size));
+        assert!(!should_force_periodic_full_redraw(
+            Duration::from_millis(4999),
+            FULL_REDRAW_INTERVAL,
+            &mut prev_grid,
+        ));
+        assert!(prev_grid.is_some());
+        assert!(should_force_periodic_full_redraw(
+            Duration::from_secs(5),
+            FULL_REDRAW_INTERVAL,
+            &mut prev_grid,
+        ));
+        assert!(prev_grid.is_none());
+        prev_grid = Some(Grid::new(size));
+        assert!(should_force_periodic_full_redraw(
+            Duration::from_secs(8),
+            FULL_REDRAW_INTERVAL,
+            &mut prev_grid,
+        ));
+        assert!(prev_grid.is_none());
     }
 }

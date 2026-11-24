@@ -73,6 +73,7 @@ Legend:
 | `F1`, `?`, `h` | Parity | M5 | Open Help menu (`H` when `vim_keys = true`). |
 | `q`, `Ctrl+C` | Parity | M1 | Clean exit with full console restoration. |
 | `Ctrl+R` | Parity | M1 | Reload `btop.conf` from disk. |
+| `Ctrl+L` | Windows extra | v0.1.1 | Force full-grid redraw without resetting filter, sort, or selection (also triggered automatically on terminal focus gain and periodically every 5s for PWA/web terminals). |
 | `Ctrl+Z` | N/A | M1 | Windows has no POSIX `SIGTSTP` job control; intentional no-op. |
 | `p`, `Shift+P` | Parity | M2 | Cycle layout presets forward/backward. |
 | `1`, `2`, `3`, `4`, `5`..`0` | Parity | M2, M4 | Toggle CPU, MEM, NET, PROC, and GPU boxes. |

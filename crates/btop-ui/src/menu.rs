@@ -1023,6 +1023,7 @@ pub const HELP_BINDINGS: &[HelpEntry] = &[
         "Quit btop-windows and restore Windows Terminal",
     ),
     HelpEntry::bind("Ctrl+R", "Reload btop.conf and refresh collectors"),
+    HelpEntry::bind("Ctrl+L", "Force full screen redraw"),
     HelpEntry::bind(
         "+ / -",
         "Adjust update_ms cadence (+/- 100 ms, floor 100 ms)",

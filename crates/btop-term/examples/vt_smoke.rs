@@ -159,6 +159,10 @@ fn main() -> ExitCode {
                 last_event = format!("Resize({}x{})", size.width, size.height);
                 prev_grid = None;
             }
+            Ok(Some(TermEvent::FocusGained)) => {
+                "FocusGained".clone_into(&mut last_event);
+                prev_grid = None;
+            }
             Ok(None) => {
                 if let Ok(live) = guard.size()
                     && live != size

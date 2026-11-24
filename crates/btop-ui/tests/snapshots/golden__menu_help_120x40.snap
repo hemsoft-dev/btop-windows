@@ -14,30 +14,30 @@ expression: rendered
 │0%         │ F1 / ? / h               Open Help keybindings reference (Shift+H when vim_keys=True)        │■■■■  13%  │
 │           │ q / Ctrl+C               Quit btop-windows and restore Windows Terminal                      │           │
 │           │ Ctrl+R                   Reload btop.conf and refresh collectors                             │           │
+│           │ Ctrl+L                   Force full screen redraw                                            │           │
 │           │ + / -                    Adjust update_ms cadence (+/- 100 ms, floor 100 ms)                 │           │
-│           │ ── Layout & Panels ──                                                                        │           │
-│pk         │ 1 / 2 / 3 / 4            Toggle CPU, MEM, NET, and PROC panels                               │56M/512M   │
-╰─┐WIN11-HYB│ 5 .. 9 / 0               Toggle dedicated GPU panels gpu0 through gpu5                       │───────────╯
-╭─┐²mem┌─┐di│ p / Shift+P              Cycle layout presets forward / backward                             │>┌──┐1/52┌─╮
-│ RAM ■■■■■■│ d / i                    Toggle local fixed disks list / Disk I/O graph mode                 │h    Cpu%  │
-│ Used  ■■■■│ ── Network Panel ──                                                                          │█    12.8 █│
-│ Avail ■■■■│ b / n                    Select previous / next hardware network adapter                     │▅     5.3 ││
-│ Cache ■■■■│ a / y / z                Toggle auto-scale, sync scale, or reset session totals              │▄     4.2 ││
-│ Free  ■■■■│ ── Processes & Tree ──                                                                       │▄     4.2 ││
+│pk         │ ── Layout & Panels ──                                                                        │56M/512M   │
+╰─┐WIN11-HYB│ 1 / 2 / 3 / 4            Toggle CPU, MEM, NET, and PROC panels                               │───────────╯
+╭─┐²mem┌─┐di│ 5 .. 9 / 0               Toggle dedicated GPU panels gpu0 through gpu5                       │>┌──┐1/52┌─╮
+│ RAM ■■■■■■│ p / Shift+P              Cycle layout presets forward / backward                             │h    Cpu%  │
+│ Used  ■■■■│ d / i                    Toggle local fixed disks list / Disk I/O graph mode                 │█    12.8 █│
+│ Avail ■■■■│ ── Network Panel ──                                                                          │▅     5.3 ││
+│ Cache ■■■■│ b / n                    Select previous / next hardware network adapter                     │▄     4.2 ││
+│ Free  ■■■■│ a / y / z                Toggle auto-scale, sync scale, or reset session totals              │▄     4.2 ││
+│           │ ── Processes & Tree ──                                                                       │▄     3.9 ││
 │           │ Up / Down / PgUp / PgDn  Navigate process list (j/k/g/G when vim_keys=True)                  │▄     3.9 ││
-│           │ Left / Right / r         Cycle sort column (h/l if vim_keys) / reverse sort                  │▄     3.9 ││
-│───────────│ e / Space / Shift+E      Toggle tree view / collapse branch / collapse all                   │▄     3.6 ││
-│ Commit ■■■│ f or / / Del             Edit process filter (prefix '!' for regex) / clear                  │▄     3.6 ││
-│ Swap   ■■■│ Enter / Esc              Open or close Selected Process Detail overlay                       │▄     3.6 ││
-│ Compressed│ u / Shift+F              Pause process list / follow selected process identity               │▃     3.3 ││
-╰───────────│ c / %                    Toggle per-core CPU% / memory bytes vs percent                      │▃     3.3 ││
-╭─┐³net┌─┐au│ ── Safe Windows Process & Service Actions ──                                                 │▃     3.0 ││
-│302 Mbps   │ t                        Graceful close via WM_CLOSE (interactive GUI apps)                  │▃     3.0 ││
-│           │ k (K if vim_keys)        Guarded TerminateProcess (CreateTime + critical guard)              │▃     3.0 ││
+│───────────│ Left / Right / r         Cycle sort column (h/l if vim_keys) / reverse sort                  │▄     3.6 ││
+│ Commit ■■■│ e / Space / Shift+E      Toggle tree view / collapse branch / collapse all                   │▄     3.6 ││
+│ Swap   ■■■│ f or / / Del             Edit process filter (prefix '!' for regex) / clear                  │▄     3.6 ││
+│ Compressed│ Enter / Esc              Open or close Selected Process Detail overlay                       │▃     3.3 ││
+╰───────────│ u / Shift+F              Pause process list / follow selected process identity               │▃     3.3 ││
+╭─┐³net┌─┐au│ c / %                    Toggle per-core CPU% / memory bytes vs percent                      │▃     3.0 ││
+│302 Mbps   │ ── Safe Windows Process & Service Actions ──                                                 │▃     3.0 ││
+│           │ t                        Graceful close via WM_CLOSE (interactive GUI apps)                  │▃     3.0 ││
+│           │ k (K if vim_keys)        Guarded TerminateProcess (CreateTime + critical guard)              │▃     2.7 ││
 │           │ Shift+N                  Open Windows Priority Class selector (SetPriorityClass)             │▃     2.7 ││
-│           │ Shift+S                  Toggle Windows Services (SCM) view inside PROC panel                │▃     2.7 ││
-│           │ s / x (Services)         Start / Stop selected service (requires Administrator)              │▃     2.4 ││
-│           │ ↑↓ / PgUp / PgDn scroll (1-29 of 29)  |  Esc / q close                                       │▃     2.4 ││
+│           │ Shift+S                  Toggle Windows Services (SCM) view inside PROC panel                │▃     2.4 ││
+│           │ ↑↓ / PgUp / PgDn scroll (1-29 of 30)  |  Esc / q close                                       │▃     2.4 ││
 │           ╰──────────────────────────────────────────────────────────────────────────────────────────────╯▃     2.2 ││
 │                          │ IP6: fe80::1a2b:3c4d││    5020 svchost.exe                   8    24.0M ▂▂▂▂▂▂▂▂     2.1 ││
 │302 Mbps                  │ auto sync 302 Mbps  ││    5080 svchost.exe                   8    24.0M ▂▂▂▂▂▂▂▂     2.1 ││

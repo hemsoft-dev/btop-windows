@@ -19,10 +19,10 @@ pub enum TermError {
     UnsupportedPlatform,
 }
 
-/// Escape sequence to enter alternate screen, hide cursor, and enable SGR mouse tracking.
-pub const ENTER_SEQUENCE: &str = "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h";
-/// Escape sequence to disable mouse tracking, reset SGR, show cursor, and leave alternate screen.
-pub const LEAVE_SEQUENCE: &str = "\x1b[?1006l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l";
+/// Escape sequence to enter alternate screen, hide cursor, and enable SGR mouse and focus tracking.
+pub const ENTER_SEQUENCE: &str = "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h\x1b[?1004h";
+/// Escape sequence to disable focus and mouse tracking, reset SGR, show cursor, and leave alternate screen.
+pub const LEAVE_SEQUENCE: &str = "\x1b[?1004l\x1b[?1006l\x1b[?1000l\x1b[0m\x1b[?25h\x1b[?1049l";
 
 #[cfg(windows)]
 mod win {
@@ -34,16 +34,33 @@ mod win {
         CONSOLE_SCREEN_BUFFER_INFO, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT,
         CTRL_SHUTDOWN_EVENT, DISABLE_NEWLINE_AUTO_RETURN, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS,
         ENABLE_LINE_INPUT, ENABLE_MOUSE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_QUICK_EDIT_MODE,
-        ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT, GetConsoleMode,
-        GetConsoleOutputCP, GetConsoleScreenBufferInfo, GetStdHandle, STD_INPUT_HANDLE,
-        STD_OUTPUT_HANDLE, SetConsoleCtrlHandler, SetConsoleMode, SetConsoleOutputCP,
-        WriteConsoleW,
+        ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT,
+        GetConsoleMode, GetConsoleOutputCP, GetConsoleScreenBufferInfo, GetStdHandle,
+        STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCtrlHandler, SetConsoleMode,
+        SetConsoleOutputCP, WriteConsoleW,
     };
 
     use super::{ENTER_SEQUENCE, LEAVE_SEQUENCE, TermError};
     use crate::Size;
 
     const CP_UTF8: u32 = 65001;
+
+    /// Computes raw Win32 console input mode for `crossterm::event::read()`.
+    ///
+    /// Clears `ENABLE_VIRTUAL_TERMINAL_INPUT` so `ConPTY` delivers native `FOCUS_EVENT_RECORD`
+    /// and key/mouse records rather than queuing raw VT focus sequences (`ESC [ I` / `ESC [ O`)
+    /// as printable keystrokes.
+    const fn compute_input_mode(orig_in_mode: u32) -> u32 {
+        (orig_in_mode
+            & !(ENABLE_PROCESSED_INPUT
+                | ENABLE_LINE_INPUT
+                | ENABLE_ECHO_INPUT
+                | ENABLE_QUICK_EDIT_MODE
+                | ENABLE_VIRTUAL_TERMINAL_INPUT))
+            | ENABLE_EXTENDED_FLAGS
+            | ENABLE_MOUSE_INPUT
+            | ENABLE_WINDOW_INPUT
+    }
 
     #[derive(Debug, Clone, Copy)]
     struct SavedConsoleState {
@@ -203,14 +220,7 @@ mod win {
                 ));
             }
 
-            let desired_in_mode = (orig_in_mode
-                & !(ENABLE_PROCESSED_INPUT
-                    | ENABLE_LINE_INPUT
-                    | ENABLE_ECHO_INPUT
-                    | ENABLE_QUICK_EDIT_MODE))
-                | ENABLE_EXTENDED_FLAGS
-                | ENABLE_MOUSE_INPUT
-                | ENABLE_WINDOW_INPUT;
+            let desired_in_mode = compute_input_mode(orig_in_mode);
             // SAFETY: Configuring raw/mouse/window input on the validated stdin handle.
             if unsafe { SetConsoleMode(stdin, desired_in_mode) } == 0 {
                 unsafe {
@@ -297,6 +307,24 @@ mod win {
             assert_eq!(saved.orig_in_mode, 0x2222);
             assert_eq!(saved.orig_output_cp, 437);
         }
+
+        #[test]
+        fn compute_input_mode_clears_virtual_terminal_input_and_enables_raw_events() {
+            let inherited = ENABLE_PROCESSED_INPUT
+                | ENABLE_LINE_INPUT
+                | ENABLE_ECHO_INPUT
+                | ENABLE_QUICK_EDIT_MODE
+                | ENABLE_VIRTUAL_TERMINAL_INPUT;
+            let mode = compute_input_mode(inherited);
+            assert_eq!(mode & ENABLE_VIRTUAL_TERMINAL_INPUT, 0);
+            assert_eq!(mode & ENABLE_PROCESSED_INPUT, 0);
+            assert_eq!(mode & ENABLE_LINE_INPUT, 0);
+            assert_eq!(mode & ENABLE_ECHO_INPUT, 0);
+            assert_eq!(mode & ENABLE_QUICK_EDIT_MODE, 0);
+            assert_ne!(mode & ENABLE_EXTENDED_FLAGS, 0);
+            assert_ne!(mode & ENABLE_MOUSE_INPUT, 0);
+            assert_ne!(mode & ENABLE_WINDOW_INPUT, 0);
+        }
     }
 }
 
@@ -334,3 +362,37 @@ mod stub {
 pub use stub::{TerminalGuard, restore_terminal_now};
 #[cfg(windows)]
 pub use win::{TerminalGuard, restore_terminal_now};
+
+#[cfg(test)]
+mod sequence_tests {
+    use super::{ENTER_SEQUENCE, LEAVE_SEQUENCE};
+
+    #[test]
+    fn enter_and_leave_sequences_toggle_alt_screen_cursor_mouse_and_focus() {
+        for seq in [
+            "\x1b[?1049h",
+            "\x1b[?25l",
+            "\x1b[?1000h",
+            "\x1b[?1006h",
+            "\x1b[?1004h",
+        ] {
+            assert!(
+                ENTER_SEQUENCE.contains(seq),
+                "ENTER_SEQUENCE missing {seq:?}"
+            );
+        }
+        for seq in [
+            "\x1b[?1004l",
+            "\x1b[?1006l",
+            "\x1b[?1000l",
+            "\x1b[0m",
+            "\x1b[?25h",
+            "\x1b[?1049l",
+        ] {
+            assert!(
+                LEAVE_SEQUENCE.contains(seq),
+                "LEAVE_SEQUENCE missing {seq:?}"
+            );
+        }
+    }
+}

@@ -242,6 +242,11 @@ impl DiffEncoder {
         }
 
         let same_size = prev.is_some_and(|p| p.size == next.size);
+        if !same_size {
+            // Reset SGR at the start of a full cell repaint without re-emitting DECSET mode
+            // switches (?1049h / ?1004h), avoiding ConPTY resize loops and xterm.js focus loops.
+            out.push_str("\x1b[0m");
+        }
         let mut active_foreground = Color::Reset;
         let mut active_background = Color::Reset;
         let mut active_bold = false;
@@ -475,8 +480,17 @@ mod tests {
         let frame = encoder.encode(Some(&a), &b);
         assert!(frame.starts_with("\x1b[?2026h"));
         assert!(frame.ends_with("\x1b[?2026l"));
+        assert!(!frame.contains("\x1b[?25l"));
         assert!(!frame.contains("cpu"));
         assert!(frame.contains("mem"));
+
+        let full_frame = encoder.encode(None, &b);
+        assert!(full_frame.starts_with("\x1b[?2026h\x1b[0m"));
+        assert!(full_frame.ends_with("\x1b[?2026l"));
+        assert!(!full_frame.contains("\x1b[?1049h"));
+        assert!(!full_frame.contains("\x1b[?1004h"));
+        assert!(full_frame.contains("cpu"));
+        assert!(full_frame.contains("mem"));
     }
 
     #[test]
