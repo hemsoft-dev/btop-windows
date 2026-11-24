@@ -61,7 +61,7 @@ pub struct ConfigOverrides {
 }
 
 /// Loads `btop.conf` using strict precedence (`-c` explicit -> portable exe-adjacent
-/// `btop.conf` -> `%APPDATA%\btop-windows\btop.conf`), then applies CLI overrides.
+/// `btop.conf` -> `%APPDATA%\btop\btop.conf`), then applies CLI overrides.
 pub fn load_config(
     explicit_path: Option<&Path>,
     overrides: &ConfigOverrides,

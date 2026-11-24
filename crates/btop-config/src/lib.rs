@@ -22,9 +22,9 @@ pub use theme::{
 pub enum ConfigLocation {
     /// Explicitly specified via `-c` / `--config <file>`.
     Explicit(PathBuf),
-    /// Portable mode: `btop.conf` adjacent to `btop-windows.exe`.
+    /// Portable mode: `btop.conf` adjacent to `btop.exe`.
     Portable(PathBuf),
-    /// Standard Windows user config: `%APPDATA%\btop-windows\btop.conf`.
+    /// Standard Windows user config: `%APPDATA%\btop\btop.conf`.
     AppData(PathBuf),
 }
 
@@ -39,7 +39,7 @@ impl ConfigLocation {
 /// Resolves the active `btop.conf` location using strict precedence:
 /// 1. Explicit `-c` / `--config <file>`
 /// 2. Portable mode: exe-adjacent `btop.conf` when that file already exists
-/// 3. Standard Windows path: `%APPDATA%\btop-windows\btop.conf`
+/// 3. Standard Windows path: `%APPDATA%\btop\btop.conf`
 /// 4. Fallback to exe-adjacent `btop.conf` when `%APPDATA%` is unavailable
 pub fn resolve_config_location(explicit_path: Option<&Path>) -> Option<ConfigLocation> {
     let exe_dir = std::env::current_exe()
@@ -69,9 +69,7 @@ pub fn resolve_config_location_with(
     if let Some(ad) = appdata
         && !ad.as_os_str().is_empty()
     {
-        return Some(ConfigLocation::AppData(
-            ad.join("btop-windows").join("btop.conf"),
-        ));
+        return Some(ConfigLocation::AppData(ad.join("btop").join("btop.conf")));
     }
     exe_dir.map(|dir| ConfigLocation::Portable(dir.join("btop.conf")))
 }
@@ -876,11 +874,11 @@ mod tests {
         std::fs::create_dir_all(&exe_dir).expect("mkdir exe_dir");
         std::fs::create_dir_all(&appdata).expect("mkdir appdata");
 
-        // 1. Without exe-adjacent btop.conf, falls back to %APPDATA%\btop-windows\btop.conf.
+        // 1. Without exe-adjacent btop.conf, falls back to %APPDATA%\btop\btop.conf.
         assert_eq!(
             resolve_config_location_with(None, Some(&exe_dir), Some(&appdata)),
             Some(ConfigLocation::AppData(
-                appdata.join("btop-windows").join("btop.conf")
+                appdata.join("btop").join("btop.conf")
             ))
         );
 

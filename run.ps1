@@ -20,7 +20,7 @@
 
 .EXAMPLE
     .\run.ps1 --update-ms 1000 --preset 2
-    Forwards arbitrary CLI flags directly to btop-windows.exe.
+    Forwards arbitrary CLI flags directly to btop.exe.
 #>
 [CmdletBinding()]
 param(
@@ -38,7 +38,7 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = $PSScriptRoot
 $targetTriple = 'x86_64-pc-windows-msvc'
 $profileDir = if ($DebugBuild) { 'debug' } else { 'release' }
-$exePath = Join-Path $repoRoot "target\$targetTriple\$profileDir\btop-windows.exe"
+$exePath = Join-Path $repoRoot "target\$targetTriple\$profileDir\btop.exe"
 $themesDir = Join-Path $repoRoot 'themes'
 $defaultFixture = Join-Path $repoRoot 'fixtures\win11-16core-dual-gpu-desktop.jsonl'
 

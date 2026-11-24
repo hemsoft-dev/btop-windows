@@ -597,7 +597,7 @@ fn apply_theme_key(spec: &mut ThemeSpec, grads: &mut RawGradients, key: &str, co
 }
 
 /// Ordered theme search directories: `--themes-dir`, exe-adjacent `themes\`, and
-/// `%APPDATA%\btop-windows\themes`.
+/// `%APPDATA%\btop\themes`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ThemeSearchPaths {
     pub cli_dir: Option<PathBuf>,
@@ -613,7 +613,7 @@ impl ThemeSearchPaths {
             .and_then(|p| p.parent().map(|dir| dir.join("themes")));
         let appdata_dir = std::env::var_os("APPDATA")
             .filter(|v| !v.is_empty())
-            .map(|dir| PathBuf::from(dir).join("btop-windows").join("themes"));
+            .map(|dir| PathBuf::from(dir).join("btop").join("themes"));
         Self {
             cli_dir: cli_themes_dir.map(Path::to_path_buf),
             exe_dir,
@@ -679,7 +679,7 @@ impl ThemeSearchPaths {
     /// 2. Explicit `.theme` file path on disk (when it contains a path separator or ends in `.theme`)
     /// 3. `--themes-dir`
     /// 4. Exe-adjacent `themes\`
-    /// 5. `%APPDATA%\btop-windows\themes`
+    /// 5. `%APPDATA%\btop\themes`
     /// 6. Embedded curated Apache-2.0 bundle
     pub fn load_theme(&self, name_or_path: &str) -> Result<ThemeSpec, ThemeError> {
         let trimmed = name_or_path.trim();

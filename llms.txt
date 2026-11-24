@@ -1,0 +1,32 @@
+# btop-windows
+
+> Fast, zero-driver, native Windows 11 x64 terminal resource monitor written in Rust, shipping as `btop.exe` with modern btop++ (v1.4.8) UX, multi-GPU telemetry, and Windows Services controls.
+
+## Quick install (Windows 11 x64)
+
+- One-line PowerShell install (user-level, no Admin, verifies SHA-256, adds `btop.exe` to User PATH):
+  `irm https://raw.githubusercontent.com/hemsoft-dev/btop-windows/main/install.ps1 | iex`
+- Uninstall:
+  `& ([scriptblock]::Create((irm https://raw.githubusercontent.com/hemsoft-dev/btop-windows/main/install.ps1))) -Uninstall` (or `.\install.ps1 -Uninstall`)
+- Portable archive: download `btop-windows-<tag>-x86_64-windows.zip` and `SHA256SUMS.txt` from https://github.com/hemsoft-dev/btop-windows/releases
+- Run from source checkout: `.\run.ps1` (auto-builds `target\x86_64-pc-windows-msvc\release\btop.exe` when needed)
+
+## Runtime profile
+
+- Executable: `btop.exe` (single 3.0 MiB static-CRT x64 binary, zero `vc_redist`, zero kernel drivers)
+- Target environment: English Windows 11 (23H2+) x64 in Windows Terminal (24-bit TrueColor, UTF-8, Braille/Block graphs)
+- Privileges: Runs non-elevated for all telemetry (including DXGI/WDDM GPU and optional `System32\nvml.dll` NVIDIA sensors); Administrator is required only to Start/Stop Windows Services
+- Config file: Portable `btop.conf` next to `btop.exe` if present, otherwise `%APPDATA%\btop\btop.conf` (override with `-c <file>`, generate starter with `btop --default-config`)
+- Themes: 10 Apache-2.0 `.theme` files embedded in `btop.exe`; custom themes searched in `--themes-dir`, exe-adjacent `themes\`, then `%APPDATA%\btop\themes`
+- Useful CLI flags: `-c/--config`, `-f/--filter`, `-p/--preset <0-9>`, `-u/--update <ms>`, `--themes-dir <dir>`, `--default-config`, `--record <file>`, `--replay <file>`, `-V/--version`, `-h/--help`
+
+## Documentation index
+
+- [README.md](https://github.com/hemsoft-dev/btop-windows/blob/main/README.md): User overview, installation, keybindings, configuration, and local development
+- [CONTRIBUTING.md](https://github.com/hemsoft-dev/btop-windows/blob/main/CONTRIBUTING.md): Contributor guide, crate architecture, safety invariants, and PR validation gates
+- [AGENTS.md](https://github.com/hemsoft-dev/btop-windows/blob/main/AGENTS.md): Authoritative AI coding agent boundaries, v1 scope, and non-negotiable invariants
+- [docs/SPEC.md](https://github.com/hemsoft-dev/btop-windows/blob/main/docs/SPEC.md): Functional specification and Windows telemetry semantics
+- [docs/ARCHITECTURE.md](https://github.com/hemsoft-dev/btop-windows/blob/main/docs/ARCHITECTURE.md): Crate boundaries, threading model, and testing strategy
+- [docs/PARITY.md](https://github.com/hemsoft-dev/btop-windows/blob/main/docs/PARITY.md): Upstream btop v1.4.8 config, CLI, keybinding, and theme parity map
+- [docs/adr/0001-tech-stack-and-renderer.md](https://github.com/hemsoft-dev/btop-windows/blob/main/docs/adr/0001-tech-stack-and-renderer.md): Rust stack and custom VT diff renderer decision
+- [docs/adr/0002-gpu-baseline-api.md](https://github.com/hemsoft-dev/btop-windows/blob/main/docs/adr/0002-gpu-baseline-api.md): DXGI + WDDM PDH + optional NVML GPU telemetry decision

@@ -5,7 +5,7 @@ use btop_config::{ThemeColor, ThemeGradient101, ThemeRgb, ThemeSearchPaths, Them
 use btop_term::{Color, Rgb};
 
 /// Built-in `TrueColor` theme names selectable out of the box (in addition to any user `.theme`
-/// files discovered via `--themes-dir`, exe-adjacent `themes\`, or `%APPDATA%\btop-windows\themes`).
+/// files discovered via `--themes-dir`, exe-adjacent `themes\`, or `%APPDATA%\btop\themes`).
 pub const BUILTIN_THEME_NAMES: [&str; 11] = [
     "Default",
     "dracula",

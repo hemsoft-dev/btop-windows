@@ -1,61 +1,84 @@
 # btop-windows
 
-A fast, zero-driver, native Windows terminal resource monitor written in Rust, bringing modern [btop++](https://github.com/aristocratos/btop) (v1.4.8) capabilities and Windows-first process and service workflows to English Windows 11 (x64) in Windows Terminal.
+A fast, zero-driver, native Windows 11 terminal resource monitor written in Rust. It ships as a single static `btop.exe` binary (~3 MiB) bringing modern [btop++](https://github.com/aristocratos/btop) (v1.4.8) panels, themes, and multi-GPU telemetry together with Windows-first process and Windows Services controls.
 
-## Initial release scope and simplicity
+## Quick install
 
-Read [AGENTS.md](AGENTS.md) before contributing. To keep v1 focused and maintainable:
+Install `btop.exe` into `%LOCALAPPDATA%\Programs\btop`, verify its SHA-256 checksum, and add `btop` to your User `PATH` (no Administrator prompt or Visual C++ Redistributable required):
 
-- **Target baseline:** English Windows 11 x64 in Windows Terminal (24-bit TrueColor, UTF-8, Braille/Block graphs).
-- **Deferred post-v1:** Windows 10, non-English locales, legacy ConHost workarounds, ARM64, >64-LP multi-group CPUs, 256-color/16-color TTY fallback, AMD ADLX / Intel IGCL SDKs, external LHM/HWiNFO sensor bridges, and package-manager publishing.
+```powershell
+irm https://raw.githubusercontent.com/hemsoft-dev/btop-windows/main/install.ps1 | iex
+```
 
-## Install and setup (Windows 11 x64)
+Then open **Windows Terminal** and run:
 
-`btop-windows` ships as a portable static-CRT `.zip` archive with no Visual C++ Redistributable (`vc_redist`) or kernel driver installation required.
+```powershell
+btop
+```
+
+To uninstall later:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/hemsoft-dev/btop-windows/main/install.ps1))) -Uninstall
+```
+
+### Manual portable install
 
 1. Download `btop-windows-<tag>-x86_64-windows.zip` and `SHA256SUMS.txt` from [GitHub Releases](https://github.com/hemsoft-dev/btop-windows/releases).
-2. Verify the download checksum in PowerShell:
+2. Verify the SHA-256 hash in PowerShell:
 
    ```powershell
    Get-FileHash .\btop-windows-<tag>-x86_64-windows.zip -Algorithm SHA256
    Get-Content .\SHA256SUMS.txt
    ```
 
-3. Extract the archive into a local folder such as `C:\Tools\btop-windows`:
+3. Extract anywhere (for example `C:\Tools\btop`) and run `C:\Tools\btop\btop.exe` in Windows Terminal, or add the folder to your User `PATH`.
 
-   ```powershell
-   Expand-Archive .\btop-windows-<tag>-x86_64-windows.zip -DestinationPath C:\Tools\btop-windows
-   ```
+## Platform baseline
 
-   Optionally add `C:\Tools\btop-windows` to your user `PATH` so you can launch `btop-windows` from any directory.
+| Area | Baseline |
+| --- | --- |
+| Operating system | English Windows 11 (23H2+) x64 (`x86_64-pc-windows-msvc`) |
+| Terminal | Windows Terminal (24-bit TrueColor, UTF-8, Cascadia Mono or Nerd Font for Braille/Block graphs) |
+| Runtime dependencies | Zero external runtimes (`+crt-static`, audited to 11 inbox Windows system DLLs only) |
+| Kernel drivers | Zero (user-mode Win32/NT APIs only; no WinRing0 or Defender friction) |
+| Privileges | Non-elevated by default; Administrator required only to Start/Stop Windows Services |
+| GPU telemetry | All hardware GPUs via DXGI + WDDM PDH, plus automatic `System32\nvml.dll` enrichment on NVIDIA GPUs |
 
-4. Open **Windows Terminal** (recommended font: **Cascadia Mono** or a Nerd Font with Unicode Braille and Block glyph coverage) and run:
+For contributor scope boundaries and planned post-v1 items, see [AGENTS.md](AGENTS.md).
 
-   ```powershell
-   btop-windows.exe
-   ```
+## Highlights
 
-- **Themes:** Bundled Apache-2.0 `.theme` files live in the extracted `themes\` directory and can be selected live from `Esc` -> **Options** (`color_theme`).
-- **Configuration:** Place a `btop.conf` next to `btop-windows.exe` for portable mode, or let `btop-windows` load and save `%APPDATA%\btop-windows\btop.conf` automatically. Generate a starter config with `btop-windows.exe --default-config`.
-- **Services control:** Viewing Windows Services (`S`) works non-elevated; starting or stopping a service requires launching Windows Terminal as Administrator.
+- **Zero kernel drivers and zero runtime installers.** Every core metric uses user-mode Windows APIs plus optional safe loading of `System32\nvml.dll`. No WinRing0, no `vc_redist.x64.exe`, no Defender false positives.
+- **Modern btop UX plus Windows workflows.** CPU with hybrid P/E-core labels, frequency, and Task Manager utility mode; physical/commit/pagefile/cache memory accounting; local disk capacity and I/O mode; 64-bit auto-scaling network graphs; dedicated multi-GPU boxes (`5`..`0`); process tree, regex filter, pause, follow, detail overlay, and guarded process controls; plus a toggleable Windows Services (`S`) view.
+- **TrueColor themes and mouse/Vim controls.** 10 Apache-2.0 themes embedded directly in `btop.exe`, live preview in Options, full mouse click and scroll hit-testing, and optional `vim_keys`.
+- **Deterministic record and replay.** Capture live sessions with `btop --record <file>` and inspect them anywhere with `btop --replay <file>`.
 
-## Why btop-windows
+## Everyday keys and configuration
 
-Upstream `aristocratos/btop` targets Linux, macOS, and BSDs. The separate `aristocratos/btop4win` port remains on the v1.0 codebase: it lacks modern multi-GPU boxes, requires the Visual C++ Redistributable, and depends on LibreHardwareMonitor's WinRing0 kernel driver, which triggers Windows Defender detections on Windows 11.
+- **Panels and presets:** `1`..`4` toggle CPU/MEM/NET/PROC, `5`..`0` toggle GPU boxes, `p`/`P` cycle layout presets, `d` toggles disks, `i` toggles Disk I/O mode.
+- **Processes and Services:** `e` tree view, `f` filter (`!` prefix for regex), `Enter` detail overlay, `u` pause, `F` follow, `t` graceful close, `k` guarded terminate, `N` priority class, `S` toggle Windows Services view.
+- **Menus and themes:** `Esc` / `m` Main menu, `o` / `F2` Options (live `color_theme` switcher), `h` / `F1` Help, `q` quit.
+- **Config location:** Place `btop.conf` next to `btop.exe` for portable mode, or let `btop` load and save `%APPDATA%\btop\btop.conf` automatically. Print a starter config with `btop --default-config`.
+- **Custom themes:** Searched in `--themes-dir`, exe-adjacent `themes\`, `%APPDATA%\btop\themes`, then the embedded bundle.
 
-`btop-windows` is a clean-room Rust implementation built around four principles:
+## Local development
 
-1. **Zero bundled kernel drivers.** Every core metric uses user-mode Windows APIs plus optional safe loading of `nvml.dll`. No WinRing0, no Defender false positives.
-2. **Modern btop core plus Windows workflows.** CPU (with P/E-core labels, frequency, and optional Task Manager utility mode), memory and commit accounting, local disk I/O, 64-bit network counters, GPU boxes (WDDM baseline + NVIDIA NVML), process tree/filter/follow/pause, and a simple Windows Services (SCM) view.
-3. **Single static binary.** Compiled in Rust with `+crt-static` on x64 with no runtime installer dependencies.
-4. **Simple, testable architecture.** Platform-independent model, config, renderer, and UI crates build and test cleanly on Linux and Windows, backed by `--record` and `--replay` snapshot streams.
+```powershell
+# Build (when needed) and launch btop.exe from the repo root
+.\run.ps1
 
-## Tech stack
+# Helpful run.ps1 options
+.\run.ps1 -Build                  # Force a fresh release build
+.\run.ps1 -DebugBuild             # Build and run the debug binary
+.\run.ps1 -Replay                 # Run against the dual-GPU replay fixture
+.\run.ps1 --update-ms 1000        # Forward CLI flags to btop.exe
 
-- **Language:** Rust (Edition 2024, MSRV 1.95), static CRT (`+crt-static`) on Windows 11 x64
-- **Windows bindings:** `windows-sys` for raw Win32/NT FFI, `windows` minimally for COM/DXGI, hand-audited NT structs with compile-time layout assertions in `crates/btop-sys`
-- **Terminal rendering:** Custom cell `Grid`, per-frame `HitMap`, and DEC 2026 synchronized VT diff encoder in `crates/btop-term`, with `crossterm` behind an `InputSource` trait
-- **State & concurrency:** Immutable timestamped `Snapshot` publication via `arc-swap`; optional slow vendor GPU calls run off the UI thread so input stays responsive
+# Quality gates
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
 
 ## Workspace layout
 
@@ -66,57 +89,25 @@ crates/
   btop-config/    # btop.conf and .theme parsers, validation, defaults (no unsafe)
   btop-collect/   # Collector trait, pure delta math, Windows collectors
   btop-term/      # Grid, HitMap, VT diff encoder, InputSource, Windows VT console
-  btop-ui/        # Pure render(&Snapshot, &Config, &Theme, Size) -> Grid (no unsafe)
+  btop-ui/        # Pure render(&Snapshot, &History, &UiState, &Config, Size) -> Grid (no unsafe)
 apps/
-  btop-windows/   # CLI (clap), thread wiring, startup hardening, panic-safe restore
+  btop-windows/   # btop.exe CLI (clap), thread wiring, startup hardening, panic-safe restore
 docs/
-  SPEC.md         # Full functional specification and upstream btop deep dive
-  ARCHITECTURE.md # System architecture, Windows telemetry matrix, test & CI plan
+  SPEC.md         # Full functional specification
+  ARCHITECTURE.md # System architecture, telemetry matrix, test and CI plan
   PARITY.md       # Upstream btop v1.4.8 config, CLI, keybinding, and theme parity map
   adr/            # Architecture Decision Records
 ```
 
-## Documentation
+## Documentation and contributing
 
+- [Contributing Guide](CONTRIBUTING.md)
+- [Agent Instructions (AGENTS.md)](AGENTS.md) and [llms.txt](llms.txt)
 - [Functional Specification](docs/SPEC.md)
 - [System Architecture](docs/ARCHITECTURE.md)
 - [Upstream Parity Matrix](docs/PARITY.md)
 - [ADR-0001: Tech Stack, Renderer, and Telemetry Architecture](docs/adr/0001-tech-stack-and-renderer.md)
 - [ADR-0002: Windows 11 x64 GPU Baseline API (DXGI + WDDM PDH)](docs/adr/0002-gpu-baseline-api.md)
-
-## Local development
-
-```powershell
-# Build (if needed) and launch from the repo root
-.\run.ps1
-
-# Useful run.ps1 options
-.\run.ps1 -Build                  # Force a fresh release build
-.\run.ps1 -DebugBuild             # Build and run the debug binary
-.\run.ps1 -Replay                 # Run against the dual-GPU replay fixture
-.\run.ps1 --update-ms 1000        # Forward CLI flags to btop-windows.exe
-
-# Format check
-cargo fmt --all -- --check
-
-# Lint (strict)
-cargo clippy --workspace --all-targets -- -D warnings
-
-# Run tests
-cargo test --workspace
-```
-
-## Milestones
-
-Track progress on [GitHub Milestones](https://github.com/hemsoft-dev/btop-windows/milestones) and [GitHub Issues](https://github.com/hemsoft-dev/btop-windows/issues):
-
-- **M0:** Technical Spikes & ADRs
-- **M1:** Walking Skeleton & Vertical Slice
-- **M2:** Core System Boxes & Layout Engine
-- **M3:** Process Manager & Windows Services
-- **M4:** Multi-GPU & Hardware Sensors
-- **M5:** Menus, Themes, Mouse & Upstream Parity
-- **M6:** Release, Signing & Performance Gates
 
 ## License
 

@@ -12,7 +12,7 @@ use clap::Parser;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "btop-windows",
+    name = "btop",
     version,
     about = "Native Windows terminal resource monitor inspired by aristocratos/btop"
 )]

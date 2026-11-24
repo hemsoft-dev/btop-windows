@@ -52,5 +52,5 @@ jobs:
         shell: pwsh
         run: |
           cargo build -p btop-windows --target x86_64-pc-windows-msvc
-          .\target\x86_64-pc-windows-msvc\debug\btop-windows.exe --version
-          .\target\x86_64-pc-windows-msvc\debug\btop-windows.exe --default-config | Out-Null
+          .\target\x86_64-pc-windows-msvc\debug\btop.exe --version
+          .\target\x86_64-pc-windows-msvc\debug\btop.exe --default-config | Out-Null

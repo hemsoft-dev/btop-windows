@@ -85,11 +85,11 @@ fn cli_replay_malformed_jsonl_exits_with_clear_error_and_no_panic() {
     let path = temp_jsonl_path("malformed");
     fs::write(&path, "{\"timestamp_ms\":1}\n{bad json line\n").expect("write malformed file");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_btop-windows"))
+    let output = Command::new(env!("CARGO_BIN_EXE_btop"))
         .arg("--replay")
         .arg(&path)
         .output()
-        .expect("run btop-windows binary");
+        .expect("run btop binary");
 
     let _ = fs::remove_file(&path);
     assert!(!output.status.success());
@@ -104,11 +104,11 @@ fn cli_replay_malformed_jsonl_exits_with_clear_error_and_no_panic() {
 #[test]
 fn cli_replay_missing_file_exits_with_clear_error() {
     let path = temp_jsonl_path("does-not-exist");
-    let output = Command::new(env!("CARGO_BIN_EXE_btop-windows"))
+    let output = Command::new(env!("CARGO_BIN_EXE_btop"))
         .arg("--replay")
         .arg(&path)
         .output()
-        .expect("run btop-windows binary");
+        .expect("run btop binary");
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);

@@ -64,12 +64,12 @@ jobs:
       - name: Audit PE imports (confirm +crt-static and Windows system DLLs only)
         shell: pwsh
         run: |
-          pwsh -NoProfile -File scripts/check-pe-imports.ps1 -BinaryPath target/x86_64-pc-windows-msvc/release/btop-windows.exe
+          pwsh -NoProfile -File scripts/check-pe-imports.ps1 -BinaryPath target/x86_64-pc-windows-msvc/release/btop.exe
 
       - name: Smoke test release binary
         shell: pwsh
         run: |
-          $exe = "target/x86_64-pc-windows-msvc/release/btop-windows.exe"
+          $exe = "target/x86_64-pc-windows-msvc/release/btop.exe"
           & $exe --version
           & $exe --help | Out-Null
           & $exe --default-config | Out-Null
@@ -84,7 +84,7 @@ jobs:
           }
           New-Item -ItemType Directory -Path (Join-Path $stage "themes") -Force | Out-Null
 
-          Copy-Item -LiteralPath "target/x86_64-pc-windows-msvc/release/btop-windows.exe" -Destination $stage
+          Copy-Item -LiteralPath "target/x86_64-pc-windows-msvc/release/btop.exe" -Destination $stage
           Copy-Item -LiteralPath "LICENSE" -Destination $stage
           Copy-Item -LiteralPath "NOTICE" -Destination $stage
           Copy-Item -LiteralPath "README.md" -Destination $stage
@@ -104,7 +104,7 @@ jobs:
           # Verify extracted archive contains every expected release file.
           $verifyDir = Join-Path $dist "verify"
           Expand-Archive -LiteralPath $archivePath -DestinationPath $verifyDir -Force
-          $required = @("btop-windows.exe", "LICENSE", "NOTICE", "README.md")
+          $required = @("btop.exe", "LICENSE", "NOTICE", "README.md")
           foreach ($item in $required) {
             if (-not (Test-Path -LiteralPath (Join-Path $verifyDir $item) -PathType Leaf)) {
               throw "Missing required release file in zip: $item"
@@ -115,7 +115,7 @@ jobs:
             throw "Bundled themes/ directory is empty inside release archive"
           }
           Write-Host "Verified extracted archive ($themeCount themes) and running extracted --version:"
-          & (Join-Path $verifyDir "btop-windows.exe") --version
+          & (Join-Path $verifyDir "btop.exe") --version
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
