@@ -2,6 +2,8 @@
 
 A fast, zero-driver, native Windows 11 terminal resource monitor written in Rust. It ships as a single static `btop.exe` binary (~3 MiB) bringing modern [btop++](https://github.com/aristocratos/btop) (v1.4.8) panels, themes, and multi-GPU telemetry together with Windows-first process and Windows Services controls.
 
+![btop-windows running in Windows Terminal showing hybrid 8P+8E CPU, dual NVIDIA RTX 5090 and AMD Radeon GPU telemetry, memory, disks, network, and processes](docs/assets/btop-windows-hero.png)
+
 ## Quick install
 
 Install `btop.exe` into `%LOCALAPPDATA%\Programs\btop`, verify its SHA-256 checksum, and add `btop` to your User `PATH` (no Administrator prompt or Visual C++ Redistributable required):
