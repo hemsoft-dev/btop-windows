@@ -12,17 +12,17 @@ expression: rendered
 │p│ F1 / ? / h               Open Help keybindings reference (Shift+H when … │ │
 ╰─│ q / Ctrl+C               Quit btop-windows and restore Windows Terminal  │─╯
 ╭─│ Ctrl+R                   Reload btop.conf and refresh collectors         │─╮
-│ │ + / -                    Adjust update_ms cadence (+/- 100 ms, floor 10… │ │
-│ │ ── Layout & Panels ──                                                    │█│
+│ │ Ctrl+L                   Force full screen redraw                        │ │
+│ │ + / -                    Adjust update_ms cadence (+/- 100 ms, floor 10… │█│
+│ │ ── Layout & Panels ──                                                    │││
 │ │ 1 / 2 / 3 / 4            Toggle CPU, MEM, NET, and PROC panels           │││
 │ │ 5 .. 9 / 0               Toggle dedicated GPU panels gpu0 through gpu5   │││
 │ │ p / Shift+P              Cycle layout presets forward / backward         │││
-│ │ d / i                    Toggle local fixed disks list / Disk I/O graph… │││
-╰─│ ── Network Panel ──                                                      │││
-╭─│ b / n                    Select previous / next hardware network adapter │││
+╰─│ d / i                    Toggle local fixed disks list / Disk I/O graph… │││
+╭─│ ── Network Panel ──                                                      │││
+│ │ b / n                    Select previous / next hardware network adapter │││
 │ │ a / y / z                Toggle auto-scale, sync scale, or reset sessio… │││
 │ │ ── Processes & Tree ──                                                   │││
-│ │ Up / Down / PgUp / PgDn  Navigate process list (j/k/g/G when vim_keys=T… │││
-│ │ ↑↓ / PgUp / PgDn scroll (1-17 of 29)  |  Esc / q close                   │││
+│ │ ↑↓ / PgUp / PgDn scroll (1-17 of 30)  |  Esc / q close                   │││
 │ ╰──────────────────────────────────────────────────────────────────────────╯││
 ╰───────────────────────────────╯╰─┐↑↓ sel | e tree | f filter | u pause | F f┌╯
