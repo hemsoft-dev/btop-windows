@@ -4,8 +4,13 @@
 #![forbid(unsafe_code)]
 
 pub mod fixtures;
+pub mod json_output;
 pub mod jsonl;
 
+pub use json_output::{
+    JSON_SCHEMA_VERSION, JsonErrorBody, JsonErrorEnvelope, JsonSections, JsonSnapshotEnvelope,
+    VALID_SECTION_NAMES,
+};
 pub use jsonl::{
     JsonlError, RecordStats, SnapshotRecorder, parse_jsonl_file, parse_jsonl_reader,
     write_snapshot_line,

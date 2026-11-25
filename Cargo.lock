@@ -145,6 +145,7 @@ dependencies = [
  "btop-term",
  "btop-ui",
  "clap",
+ "serde_json",
  "thiserror",
 ]
 
