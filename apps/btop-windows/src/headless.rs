@@ -166,6 +166,10 @@ fn takes_separate_long_value(arg: &str) -> bool {
             | "--replay"
             | "--sections"
             | "--sample-ms"
+            | "--top"
+            | "--sort"
+            | "--pid"
+            | "--services-state"
     )
 }
 

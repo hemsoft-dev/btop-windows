@@ -2,9 +2,13 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::proc_query::{
+    HeadlessQuery, ProcessTreeNode, ProcsQueryMeta, QueryFilter, ServiceJsonEntry,
+    ServicesQueryMeta, query_flat_procs, query_proc_tree, query_services,
+};
 use crate::{
     BatterySnapshot, CpuSnapshot, DataState, DiskSnapshot, GpuSnapshot, MemSnapshot,
-    NetInterfaceSnapshot, ProcessEntry, ServiceEntry, Snapshot,
+    NetInterfaceSnapshot, ProcessEntry, Snapshot,
 };
 
 /// Current schema version for headless `btop --json` output envelopes.
@@ -137,7 +141,13 @@ pub struct JsonSnapshotEnvelope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub procs: Option<DataState<Vec<ProcessEntry>>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub services: Option<DataState<Vec<ServiceEntry>>>,
+    pub proc_tree: Option<DataState<Vec<ProcessTreeNode>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub procs_meta: Option<ProcsQueryMeta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub services: Option<DataState<Vec<ServiceJsonEntry>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub services_meta: Option<ServicesQueryMeta>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpus: Option<Vec<DataState<GpuSnapshot>>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -145,39 +155,210 @@ pub struct JsonSnapshotEnvelope {
 }
 
 impl JsonSnapshotEnvelope {
-    /// Projects an immutable [`Snapshot`] into a versioned JSON envelope containing only `sections`.
+    /// Projects an immutable [`Snapshot`] into a versioned JSON envelope containing only `sections`
+    /// using default (unfiltered, flat) query options.
     pub fn from_snapshot(
         snapshot: Snapshot,
         btop_version: impl Into<String>,
         sample_window_ms: u64,
         sections: JsonSections,
     ) -> Self {
+        Self::from_snapshot_with_query(
+            snapshot,
+            btop_version,
+            sample_window_ms,
+            sections,
+            &HeadlessQuery::default(),
+            &QueryFilter::None,
+        )
+    }
+
+    /// Projects an immutable [`Snapshot`] into a versioned JSON envelope applying `query` and
+    /// `compiled_filter` to `procs`/`proc_tree` and `services`.
+    pub fn from_snapshot_with_query(
+        snapshot: Snapshot,
+        btop_version: impl Into<String>,
+        sample_window_ms: u64,
+        sections: JsonSections,
+        query: &HeadlessQuery,
+        compiled_filter: &QueryFilter,
+    ) -> Self {
+        let Snapshot {
+            timestamp_ms,
+            hostname,
+            username,
+            total_phys_mem_bytes,
+            cpu,
+            mem,
+            disks,
+            net,
+            processes,
+            services,
+            gpus,
+            battery,
+        } = snapshot;
+
+        let live_procs_slice = match &processes {
+            DataState::Available(list) | DataState::Stale { value: list, .. } => {
+                Some(list.as_slice())
+            }
+            _ => None,
+        };
+
+        let (services_out, services_meta) = if sections.services {
+            project_services(services, live_procs_slice, query, compiled_filter)
+        } else {
+            (None, None)
+        };
+
+        let projected_procs = if sections.procs {
+            project_processes(processes, query, compiled_filter)
+        } else {
+            ProjectedProcs::default()
+        };
+
         Self {
             schema_version: JSON_SCHEMA_VERSION,
             btop_version: btop_version.into(),
-            captured_at_ms: snapshot.timestamp_ms,
+            captured_at_ms: timestamp_ms,
             sample_window_ms,
-            hostname: snapshot.hostname,
-            username: snapshot.username,
+            hostname,
+            username,
             sections: sections
                 .selected_names()
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
             total_phys_mem_bytes: if sections.mem {
-                snapshot.total_phys_mem_bytes
+                total_phys_mem_bytes
             } else {
                 None
             },
-            cpu: sections.cpu.then_some(snapshot.cpu),
-            mem: sections.mem.then_some(snapshot.mem),
-            disks: sections.disks.then_some(snapshot.disks),
-            net: sections.net.then_some(snapshot.net),
-            procs: sections.procs.then_some(snapshot.processes),
-            services: sections.services.then_some(snapshot.services),
-            gpus: sections.gpus.then_some(snapshot.gpus),
-            battery: sections.battery.then_some(snapshot.battery),
+            cpu: sections.cpu.then_some(cpu),
+            mem: sections.mem.then_some(mem),
+            disks: sections.disks.then_some(disks),
+            net: sections.net.then_some(net),
+            procs: projected_procs.procs,
+            proc_tree: projected_procs.proc_tree,
+            procs_meta: projected_procs.meta,
+            services: services_out,
+            services_meta,
+            gpus: sections.gpus.then_some(gpus),
+            battery: sections.battery.then_some(battery),
         }
+    }
+}
+
+#[derive(Default)]
+struct ProjectedProcs {
+    procs: Option<DataState<Vec<ProcessEntry>>>,
+    proc_tree: Option<DataState<Vec<ProcessTreeNode>>>,
+    meta: Option<ProcsQueryMeta>,
+}
+
+fn project_processes(
+    processes: DataState<Vec<ProcessEntry>>,
+    query: &HeadlessQuery,
+    compiled_filter: &QueryFilter,
+) -> ProjectedProcs {
+    if query.tree {
+        match processes {
+            DataState::Available(list) => {
+                let (nodes, meta) = query_proc_tree(&list, query, compiled_filter);
+                ProjectedProcs {
+                    procs: None,
+                    proc_tree: Some(DataState::Available(nodes)),
+                    meta: Some(meta),
+                }
+            }
+            DataState::Stale { value, age_ms } => {
+                let (nodes, meta) = query_proc_tree(&value, query, compiled_filter);
+                ProjectedProcs {
+                    procs: None,
+                    proc_tree: Some(DataState::Stale {
+                        value: nodes,
+                        age_ms,
+                    }),
+                    meta: Some(meta),
+                }
+            }
+            DataState::WarmingUp => ProjectedProcs {
+                proc_tree: Some(DataState::WarmingUp),
+                ..ProjectedProcs::default()
+            },
+            DataState::Denied => ProjectedProcs {
+                proc_tree: Some(DataState::Denied),
+                ..ProjectedProcs::default()
+            },
+            DataState::Unavailable(msg) => ProjectedProcs {
+                proc_tree: Some(DataState::Unavailable(msg)),
+                ..ProjectedProcs::default()
+            },
+        }
+    } else {
+        match processes {
+            DataState::Available(list) => {
+                let (rows, meta) = query_flat_procs(&list, query, compiled_filter);
+                ProjectedProcs {
+                    procs: Some(DataState::Available(rows)),
+                    proc_tree: None,
+                    meta: Some(meta),
+                }
+            }
+            DataState::Stale { value, age_ms } => {
+                let (rows, meta) = query_flat_procs(&value, query, compiled_filter);
+                ProjectedProcs {
+                    procs: Some(DataState::Stale {
+                        value: rows,
+                        age_ms,
+                    }),
+                    proc_tree: None,
+                    meta: Some(meta),
+                }
+            }
+            DataState::WarmingUp => ProjectedProcs {
+                procs: Some(DataState::WarmingUp),
+                ..ProjectedProcs::default()
+            },
+            DataState::Denied => ProjectedProcs {
+                procs: Some(DataState::Denied),
+                ..ProjectedProcs::default()
+            },
+            DataState::Unavailable(msg) => ProjectedProcs {
+                procs: Some(DataState::Unavailable(msg)),
+                ..ProjectedProcs::default()
+            },
+        }
+    }
+}
+
+fn project_services(
+    services: DataState<Vec<crate::ServiceEntry>>,
+    procs: Option<&[ProcessEntry]>,
+    query: &HeadlessQuery,
+    compiled_filter: &QueryFilter,
+) -> (
+    Option<DataState<Vec<ServiceJsonEntry>>>,
+    Option<ServicesQueryMeta>,
+) {
+    match services {
+        DataState::Available(list) => {
+            let (rows, meta) = query_services(&list, procs, query, compiled_filter);
+            (Some(DataState::Available(rows)), Some(meta))
+        }
+        DataState::Stale { value, age_ms } => {
+            let (rows, meta) = query_services(&value, procs, query, compiled_filter);
+            (
+                Some(DataState::Stale {
+                    value: rows,
+                    age_ms,
+                }),
+                Some(meta),
+            )
+        }
+        DataState::WarmingUp => (Some(DataState::WarmingUp), None),
+        DataState::Denied => (Some(DataState::Denied), None),
+        DataState::Unavailable(msg) => (Some(DataState::Unavailable(msg)), None),
     }
 }
 

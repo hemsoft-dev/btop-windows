@@ -1,9 +1,7 @@
 //! Cycle-free Windows process tree builder (guarded by `parent.create_time_100ns <= child.create_time_100ns`),
 //! child CPU/memory rollup (`proc_aggregate`), and live substring/`!regex` filtering.
 
-use std::collections::BTreeMap;
-
-use btop_model::{ProcessEntry, ProcessIdentity};
+use btop_model::{ProcessEntry, ProcessIdentity, build_acyclic_adjacency};
 use regex::{Regex, RegexBuilder};
 
 use crate::proc_box::{ProcSort, ProcViewState};
@@ -194,65 +192,6 @@ pub fn build_visible_rows<'a>(
     }
 
     (out, filter_error)
-}
-
-/// Validates parent links using `parent.create_time_100ns <= child.create_time_100ns` plus
-/// ancestor cycle detection so equal-timestamp synthetic inputs can never form cycles.
-fn build_acyclic_adjacency(procs: &[ProcessEntry]) -> (Vec<Option<usize>>, Vec<Vec<usize>>) {
-    let mut pid_to_idx: BTreeMap<u32, usize> = BTreeMap::new();
-    for (idx, proc_entry) in procs.iter().enumerate() {
-        pid_to_idx.entry(proc_entry.identity.pid).or_insert(idx);
-    }
-
-    let mut parent_of = vec![None; procs.len()];
-    for (idx, child) in procs.iter().enumerate() {
-        if child.parent_pid == child.identity.pid {
-            continue;
-        }
-        let Some(&p_idx) = pid_to_idx.get(&child.parent_pid) else {
-            continue;
-        };
-        if p_idx == idx {
-            continue;
-        }
-        let parent = &procs[p_idx];
-        if parent.identity.create_time_100ns == 0
-            || parent.identity.create_time_100ns > child.identity.create_time_100ns
-        {
-            continue;
-        }
-        if !would_create_cycle(idx, p_idx, &parent_of) {
-            parent_of[idx] = Some(p_idx);
-        }
-    }
-
-    let mut children = vec![Vec::new(); procs.len()];
-    for (idx, parent) in parent_of.iter().enumerate() {
-        if let Some(p_idx) = *parent {
-            children[p_idx].push(idx);
-        }
-    }
-    (parent_of, children)
-}
-
-fn would_create_cycle(
-    child_idx: usize,
-    candidate_parent: usize,
-    parent_of: &[Option<usize>],
-) -> bool {
-    let mut cur = Some(candidate_parent);
-    let mut steps = 0usize;
-    while let Some(node) = cur {
-        if node == child_idx {
-            return true;
-        }
-        steps += 1;
-        if steps > parent_of.len() {
-            return true;
-        }
-        cur = parent_of[node];
-    }
-    false
 }
 
 fn compute_subtree_totals(

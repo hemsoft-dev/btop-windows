@@ -6,6 +6,7 @@
 pub mod fixtures;
 pub mod json_output;
 pub mod jsonl;
+pub mod proc_query;
 
 pub use json_output::{
     JSON_SCHEMA_VERSION, JsonErrorBody, JsonErrorEnvelope, JsonSections, JsonSnapshotEnvelope,
@@ -14,6 +15,10 @@ pub use json_output::{
 pub use jsonl::{
     JsonlError, RecordStats, SnapshotRecorder, parse_jsonl_file, parse_jsonl_reader,
     write_snapshot_line,
+};
+pub use proc_query::{
+    HeadlessQuery, ProcSortField, ProcessTreeNode, ProcsQueryMeta, QueryFilter, ServiceJsonEntry,
+    ServiceLinkedProcess, ServiceStateFilter, ServicesQueryMeta, build_acyclic_adjacency,
 };
 
 use serde::{Deserialize, Serialize};

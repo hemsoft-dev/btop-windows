@@ -263,4 +263,167 @@ fn live_windows_json_snapshot_runs_without_tty_and_populates_deltas() {
         svc_env.services,
         Some(btop_model::DataState::Available(ref s)) if !s.is_empty()
     ));
+
+    // Running services filter on live Windows 11 x64 returns only Running services.
+    let run_out = Command::new(btop_bin())
+        .args([
+            "--json",
+            "--sections",
+            "services",
+            "--services-state",
+            "running",
+            "--sample-ms",
+            "0",
+        ])
+        .output()
+        .expect("run live running services");
+    assert!(run_out.status.success());
+    let run_env: JsonSnapshotEnvelope =
+        serde_json::from_slice(&run_out.stdout).expect("parse running services");
+    let Some(btop_model::DataState::Available(running)) = run_env.services else {
+        panic!("expected available running services");
+    };
+    assert_ne!(running.len(), 0);
+    assert!(
+        running
+            .iter()
+            .all(|s| s.service.state.eq_ignore_ascii_case("running"))
+    );
+}
+
+#[test]
+fn json_proc_flat_and_tree_queries_on_replay_fixture() {
+    let fixture = fixture_path();
+
+    // 1. Flat --top + --sort mem + metadata.
+    let flat_out = Command::new(btop_bin())
+        .args([
+            "--json",
+            "--sections",
+            "procs",
+            "--sort",
+            "mem",
+            "--top",
+            "5",
+            "--replay",
+        ])
+        .arg(&fixture)
+        .output()
+        .expect("run flat top 5 mem");
+    assert!(flat_out.status.success());
+    let flat_env: JsonSnapshotEnvelope =
+        serde_json::from_slice(&flat_out.stdout).expect("parse flat json");
+    assert!(flat_env.proc_tree.is_none());
+    let Some(btop_model::DataState::Available(procs)) = flat_env.procs else {
+        panic!("expected available procs");
+    };
+    assert_eq!(procs.len(), 5);
+    assert!(
+        procs
+            .windows(2)
+            .all(|w| w[0].working_set_private_bytes >= w[1].working_set_private_bytes)
+    );
+    let meta = flat_env.procs_meta.expect("procs_meta");
+    assert_eq!(meta.returned, 5);
+    assert!(meta.total_processes > 5);
+    assert!(meta.truncated);
+    assert_eq!(meta.sort, btop_model::ProcSortField::Mem);
+    assert!(!meta.tree);
+
+    // 2. Nested --tree + regex --filter + --top.
+    let tree_out = Command::new(btop_bin())
+        .args([
+            "--json",
+            "--sections",
+            "procs",
+            "--tree",
+            "--filter",
+            "!^(cargo|rust-analyzer)",
+            "--sort",
+            "cpu",
+            "--top",
+            "10",
+            "--replay",
+        ])
+        .arg(&fixture)
+        .output()
+        .expect("run tree regex filter");
+    assert!(tree_out.status.success());
+    let tree_env: JsonSnapshotEnvelope =
+        serde_json::from_slice(&tree_out.stdout).expect("parse tree json");
+    assert!(
+        tree_env.procs.is_none(),
+        "flat procs omitted in --tree mode"
+    );
+    let Some(btop_model::DataState::Available(roots)) = tree_env.proc_tree else {
+        panic!("expected available proc_tree");
+    };
+    assert_ne!(roots.len(), 0);
+    assert!(roots.iter().all(|r| r.depth == 0));
+    let tree_meta = tree_env.procs_meta.expect("tree meta");
+    assert!(tree_meta.tree);
+    assert!(tree_meta.total_matched > 0);
+}
+
+#[test]
+fn json_proc_pid_slicing_and_query_error_boundaries() {
+    let fixture = fixture_path();
+
+    // 1. --pid subtree slicing for rust-analyzer (PID 4216 in committed dual-GPU fixture).
+    let pid_out = Command::new(btop_bin())
+        .args([
+            "--json",
+            "--sections",
+            "procs",
+            "--pid",
+            "4216",
+            "--tree",
+            "--replay",
+        ])
+        .arg(&fixture)
+        .output()
+        .expect("run pid 4216 tree");
+    assert!(pid_out.status.success());
+    let pid_env: JsonSnapshotEnvelope =
+        serde_json::from_slice(&pid_out.stdout).expect("parse pid json");
+    let Some(btop_model::DataState::Available(pid_roots)) = pid_env.proc_tree else {
+        panic!("expected available proc_tree for pid 4216");
+    };
+    assert_ne!(pid_roots.len(), 0);
+    let pid_meta = pid_env.procs_meta.expect("pid meta");
+    assert_eq!(pid_meta.pid, Some(4216));
+    assert!(pid_meta.total_matched >= 1);
+
+    // 2. Invalid --sort, --services-state, and invalid !regex produce structured JSON errors.
+    for args in [
+        &["--json", "--sort", "bogus"][..],
+        &["--json", "--services-state", "paused"][..],
+        &["--json", "--filter", "![unclosed"][..],
+    ] {
+        let bad = Command::new(btop_bin())
+            .args(args)
+            .output()
+            .expect("run invalid query flag");
+        assert!(!bad.status.success(), "expected error for {args:?}");
+        assert_eq!(bad.stdout, b"");
+        let parsed: JsonErrorEnvelope =
+            serde_json::from_slice(&bad.stderr).expect("structured stderr json");
+        assert_eq!(parsed.error.code, "cli_usage");
+    }
+
+    // 3. Value-consumption boundary: `--sort --json` must NOT emit JSON stderr.
+    for args in [
+        &["--sort", "--json"][..],
+        &["--pid", "--json"][..],
+        &["--services-state", "--json"][..],
+        &["--top", "--json"][..],
+    ] {
+        let non_json = Command::new(btop_bin())
+            .args(args)
+            .output()
+            .expect("run non-json value consumption");
+        assert!(!non_json.status.success());
+        assert_eq!(non_json.stdout, b"");
+        assert!(serde_json::from_slice::<JsonErrorEnvelope>(&non_json.stderr).is_err());
+    }
 }

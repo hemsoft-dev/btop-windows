@@ -7,7 +7,10 @@ use std::process::ExitCode;
 
 use btop_collect::{FreqMode, LiveCollector, ReplaySource, SnapshotSource};
 use btop_config::Config;
-use btop_model::{JsonSections, JsonSnapshotEnvelope, SnapshotRecorder};
+use btop_model::{
+    HeadlessQuery, JsonSections, JsonSnapshotEnvelope, ProcSortField, QueryFilter,
+    ServiceStateFilter, SnapshotRecorder,
+};
 use btop_term::CrosstermInput;
 use btop_windows::headless::{
     DEFAULT_LIVE_SAMPLE_MS, HeadlessJsonOptions, MAX_SAMPLE_MS, collect_headless_snapshot,
@@ -32,7 +35,7 @@ struct Cli {
     #[arg(short = 'd', long = "debug")]
     debug: bool,
 
-    /// Set an initial process filter (prefix with '!' for regex)
+    /// Set a process/service filter (prefix with '!' for regex)
     #[arg(short = 'f', long = "filter", value_name = "FILTER")]
     filter: Option<String>,
 
@@ -96,6 +99,30 @@ struct Cli {
         value_parser = clap::value_parser!(u64).range(0..=MAX_SAMPLE_MS)
     )]
     sample_ms: Option<u64>,
+
+    /// Limit returned processes (or top-level trees with --tree) in --json mode (0 = unlimited)
+    #[arg(long = "top", value_name = "N", requires = "json")]
+    top: Option<usize>,
+
+    /// Sort field for --json process output (cpu, mem, pid, name, threads, io)
+    #[arg(long = "sort", value_name = "FIELD", requires = "json")]
+    sort: Option<String>,
+
+    /// Reverse the process sort order in --json mode
+    #[arg(long = "reverse", requires = "json")]
+    reverse: bool,
+
+    /// Scope --json process output to a PID plus its verified ancestors and descendants
+    #[arg(long = "pid", value_name = "PID", requires = "json")]
+    pid: Option<u32>,
+
+    /// Emit nested parent-child process tree graph with subtree totals in --json mode
+    #[arg(long = "tree", requires = "json")]
+    tree: bool,
+
+    /// Filter Windows Services by state in --json mode (all, running, stopped)
+    #[arg(long = "services-state", value_name = "STATE", requires = "json")]
+    services_state: Option<String>,
 }
 
 fn emit_error(json_mode: bool, pretty: bool, code: &str, message: &str) {
@@ -133,6 +160,62 @@ fn parse_cli_or_exit(raw_args: &[OsString]) -> Result<Cli, ExitCode> {
             Err(ExitCode::from(code))
         }
     }
+}
+
+fn parse_headless_params(
+    cli: &Cli,
+) -> Result<(JsonSections, HeadlessQuery, QueryFilter), ExitCode> {
+    let sections = match cli.sections.as_deref() {
+        Some(spec) => match JsonSections::parse_csv(spec) {
+            Ok(parsed) => parsed,
+            Err(msg) => {
+                emit_error(true, cli.pretty, "cli_usage", &msg);
+                return Err(ExitCode::from(2));
+            }
+        },
+        None => JsonSections::all(),
+    };
+
+    let sort = match cli.sort.as_deref() {
+        Some(val) => match ProcSortField::parse_str(val) {
+            Ok(field) => field,
+            Err(msg) => {
+                emit_error(true, cli.pretty, "cli_usage", &msg);
+                return Err(ExitCode::from(2));
+            }
+        },
+        None => ProcSortField::Cpu,
+    };
+
+    let services_state = match cli.services_state.as_deref() {
+        Some(val) => match ServiceStateFilter::parse_str(val) {
+            Ok(state) => state,
+            Err(msg) => {
+                emit_error(true, cli.pretty, "cli_usage", &msg);
+                return Err(ExitCode::from(2));
+            }
+        },
+        None => ServiceStateFilter::All,
+    };
+
+    let compiled_filter = match QueryFilter::compile(cli.filter.as_deref()) {
+        Ok(compiled) => compiled,
+        Err(msg) => {
+            emit_error(true, cli.pretty, "cli_usage", &msg);
+            return Err(ExitCode::from(2));
+        }
+    };
+
+    let query = HeadlessQuery {
+        top: cli.top,
+        sort,
+        reversed: cli.reverse,
+        filter: cli.filter.clone(),
+        pid: cli.pid,
+        tree: cli.tree,
+        services_state,
+    };
+    Ok((sections, query, compiled_filter))
 }
 
 fn build_snapshot_source(cli: &Cli, config: &Config) -> Result<Box<dyn SnapshotSource>, ExitCode> {
@@ -184,19 +267,13 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let json_sections = if cli.json {
-        match cli.sections.as_deref() {
-            Some(spec) => match JsonSections::parse_csv(spec) {
-                Ok(parsed) => parsed,
-                Err(msg) => {
-                    emit_error(true, cli.pretty, "cli_usage", &msg);
-                    return ExitCode::from(2);
-                }
-            },
-            None => JsonSections::all(),
+    let headless_params = if cli.json {
+        match parse_headless_params(&cli) {
+            Ok(params) => Some(params),
+            Err(code) => return code,
         }
     } else {
-        JsonSections::all()
+        None
     };
 
     let overrides = ConfigOverrides {
@@ -227,17 +304,17 @@ fn main() -> ExitCode {
         Err(code) => return code,
     };
 
-    if cli.json {
+    if let Some((sections, query, compiled_filter)) = headless_params {
         let sample_ms = cli
             .sample_ms
             .unwrap_or(if is_replay { 0 } else { DEFAULT_LIVE_SAMPLE_MS });
         let options = HeadlessJsonOptions {
-            sections: json_sections,
+            sections,
             sample_ms,
             pretty: cli.pretty,
             is_replay,
         };
-        return run_headless_json(source.as_mut(), options);
+        return run_headless_json(source.as_mut(), options, &query, &compiled_filter);
     }
 
     let recorder = if let Some(record_path) = cli.record.as_deref() {
@@ -272,7 +349,12 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_headless_json(source: &mut dyn SnapshotSource, options: HeadlessJsonOptions) -> ExitCode {
+fn run_headless_json(
+    source: &mut dyn SnapshotSource,
+    options: HeadlessJsonOptions,
+    query: &HeadlessQuery,
+    compiled_filter: &QueryFilter,
+) -> ExitCode {
     let (snapshot, sample_window_ms) =
         match collect_headless_snapshot(source, options, std::thread::sleep) {
             Ok(result) => result,
@@ -287,11 +369,13 @@ fn run_headless_json(source: &mut dyn SnapshotSource, options: HeadlessJsonOptio
             }
         };
 
-    let envelope = JsonSnapshotEnvelope::from_snapshot(
+    let envelope = JsonSnapshotEnvelope::from_snapshot_with_query(
         snapshot,
         env!("CARGO_PKG_VERSION"),
         sample_window_ms,
         options.sections,
+        query,
+        compiled_filter,
     );
 
     if let Err(err) = write_json_envelope(&mut io::stdout().lock(), &envelope, options.pretty) {
