@@ -1,14 +1,21 @@
 //! Entry point for `btop-windows`.
 
+use std::ffi::OsString;
+use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use btop_collect::{FreqMode, LiveCollector, ReplaySource, SnapshotSource};
 use btop_config::Config;
-use btop_model::SnapshotRecorder;
+use btop_model::{JsonSections, JsonSnapshotEnvelope, SnapshotRecorder};
 use btop_term::CrosstermInput;
+use btop_windows::headless::{
+    DEFAULT_LIVE_SAMPLE_MS, HeadlessJsonOptions, MAX_SAMPLE_MS, collect_headless_snapshot,
+    raw_args_request_json, raw_args_request_pretty, write_json_envelope, write_json_error,
+};
 use btop_windows::{ConfigOverrides, load_config, run_tui_loop};
 use clap::Parser;
+use clap::error::ErrorKind;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -58,33 +65,145 @@ struct Cli {
     update_ms: Option<u32>,
 
     /// Print default config to standard output and exit
-    #[arg(long = "default-config")]
+    #[arg(long = "default-config", conflicts_with = "json")]
     default_config: bool,
 
     /// Record timestamped Snapshot JSONL stream to file
-    #[arg(long = "record", value_name = "FILE")]
+    #[arg(long = "record", value_name = "FILE", conflicts_with = "json")]
     record: Option<PathBuf>,
 
     /// Replay a recorded Snapshot JSONL stream instead of querying live Windows APIs
     #[arg(long = "replay", value_name = "FILE")]
     replay: Option<PathBuf>,
+
+    /// Emit structured JSON telemetry to stdout without starting the interactive TUI
+    #[arg(long = "json")]
+    json: bool,
+
+    /// Pretty-print JSON output (requires --json)
+    #[arg(long = "pretty", requires = "json")]
+    pretty: bool,
+
+    /// Comma-separated telemetry sections for --json (cpu,mem,disks,net,procs,services,gpus,battery,all)
+    #[arg(long = "sections", value_name = "LIST", requires = "json")]
+    sections: Option<String>,
+
+    /// Warmup sampling window in milliseconds for --json live delta metrics (0-10000, default 500)
+    #[arg(
+        long = "sample-ms",
+        value_name = "MS",
+        requires = "json",
+        value_parser = clap::value_parser!(u64).range(0..=MAX_SAMPLE_MS)
+    )]
+    sample_ms: Option<u64>,
+}
+
+fn emit_error(json_mode: bool, pretty: bool, code: &str, message: &str) {
+    if json_mode {
+        write_json_error(&mut io::stderr().lock(), code, message, pretty);
+    } else {
+        eprintln!("error: {message}");
+    }
+}
+
+fn parse_cli_or_exit(raw_args: &[OsString]) -> Result<Cli, ExitCode> {
+    match Cli::try_parse_from(raw_args) {
+        Ok(cli) => Ok(cli),
+        Err(err) => {
+            if matches!(
+                err.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) {
+                let _ = err.print();
+                return Err(ExitCode::SUCCESS);
+            }
+            if raw_args_request_json(raw_args) {
+                let pretty = raw_args_request_pretty(raw_args);
+                let message = err.render().to_string();
+                write_json_error(
+                    &mut io::stderr().lock(),
+                    "cli_usage",
+                    message.trim(),
+                    pretty,
+                );
+                return Err(ExitCode::from(2));
+            }
+            let _ = err.print();
+            let code = u8::try_from(err.exit_code()).unwrap_or(2);
+            Err(ExitCode::from(code))
+        }
+    }
+}
+
+fn build_snapshot_source(cli: &Cli, config: &Config) -> Result<Box<dyn SnapshotSource>, ExitCode> {
+    if let Some(replay_path) = cli.replay.as_deref() {
+        match ReplaySource::from_path(replay_path) {
+            Ok(replay) => Ok(Box::new(if cli.json {
+                replay.with_looping(false)
+            } else {
+                replay
+            })),
+            Err(err) => {
+                emit_error(
+                    cli.json,
+                    cli.pretty,
+                    "replay_error",
+                    &format!("failed to load --replay '{}': {err}", replay_path.display()),
+                );
+                Err(ExitCode::FAILURE)
+            }
+        }
+    } else {
+        let freq_mode = FreqMode::from_config_str(&config.freq_mode);
+        match LiveCollector::with_options(freq_mode, config.nvml_measure_pcie_speeds) {
+            Ok(live) => Ok(Box::new(live)),
+            Err(err) => {
+                emit_error(
+                    cli.json,
+                    cli.pretty,
+                    "collector_error",
+                    &format!("failed to initialize live telemetry collector: {err}"),
+                );
+                Err(ExitCode::FAILURE)
+            }
+        }
+    }
 }
 
 fn main() -> ExitCode {
     btop_sys::harden_process_startup();
 
-    let cli = Cli::parse();
+    let raw_args: Vec<OsString> = std::env::args_os().collect();
+    let cli = match parse_cli_or_exit(&raw_args) {
+        Ok(cli) => cli,
+        Err(code) => return code,
+    };
 
     if cli.default_config {
         print!("{}", Config::render_default_conf());
         return ExitCode::SUCCESS;
     }
 
+    let json_sections = if cli.json {
+        match cli.sections.as_deref() {
+            Some(spec) => match JsonSections::parse_csv(spec) {
+                Ok(parsed) => parsed,
+                Err(msg) => {
+                    emit_error(true, cli.pretty, "cli_usage", &msg);
+                    return ExitCode::from(2);
+                }
+            },
+            None => JsonSections::all(),
+        }
+    } else {
+        JsonSections::all()
+    };
+
     let overrides = ConfigOverrides {
         update_ms: cli.update_ms,
         preset: cli.preset,
-        filter: cli.filter,
-        themes_dir: cli.themes_dir,
+        filter: cli.filter.clone(),
+        themes_dir: cli.themes_dir.clone(),
         force_tty: cli.tty,
         low_color: cli.low_color,
     };
@@ -92,32 +211,34 @@ fn main() -> ExitCode {
     let config = match load_config(cli.config_file.as_deref(), &overrides) {
         Ok(cfg) => cfg,
         Err(err) => {
-            eprintln!("error: failed to load config: {err}");
+            emit_error(
+                cli.json,
+                cli.pretty,
+                "config_error",
+                &format!("failed to load config: {err}"),
+            );
             return ExitCode::FAILURE;
         }
     };
 
-    let source: Box<dyn SnapshotSource> = if let Some(replay_path) = cli.replay.as_deref() {
-        match ReplaySource::from_path(replay_path) {
-            Ok(replay) => Box::new(replay),
-            Err(err) => {
-                eprintln!(
-                    "error: failed to load --replay '{}': {err}",
-                    replay_path.display()
-                );
-                return ExitCode::FAILURE;
-            }
-        }
-    } else {
-        let freq_mode = FreqMode::from_config_str(&config.freq_mode);
-        match LiveCollector::with_options(freq_mode, config.nvml_measure_pcie_speeds) {
-            Ok(live) => Box::new(live),
-            Err(err) => {
-                eprintln!("error: failed to initialize live telemetry collector: {err}");
-                return ExitCode::FAILURE;
-            }
-        }
+    let is_replay = cli.replay.is_some();
+    let mut source = match build_snapshot_source(&cli, &config) {
+        Ok(src) => src,
+        Err(code) => return code,
     };
+
+    if cli.json {
+        let sample_ms = cli
+            .sample_ms
+            .unwrap_or(if is_replay { 0 } else { DEFAULT_LIVE_SAMPLE_MS });
+        let options = HeadlessJsonOptions {
+            sections: json_sections,
+            sample_ms,
+            pretty: cli.pretty,
+            is_replay,
+        };
+        return run_headless_json(source.as_mut(), options);
+    }
 
     let recorder = if let Some(record_path) = cli.record.as_deref() {
         match SnapshotRecorder::open(record_path) {
@@ -149,4 +270,42 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn run_headless_json(source: &mut dyn SnapshotSource, options: HeadlessJsonOptions) -> ExitCode {
+    let (snapshot, sample_window_ms) =
+        match collect_headless_snapshot(source, options, std::thread::sleep) {
+            Ok(result) => result,
+            Err(err) => {
+                emit_error(
+                    true,
+                    options.pretty,
+                    "collector_error",
+                    &format!("failed to collect telemetry snapshot: {err}"),
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+
+    let envelope = JsonSnapshotEnvelope::from_snapshot(
+        snapshot,
+        env!("CARGO_PKG_VERSION"),
+        sample_window_ms,
+        options.sections,
+    );
+
+    if let Err(err) = write_json_envelope(&mut io::stdout().lock(), &envelope, options.pretty) {
+        if err.kind() == io::ErrorKind::BrokenPipe {
+            return ExitCode::SUCCESS;
+        }
+        emit_error(
+            true,
+            options.pretty,
+            "io_error",
+            &format!("failed to write JSON output: {err}"),
+        );
+        return ExitCode::FAILURE;
+    }
+
+    ExitCode::SUCCESS
 }

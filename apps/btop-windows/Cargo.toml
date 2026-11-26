@@ -21,4 +21,5 @@ btop-sys.workspace = true
 btop-term.workspace = true
 btop-ui.workspace = true
 clap.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
