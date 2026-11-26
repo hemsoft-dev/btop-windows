@@ -1,10 +1,13 @@
 //! End-to-end CLI integration tests for headless `--json` mode, subsystem selection,
 //! warmup sampling, and machine-readable stderr error contracts.
 
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
-use btop_model::{JSON_SCHEMA_VERSION, JsonErrorEnvelope, JsonSnapshotEnvelope};
+use btop_model::{
+    JSON_SCHEMA_VERSION, JsonErrorEnvelope, JsonSnapshotEnvelope, JsonSummaryEnvelope,
+};
 
 fn btop_bin() -> &'static str {
     env!("CARGO_BIN_EXE_btop")
@@ -417,6 +420,9 @@ fn json_proc_pid_slicing_and_query_error_boundaries() {
         &["--pid", "--json"][..],
         &["--services-state", "--json"][..],
         &["--top", "--json"][..],
+        &["--count", "--json"][..],
+        &["--interval-ms", "--json"][..],
+        &["--window-ms", "--json"][..],
     ] {
         let non_json = Command::new(btop_bin())
             .args(args)
@@ -426,4 +432,193 @@ fn json_proc_pid_slicing_and_query_error_boundaries() {
         assert_eq!(non_json.stdout, b"");
         assert!(serde_json::from_slice::<JsonErrorEnvelope>(&non_json.stderr).is_err());
     }
+}
+
+#[test]
+fn json_streaming_count_and_replay_summary_with_series() {
+    let fixture = fixture_path();
+
+    // 1. Streaming `--count 2` on replay emits exactly 2 valid NDJSON lines.
+    let stream_out = Command::new(btop_bin())
+        .args([
+            "--json",
+            "--sections",
+            "cpu,mem,gpus",
+            "--count",
+            "2",
+            "--replay",
+        ])
+        .arg(&fixture)
+        .output()
+        .expect("run replay stream count 2");
+    assert!(
+        stream_out.status.success(),
+        "stream failed: {}",
+        String::from_utf8_lossy(&stream_out.stderr)
+    );
+    let stream_text = String::from_utf8(stream_out.stdout).expect("utf8 stream");
+    let lines: Vec<&str> = stream_text.lines().collect();
+    assert_eq!(lines.len(), 2);
+    for line in lines {
+        let env: JsonSnapshotEnvelope = serde_json::from_str(line).expect("parse ndjson line");
+        assert_eq!(env.schema_version, JSON_SCHEMA_VERSION);
+        assert!(env.cpu.is_some());
+        assert!(env.mem.is_some());
+        assert!(env.gpus.is_some());
+        assert!(env.disks.is_none());
+    }
+
+    // 2. Deterministic `--summary --include-series` on committed dual-GPU fixture.
+    let sum_out = Command::new(btop_bin())
+        .args(["--json", "--summary", "--include-series", "--replay"])
+        .arg(&fixture)
+        .output()
+        .expect("run replay summary");
+    assert!(
+        sum_out.status.success(),
+        "summary failed: {}",
+        String::from_utf8_lossy(&sum_out.stderr)
+    );
+    let summary: JsonSummaryEnvelope =
+        serde_json::from_slice(&sum_out.stdout).expect("parse summary json");
+    assert_eq!(summary.schema_version, JSON_SCHEMA_VERSION);
+    assert_eq!(summary.sample_count, 3);
+    assert!(summary.window_ms > 0);
+    let cpu = summary.cpu.expect("cpu summary");
+    assert_eq!(cpu.samples_available, 3);
+    assert!(cpu.total_busy_pct.max >= cpu.total_busy_pct.min);
+    let mem = summary.mem.expect("mem summary");
+    assert_eq!(mem.samples_available, 3);
+    let gpus = summary.gpus.expect("gpus summary");
+    assert_eq!(gpus.len(), 2);
+    let procs = summary.procs.expect("procs summary");
+    assert_ne!(procs.by_cpu.len(), 0);
+    assert_ne!(procs.by_mem.len(), 0);
+    let series = summary.series.expect("series");
+    assert_eq!(series.len(), 3);
+}
+
+#[test]
+fn json_streaming_broken_pipe_and_invalid_flag_combinations() {
+    // 1. Invalid streaming/summary combinations emit structured `cli_usage` JSON on stderr.
+    for args in [
+        &["--json", "--summary", "--count", "0"][..],
+        &["--json", "--count", "2", "--pretty"][..],
+        &["--json", "--interval-ms", "50"][..],
+        &["--json", "--window-ms", "500"][..],
+    ] {
+        let bad = Command::new(btop_bin())
+            .args(args)
+            .output()
+            .expect("run invalid stream/summary flag combo");
+        assert!(!bad.status.success(), "expected error for {args:?}");
+        assert_eq!(bad.stdout, b"");
+        let parsed: JsonErrorEnvelope =
+            serde_json::from_slice(&bad.stderr).expect("structured stderr json");
+        assert_eq!(parsed.error.code, "cli_usage");
+    }
+
+    // 2. Broken pipe during continuous streaming (`--count 0`) exits cleanly with no panic.
+    let mut child = Command::new(btop_bin())
+        .args([
+            "--json",
+            "--sections",
+            "cpu",
+            "--count",
+            "0",
+            "--interval-ms",
+            "100",
+            "--sample-ms",
+            "0",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn continuous stream");
+
+    {
+        let stdout = child.stdout.take().expect("stdout pipe");
+        let mut reader = BufReader::new(stdout);
+        let mut first_line = String::new();
+        let bytes = reader.read_line(&mut first_line).expect("read first line");
+        assert_ne!(bytes, 0);
+        let parsed: JsonSnapshotEnvelope =
+            serde_json::from_str(first_line.trim()).expect("valid first json line");
+        assert_eq!(parsed.schema_version, JSON_SCHEMA_VERSION);
+        // Drop reader/stdout here to close the pipe while child is still streaming.
+    }
+
+    let output = child.wait_with_output().expect("wait for broken-pipe exit");
+    assert!(
+        output.status.success(),
+        "expected clean exit 0 on broken pipe, got {:?}, stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stderr.len(), 0);
+}
+
+#[cfg(windows)]
+#[test]
+fn live_windows_streaming_and_summary_populate_real_metrics() {
+    let stream = Command::new(btop_bin())
+        .args([
+            "--json",
+            "--sections",
+            "cpu,mem,gpus",
+            "--count",
+            "2",
+            "--interval-ms",
+            "150",
+            "--sample-ms",
+            "100",
+        ])
+        .output()
+        .expect("run live stream");
+    assert!(
+        stream.status.success(),
+        "live stream failed: {}",
+        String::from_utf8_lossy(&stream.stderr)
+    );
+    let lines: Vec<&str> = std::str::from_utf8(&stream.stdout)
+        .expect("utf8")
+        .lines()
+        .collect();
+    assert_eq!(lines.len(), 2);
+    for line in lines {
+        let env: JsonSnapshotEnvelope = serde_json::from_str(line).expect("parse live line");
+        assert!(matches!(env.cpu, Some(btop_model::DataState::Available(_))));
+    }
+
+    let sum = Command::new(btop_bin())
+        .args([
+            "--json",
+            "--summary",
+            "--include-series",
+            "--sections",
+            "cpu,mem,procs",
+            "--window-ms",
+            "400",
+            "--interval-ms",
+            "150",
+            "--sample-ms",
+            "100",
+        ])
+        .output()
+        .expect("run live summary");
+    assert!(
+        sum.status.success(),
+        "live summary failed: {}",
+        String::from_utf8_lossy(&sum.stderr)
+    );
+    let summary: JsonSummaryEnvelope =
+        serde_json::from_slice(&sum.stdout).expect("parse live summary");
+    assert!(summary.sample_count >= 2);
+    assert!(summary.cpu.is_some());
+    assert!(summary.mem.is_some());
+    assert!(summary.procs.is_some());
+    assert_eq!(
+        summary.series.as_ref().map(Vec::len),
+        Some(summary.sample_count)
+    );
 }

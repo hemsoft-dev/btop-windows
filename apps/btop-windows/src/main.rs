@@ -4,6 +4,9 @@ use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use btop_collect::{FreqMode, LiveCollector, ReplaySource, SnapshotSource};
 use btop_config::Config;
@@ -11,10 +14,14 @@ use btop_model::{
     HeadlessQuery, JsonSections, JsonSnapshotEnvelope, ProcSortField, QueryFilter,
     ServiceStateFilter, SnapshotRecorder,
 };
+use btop_sys::{TimerWake, WaitableWakeTimer, install_headless_ctrl_c_handler};
 use btop_term::CrosstermInput;
 use btop_windows::headless::{
-    DEFAULT_LIVE_SAMPLE_MS, HeadlessJsonOptions, MAX_SAMPLE_MS, collect_headless_snapshot,
-    raw_args_request_json, raw_args_request_pretty, write_json_envelope, write_json_error,
+    DEFAULT_INTERVAL_MS, DEFAULT_LIVE_SAMPLE_MS, HeadlessContext, HeadlessJsonOptions,
+    HeadlessStreamOptions, HeadlessSummaryOptions, MAX_INTERVAL_MS, MAX_SAMPLE_MS,
+    MAX_SUMMARY_WINDOW_MS, MIN_INTERVAL_MS, collect_headless_snapshot, collect_headless_summary,
+    raw_args_request_json, raw_args_request_pretty, stream_headless_snapshots, write_json_envelope,
+    write_json_error, write_json_summary,
 };
 use btop_windows::{ConfigOverrides, load_config, run_tui_loop};
 use clap::Parser;
@@ -123,6 +130,36 @@ struct Cli {
     /// Filter Windows Services by state in --json mode (all, running, stopped)
     #[arg(long = "services-state", value_name = "STATE", requires = "json")]
     services_state: Option<String>,
+
+    /// Number of samples to stream as NDJSON (0 = stream until Ctrl+C or broken pipe; requires --json)
+    #[arg(long = "count", value_name = "N", requires = "json")]
+    count: Option<usize>,
+
+    /// Sampling interval in milliseconds for --count streaming or --summary mode (100-60000, default 1000)
+    #[arg(
+        long = "interval-ms",
+        value_name = "MS",
+        requires = "json",
+        value_parser = clap::value_parser!(u64).range(MIN_INTERVAL_MS..=MAX_INTERVAL_MS)
+    )]
+    interval_ms: Option<u64>,
+
+    /// Aggregate a multi-sample time window into one compact JSON summary object (requires --json)
+    #[arg(long = "summary", requires = "json")]
+    summary: bool,
+
+    /// Target window duration in milliseconds for --summary mode (100-300000, default 3000 live)
+    #[arg(
+        long = "window-ms",
+        value_name = "MS",
+        requires = "summary",
+        value_parser = clap::value_parser!(u64).range(MIN_INTERVAL_MS..=MAX_SUMMARY_WINDOW_MS)
+    )]
+    window_ms: Option<u64>,
+
+    /// Include a compact timestamped scalar series array inside --summary JSON output
+    #[arg(long = "include-series", requires = "summary")]
+    include_series: bool,
 }
 
 fn emit_error(json_mode: bool, pretty: bool, code: &str, message: &str) {
@@ -165,6 +202,26 @@ fn parse_cli_or_exit(raw_args: &[OsString]) -> Result<Cli, ExitCode> {
 fn parse_headless_params(
     cli: &Cli,
 ) -> Result<(JsonSections, HeadlessQuery, QueryFilter), ExitCode> {
+    if cli.summary && cli.count == Some(0) {
+        emit_error(
+            true,
+            cli.pretty,
+            "cli_usage",
+            "--count 0 (continuous streaming) cannot be combined with --summary; specify a positive --count or --window-ms",
+        );
+        return Err(ExitCode::from(2));
+    }
+
+    if !cli.summary && cli.count.is_some() && cli.pretty {
+        emit_error(
+            true,
+            cli.pretty,
+            "cli_usage",
+            "--pretty cannot be combined with streaming --count without --summary (NDJSON requires one JSON object per line)",
+        );
+        return Err(ExitCode::from(2));
+    }
+
     let sections = match cli.sections.as_deref() {
         Some(spec) => match JsonSections::parse_csv(spec) {
             Ok(parsed) => parsed,
@@ -305,16 +362,14 @@ fn main() -> ExitCode {
     };
 
     if let Some((sections, query, compiled_filter)) = headless_params {
-        let sample_ms = cli
-            .sample_ms
-            .unwrap_or(if is_replay { 0 } else { DEFAULT_LIVE_SAMPLE_MS });
-        let options = HeadlessJsonOptions {
-            sections,
-            sample_ms,
-            pretty: cli.pretty,
+        return dispatch_headless(
+            source.as_mut(),
+            &cli,
             is_replay,
-        };
-        return run_headless_json(source.as_mut(), options, &query, &compiled_filter);
+            sections,
+            &query,
+            &compiled_filter,
+        );
     }
 
     let recorder = if let Some(record_path) = cli.record.as_deref() {
@@ -346,6 +401,85 @@ fn main() -> ExitCode {
             eprintln!("error: {err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn dispatch_headless(
+    source: &mut dyn SnapshotSource,
+    cli: &Cli,
+    is_replay: bool,
+    sections: JsonSections,
+    query: &HeadlessQuery,
+    compiled_filter: &QueryFilter,
+) -> ExitCode {
+    let ctx = HeadlessContext {
+        query,
+        filter: compiled_filter,
+        btop_version: env!("CARGO_PKG_VERSION"),
+    };
+
+    if cli.summary {
+        let options = HeadlessSummaryOptions {
+            sections,
+            explicit_sample_ms: cli.sample_ms,
+            count: cli.count,
+            window_ms: cli.window_ms,
+            interval_ms: cli.interval_ms.unwrap_or(DEFAULT_INTERVAL_MS),
+            include_series: cli.include_series,
+            pretty: cli.pretty,
+            is_replay,
+        };
+        return run_headless_summary(source, options, ctx);
+    }
+
+    if let Some(count) = cli.count {
+        let sample_ms = cli
+            .sample_ms
+            .unwrap_or(if is_replay { 0 } else { DEFAULT_LIVE_SAMPLE_MS });
+        let options = HeadlessStreamOptions {
+            sections,
+            sample_ms,
+            count,
+            interval_ms: cli.interval_ms.unwrap_or(DEFAULT_INTERVAL_MS),
+            is_replay,
+        };
+        return run_headless_stream(source, options, ctx);
+    }
+
+    let sample_ms = cli
+        .sample_ms
+        .unwrap_or(if is_replay { 0 } else { DEFAULT_LIVE_SAMPLE_MS });
+    let options = HeadlessJsonOptions {
+        sections,
+        sample_ms,
+        pretty: cli.pretty,
+        is_replay,
+    };
+    run_headless_json(source, options, query, compiled_filter)
+}
+
+fn setup_interruptible_wait() -> (Arc<AtomicBool>, Box<dyn FnMut(Duration) -> bool>) {
+    if let Ok((timer, waker)) = WaitableWakeTimer::new() {
+        let stop_flag = install_headless_ctrl_c_handler(waker);
+        let stop_check = Arc::clone(&stop_flag);
+        let waiter = Box::new(move |dur: Duration| {
+            if stop_check.load(Ordering::SeqCst) {
+                return false;
+            }
+            match timer.wait(dur) {
+                Ok(TimerWake::Elapsed) => !stop_check.load(Ordering::SeqCst),
+                Ok(TimerWake::Woken) | Err(_) => false,
+            }
+        });
+        (stop_flag, waiter)
+    } else {
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_check = Arc::clone(&stop_flag);
+        let waiter = Box::new(move |dur: Duration| {
+            std::thread::sleep(dur);
+            !stop_check.load(Ordering::SeqCst)
+        });
+        (stop_flag, waiter)
     }
 }
 
@@ -387,6 +521,62 @@ fn run_headless_json(
             options.pretty,
             "io_error",
             &format!("failed to write JSON output: {err}"),
+        );
+        return ExitCode::FAILURE;
+    }
+
+    ExitCode::SUCCESS
+}
+
+fn run_headless_stream(
+    source: &mut dyn SnapshotSource,
+    options: HeadlessStreamOptions,
+    ctx: HeadlessContext<'_>,
+) -> ExitCode {
+    let (stop_flag, mut waiter) = setup_interruptible_wait();
+    let mut stdout = io::stdout().lock();
+    match stream_headless_snapshots(source, options, ctx, &stop_flag, &mut stdout, &mut waiter) {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(err) => {
+            emit_error(
+                true,
+                false,
+                "collector_error",
+                &format!("failed while streaming JSON telemetry: {err}"),
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_headless_summary(
+    source: &mut dyn SnapshotSource,
+    options: HeadlessSummaryOptions,
+    ctx: HeadlessContext<'_>,
+) -> ExitCode {
+    let (stop_flag, mut waiter) = setup_interruptible_wait();
+    let summary = match collect_headless_summary(source, options, ctx, &stop_flag, &mut waiter) {
+        Ok(summary) => summary,
+        Err(err) => {
+            emit_error(
+                true,
+                options.pretty,
+                "collector_error",
+                &format!("failed while collecting summary window: {err}"),
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if let Err(err) = write_json_summary(&mut io::stdout().lock(), &summary, options.pretty) {
+        if err.kind() == io::ErrorKind::BrokenPipe {
+            return ExitCode::SUCCESS;
+        }
+        emit_error(
+            true,
+            options.pretty,
+            "io_error",
+            &format!("failed to write JSON summary output: {err}"),
         );
         return ExitCode::FAILURE;
     }

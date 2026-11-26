@@ -7,6 +7,7 @@ pub mod fixtures;
 pub mod json_output;
 pub mod jsonl;
 pub mod proc_query;
+pub mod summary;
 
 pub use json_output::{
     JSON_SCHEMA_VERSION, JsonErrorBody, JsonErrorEnvelope, JsonSections, JsonSnapshotEnvelope,
@@ -19,6 +20,11 @@ pub use jsonl::{
 pub use proc_query::{
     HeadlessQuery, ProcSortField, ProcessTreeNode, ProcsQueryMeta, QueryFilter, ServiceJsonEntry,
     ServiceLinkedProcess, ServiceStateFilter, ServicesQueryMeta, build_acyclic_adjacency,
+};
+pub use summary::{
+    BatterySummary, CpuSummary, DEFAULT_SUMMARY_TOP, DiskSummary, GpuSummary, JsonSummaryEnvelope,
+    MemSummary, NetSummary, ProcessWindowEntry, ProcsWindowSummary, ScalarStats,
+    SummarySeriesPoint, U64Stats,
 };
 
 use serde::{Deserialize, Serialize};
