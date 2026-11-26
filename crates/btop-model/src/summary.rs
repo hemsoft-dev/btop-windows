@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::diagnose::{DiagnosticsReport, diagnose_summary};
+use crate::diagnose::{DiagnosticsReport, diagnose_summary, diagnose_window};
 use crate::json_output::{JSON_SCHEMA_VERSION, JsonSections};
 use crate::proc_query::{HeadlessQuery, QueryFilter, build_acyclic_adjacency};
 use crate::{
@@ -195,6 +195,8 @@ pub struct GpuSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temp_celsius: Option<ScalarStats>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temp_max_celsius: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub core_clock_mhz: Option<ScalarStats>,
 }
 
@@ -302,7 +304,21 @@ pub struct JsonSummaryEnvelope {
 }
 
 impl JsonSummaryEnvelope {
-    /// Attaches deterministic window-level health diagnostics for `--summary --diagnose`.
+    /// Attaches deterministic window-level health diagnostics computed directly from raw
+    /// un-truncated `snapshots` (prefer this over [`Self::with_diagnostics`] whenever raw
+    /// snapshots are available so process filters/truncation and mid-window limit changes
+    /// cannot distort findings).
+    #[must_use]
+    pub fn with_window_diagnostics(
+        mut self,
+        snapshots: &[Snapshot],
+        sections: JsonSections,
+    ) -> Self {
+        self.diagnostics = Some(diagnose_window(snapshots, sections));
+        self
+    }
+
+    /// Attaches deterministic window-level health diagnostics from this summary envelope alone.
     #[must_use]
     pub fn with_diagnostics(mut self, sections: JsonSections) -> Self {
         self.diagnostics = Some(diagnose_summary(&self, sections));
@@ -580,7 +596,7 @@ fn push_net_sample(map: &mut HashMap<u64, NetAccum>, iface: &NetInterfaceSnapsho
     });
     entry.name.clone_from(&iface.name);
     entry.description.clone_from(&iface.description);
-    entry.is_up = iface.is_up;
+    entry.is_up |= iface.is_up;
     if iface.link_speed_bps.is_some() {
         entry.link_speed_bps = iface.link_speed_bps;
     }
@@ -612,6 +628,7 @@ struct GpuAccum {
     power: Vec<f32>,
     power_limit: Option<f32>,
     temp: Vec<f32>,
+    temp_max: Option<f32>,
     core_clock: Vec<f64>,
 }
 
@@ -639,6 +656,7 @@ fn summarize_gpus(snapshots: &[Snapshot]) -> Vec<GpuSummary> {
             power_watts: ScalarStats::from_f32(&acc.power),
             power_limit_watts: acc.power_limit,
             temp_celsius: ScalarStats::from_f32(&acc.temp),
+            temp_max_celsius: acc.temp_max,
             core_clock_mhz: ScalarStats::from_f64(&acc.core_clock),
         })
         .collect();
@@ -671,6 +689,9 @@ fn push_gpu_sample(map: &mut HashMap<u8, GpuAccum>, gpu: &GpuSnapshot) {
     }
     if let Some(t) = gpu.temp_celsius {
         entry.temp.push(t);
+    }
+    if gpu.temp_max_celsius.is_some() {
+        entry.temp_max = gpu.temp_max_celsius;
     }
     if let Some(c) = gpu.core_clock_mhz {
         entry.core_clock.push(f64::from(c));

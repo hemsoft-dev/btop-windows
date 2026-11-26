@@ -312,7 +312,7 @@ where
         options.include_series,
     );
     if options.diagnose {
-        summary = summary.with_diagnostics(options.sections);
+        summary = summary.with_window_diagnostics(&snapshots, options.sections);
     }
     Ok(summary)
 }
@@ -773,6 +773,16 @@ mod tests {
         assert!(!summary.sections.iter().any(|s| s == "services"));
         assert_eq!(summary.sample_count, fixtures.len());
         assert_eq!(summary.series.as_ref().map(Vec::len), Some(fixtures.len()));
+        let diag = summary
+            .diagnostics
+            .as_ref()
+            .expect("summary diagnostics must be attached");
+        assert_ne!(diag.checks_evaluated.len(), 0);
+        assert!(
+            diag.checks_evaluated
+                .iter()
+                .any(|c| c == "process_subtree_cpu_dominance")
+        );
 
         // Combined `--window-ms` + `--count` stops at whichever bound is reached first.
         let mut bounded = RecordingSource {

@@ -687,9 +687,18 @@ fn json_diagnose_attaches_deterministic_report_for_snapshot_and_summary() {
             .any(|s| s.check == "gpu_health" && s.reason == "section not selected")
     );
 
-    // 3. Combined --summary --diagnose on committed dual-GPU fixture.
+    // 3. Combined --summary --diagnose on committed dual-GPU fixture (even with restrictive --filter/--top).
     let sum_out = Command::new(btop_bin())
-        .args(["--json", "--summary", "--diagnose", "--replay"])
+        .args([
+            "--json",
+            "--summary",
+            "--diagnose",
+            "--top",
+            "1",
+            "--filter",
+            "nonexistent-filter-token",
+            "--replay",
+        ])
         .arg(&fixture)
         .output()
         .expect("run replay --summary --diagnose");
@@ -698,6 +707,12 @@ fn json_diagnose_attaches_deterministic_report_for_snapshot_and_summary() {
         serde_json::from_slice(&sum_out.stdout).expect("parse summary diagnose");
     let sum_diag = sum_env.diagnostics.expect("summary diagnostics");
     assert_ne!(sum_diag.checks_evaluated.len(), 0);
+    assert!(
+        sum_diag
+            .checks_evaluated
+            .iter()
+            .any(|c| c == "process_subtree_cpu_dominance")
+    );
 
     // 4. --diagnose without --json fails cleanly with plain clap stderr (not JSON).
     let no_json = Command::new(btop_bin())

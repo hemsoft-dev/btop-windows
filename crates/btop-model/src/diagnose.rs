@@ -1,13 +1,17 @@
 //! Pure, deterministic system health and bottleneck diagnostics for headless `--json --diagnose`.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::json_output::JsonSections;
-use crate::proc_query::{build_acyclic_adjacency, compute_subtree_totals};
-use crate::summary::{JsonSummaryEnvelope, ProcessWindowEntry};
+use crate::proc_query::{
+    HeadlessQuery, QueryFilter, build_acyclic_adjacency, compute_subtree_totals,
+};
+use crate::summary::{JsonSummaryEnvelope, ProcessWindowEntry, ScalarStats};
 use crate::{
     CpuSnapshot, DataState, DiskSnapshot, GpuSnapshot, MemSnapshot, NetInterfaceSnapshot,
-    ProcessEntry, Snapshot,
+    ProcessEntry, ProcessIdentity, Snapshot,
 };
 
 /// Overall system health status derived deterministically from diagnostic findings.
@@ -1038,25 +1042,76 @@ fn proc_entity(proc_entry: &ProcessEntry) -> DiagnosticEntity {
     }
 }
 
-fn diagnose_proc_subtrees(ctx: &mut EvalContext, procs: &[ProcessEntry]) {
-    ctx.mark_evaluated("process_subtree_cpu_dominance");
-    let (parent_idx, children) = build_acyclic_adjacency(procs);
+fn find_dominant_subtrees(procs: &[ProcessEntry]) -> Vec<(usize, f64)> {
+    let (_parent_idx, children) = build_acyclic_adjacency(procs);
     let subtree_totals = compute_subtree_totals(procs, &children);
+    let n = procs.len();
+
+    // First identify candidate multi-process workload subtrees (excluding Windows Idle PID 0
+    // and kernel System PID 4) where CPU is genuinely spread across multiple processes rather
+    // than dominated by a single child (which is already caught by `process_cpu_dominance`).
+    let mut is_candidate = vec![false; n];
     for (idx, proc_entry) in procs.iter().enumerate() {
-        if proc_entry.identity.pid == 0 || children[idx].is_empty() {
-            continue;
-        }
-        if let Some(p) = parent_idx[idx]
-            && procs[p].identity.pid != 0
-            && f64::from(subtree_totals[p].0) >= 70.0
-        {
+        let pid = proc_entry.identity.pid;
+        if pid == 0 || pid == 4 || children[idx].is_empty() {
             continue;
         }
         let sub_cpu = f64::from(subtree_totals[idx].0);
+        if !sub_cpu.is_finite() || sub_cpu < 70.0 {
+            continue;
+        }
         let self_cpu = f64::from(proc_entry.cpu_pct.max(0.0));
         if sub_cpu <= self_cpu + 5.0 {
             continue;
         }
+        let max_child_sub = children[idx]
+            .iter()
+            .map(|&c| f64::from(subtree_totals[c].0))
+            .fold(0.0_f64, f64::max);
+        if max_child_sub >= sub_cpu * 0.85 {
+            continue;
+        }
+        is_candidate[idx] = true;
+    }
+
+    // Keep only the deepest (most specific) candidate in each branch so top-level ancestors
+    // like `explorer.exe` or `pwsh.exe` are not blamed for a child workload subtree.
+    let mut has_candidate_descendant = vec![false; n];
+    let mut memo: Vec<Option<bool>> = vec![None; n];
+    for (idx, has_desc) in has_candidate_descendant.iter_mut().enumerate() {
+        *has_desc = subtree_has_candidate_descendant(idx, &children, &is_candidate, &mut memo);
+    }
+
+    (0..n)
+        .filter(|&idx| is_candidate[idx] && !has_candidate_descendant[idx])
+        .map(|idx| (idx, f64::from(subtree_totals[idx].0)))
+        .collect()
+}
+
+fn subtree_has_candidate_descendant(
+    idx: usize,
+    children: &[Vec<usize>],
+    is_candidate: &[bool],
+    memo: &mut [Option<bool>],
+) -> bool {
+    if let Some(cached) = memo[idx] {
+        return cached;
+    }
+    let mut found = false;
+    for &c in &children[idx] {
+        if is_candidate[c] || subtree_has_candidate_descendant(c, children, is_candidate, memo) {
+            found = true;
+            break;
+        }
+    }
+    memo[idx] = Some(found);
+    found
+}
+
+fn diagnose_proc_subtrees(ctx: &mut EvalContext, procs: &[ProcessEntry]) {
+    ctx.mark_evaluated("process_subtree_cpu_dominance");
+    for (idx, sub_cpu) in find_dominant_subtrees(procs) {
+        let proc_entry = &procs[idx];
         if let Some((severity, threshold)) = eval_high_threshold(sub_cpu, 70.0, 90.0) {
             ctx.push_finding(
                 "process_subtree_cpu_dominance",
@@ -1486,6 +1541,10 @@ fn diagnose_gpus_summary(
 
     let mut cov = GpuCheckCoverage::default();
     for gpu in gpus {
+        let temp_crit_c = gpu
+            .temp_max_celsius
+            .filter(|m| m.is_finite() && *m > 50.0)
+            .map_or(90.0, f64::from);
         let inp = GpuEvalInputs {
             index: gpu.index,
             name: &gpu.name,
@@ -1493,7 +1552,7 @@ fn diagnose_gpus_summary(
             vram_total: gpu.vram_total_bytes,
             util_pct: gpu.utilization_pct.map(|s| s.p95),
             temp_c: gpu.temp_celsius.map(|s| s.max),
-            temp_crit_c: 90.0,
+            temp_crit_c,
             power_w: gpu.power_watts.map(|s| s.p95),
             power_limit_w: gpu.power_limit_watts.map(f64::from),
             metric_suffix: ".window",
@@ -1501,6 +1560,362 @@ fn diagnose_gpus_summary(
         evaluate_single_gpu(ctx, &mut cov, &inp);
     }
     record_optional_gpu_checks(ctx, &cov);
+}
+
+/// Evaluates pure deterministic health and bottleneck diagnostics directly over a raw un-truncated
+/// slice of [`Snapshot`] frames (used by `--summary --diagnose`).
+///
+/// Computing memory/network/GPU ratios per sample before window aggregation prevents cross-sample
+/// extrema distortion (e.g., mid-window pagefile expansion) and ensures `--filter`/`--pid`/`--top`
+/// projections never hide runaway processes or subtrees.
+pub fn diagnose_window(snapshots: &[Snapshot], sections: JsonSections) -> DiagnosticsReport {
+    let unfiltered_query = HeadlessQuery {
+        top: Some(0),
+        ..HeadlessQuery::default()
+    };
+    let full_summary = JsonSummaryEnvelope::from_snapshots(
+        snapshots,
+        "",
+        None,
+        sections,
+        &unfiltered_query,
+        &QueryFilter::None,
+        false,
+    );
+
+    let mut ctx = EvalContext::default();
+    diagnose_cpu_summary(&mut ctx, full_summary.cpu.as_ref(), sections.cpu);
+    diagnose_mem_window(&mut ctx, snapshots, sections.mem);
+    diagnose_disks_summary(&mut ctx, full_summary.disks.as_deref(), sections.disks);
+    diagnose_net_window(&mut ctx, snapshots, sections.net);
+    diagnose_gpus_summary(&mut ctx, full_summary.gpus.as_deref(), sections.gpus);
+
+    let total_phys_mem = snapshots.iter().rev().find_map(|s| {
+        state_ref(&s.mem)
+            .map(|m| m.total_bytes)
+            .filter(|&b| b > 0)
+            .or(s.total_phys_mem_bytes)
+    });
+    diagnose_procs_window(
+        &mut ctx,
+        snapshots,
+        full_summary.procs.as_ref(),
+        total_phys_mem,
+        sections.procs,
+    );
+
+    ctx.finish()
+}
+
+fn diagnose_mem_window(ctx: &mut EvalContext, snapshots: &[Snapshot], selected: bool) {
+    if !selected {
+        ctx.mark_skipped(
+            "memory_health",
+            DiagnosticCategory::Memory,
+            "section not selected",
+        );
+        return;
+    }
+    let mems: Vec<&MemSnapshot> = snapshots.iter().filter_map(|s| state_ref(&s.mem)).collect();
+    if mems.is_empty() {
+        ctx.mark_skipped(
+            "memory_health",
+            DiagnosticCategory::Memory,
+            "no available memory samples in window",
+        );
+        return;
+    }
+
+    let min_avail_pct = mems
+        .iter()
+        .filter_map(|m| ratio_pct_u64(m.available_bytes, m.total_bytes))
+        .reduce(f64::min);
+    if let Some(avail_pct) = min_avail_pct {
+        ctx.mark_evaluated("memory_low_available");
+        if let Some((severity, threshold)) = eval_low_threshold(avail_pct, 15.0, 7.0) {
+            ctx.push_finding(
+                "memory_low_available",
+                severity,
+                DiagnosticCategory::Memory,
+                format!(
+                    "Minimum available physical RAM in window was {:.1}%",
+                    round1(avail_pct)
+                ),
+                DiagnosticEvidence {
+                    metric: "mem_window.available_pct.min".to_owned(),
+                    observed: round1(avail_pct),
+                    threshold,
+                    unit: "percent".to_owned(),
+                    entity: None,
+                },
+            );
+        }
+    } else {
+        ctx.mark_skipped(
+            "memory_low_available",
+            DiagnosticCategory::Memory,
+            "total physical memory is zero",
+        );
+    }
+
+    let max_commit_pct = mems
+        .iter()
+        .filter_map(|m| ratio_pct_u64(m.commit_used_bytes, m.commit_limit_bytes))
+        .reduce(f64::max);
+    if let Some(commit_pct) = max_commit_pct {
+        ctx.mark_evaluated("memory_commit_pressure");
+        if let Some((severity, threshold)) = eval_high_threshold(commit_pct, 80.0, 92.0) {
+            ctx.push_finding(
+                "memory_commit_pressure",
+                severity,
+                DiagnosticCategory::Memory,
+                format!(
+                    "Peak Windows commit charge in window reached {:.1}% of commit limit",
+                    round1(commit_pct)
+                ),
+                DiagnosticEvidence {
+                    metric: "mem_window.commit_pct.max".to_owned(),
+                    observed: round1(commit_pct),
+                    threshold,
+                    unit: "percent".to_owned(),
+                    entity: None,
+                },
+            );
+        }
+    } else {
+        ctx.mark_skipped(
+            "memory_commit_pressure",
+            DiagnosticCategory::Memory,
+            "commit limit unavailable",
+        );
+    }
+
+    diagnose_mem_window_paging(ctx, &mems);
+}
+
+fn diagnose_mem_window_paging(ctx: &mut EvalContext, mems: &[&MemSnapshot]) {
+    let max_pf_pct = mems
+        .iter()
+        .filter_map(|m| ratio_pct_u64(m.pagefile_used_bytes, m.pagefile_total_bytes))
+        .reduce(f64::max);
+    if let Some(pf_pct) = max_pf_pct {
+        ctx.mark_evaluated("memory_pagefile_pressure");
+        if let Some((severity, threshold)) = eval_high_threshold(pf_pct, 75.0, 90.0) {
+            ctx.push_finding(
+                "memory_pagefile_pressure",
+                severity,
+                DiagnosticCategory::Memory,
+                format!(
+                    "Peak pagefile utilization in window reached {:.1}%",
+                    round1(pf_pct)
+                ),
+                DiagnosticEvidence {
+                    metric: "mem_window.pagefile_pct.max".to_owned(),
+                    observed: round1(pf_pct),
+                    threshold,
+                    unit: "percent".to_owned(),
+                    entity: None,
+                },
+            );
+        }
+    } else {
+        ctx.mark_skipped(
+            "memory_pagefile_pressure",
+            DiagnosticCategory::Memory,
+            "pagefile absent or zero capacity",
+        );
+    }
+
+    let max_comp_pct = mems
+        .iter()
+        .filter_map(|m| {
+            m.compressed_bytes
+                .and_then(|c| ratio_pct_u64(c, m.total_bytes))
+        })
+        .reduce(f64::max);
+    if let Some(comp_pct) = max_comp_pct {
+        ctx.mark_evaluated("memory_high_compressed");
+        if let Some((severity, threshold)) = eval_high_threshold(comp_pct, 15.0, 25.0) {
+            ctx.push_finding(
+                "memory_high_compressed",
+                severity,
+                DiagnosticCategory::Memory,
+                format!(
+                    "Peak compressed memory in window reached {:.1}% of physical RAM",
+                    round1(comp_pct)
+                ),
+                DiagnosticEvidence {
+                    metric: "mem_window.compressed_pct.max".to_owned(),
+                    observed: round1(comp_pct),
+                    threshold,
+                    unit: "percent".to_owned(),
+                    entity: None,
+                },
+            );
+        }
+    } else {
+        ctx.mark_skipped(
+            "memory_high_compressed",
+            DiagnosticCategory::Memory,
+            "compressed memory metric unavailable",
+        );
+    }
+}
+
+fn diagnose_net_window(ctx: &mut EvalContext, snapshots: &[Snapshot], selected: bool) {
+    if !selected {
+        ctx.mark_skipped(
+            "network_health",
+            DiagnosticCategory::Network,
+            "section not selected",
+        );
+        return;
+    }
+
+    let mut per_iface: HashMap<u64, (String, Vec<f64>)> = HashMap::new();
+    let mut saw_any_net = false;
+    for snap in snapshots {
+        let Some(ifaces) = state_ref(&snap.net) else {
+            continue;
+        };
+        saw_any_net = true;
+        for iface in ifaces {
+            if !iface.is_up {
+                continue;
+            }
+            let Some(link_bps) = iface.link_speed_bps.filter(|&b| b > 0) else {
+                continue;
+            };
+            let bps = iface
+                .rx_bytes_per_sec
+                .max(iface.tx_bytes_per_sec)
+                .saturating_mul(8);
+            if let Some(pct) = ratio_pct_u64(bps, link_bps) {
+                let entry = per_iface
+                    .entry(iface.luid)
+                    .or_insert_with(|| (iface.name.clone(), Vec::new()));
+                entry.0.clone_from(&iface.name);
+                entry.1.push(pct);
+            }
+        }
+    }
+
+    if !saw_any_net {
+        ctx.mark_skipped(
+            "network_health",
+            DiagnosticCategory::Network,
+            "no available network samples in window",
+        );
+        return;
+    }
+    if per_iface.is_empty() {
+        ctx.mark_skipped(
+            "net_high_bandwidth_utilization",
+            DiagnosticCategory::Network,
+            "no active network interface with known link speed",
+        );
+        return;
+    }
+
+    ctx.mark_evaluated("net_high_bandwidth_utilization");
+    for (luid, (name, pcts)) in per_iface {
+        if let Some(stats) = ScalarStats::from_f64(&pcts)
+            && let Some((severity, threshold)) = eval_high_threshold(stats.p95, 80.0, 95.0)
+        {
+            ctx.push_finding(
+                "net_high_bandwidth_utilization",
+                severity,
+                DiagnosticCategory::Network,
+                format!(
+                    "Network interface {name} p95 throughput reached {:.1}% of link speed",
+                    round1(stats.p95)
+                ),
+                DiagnosticEvidence {
+                    metric: "net.bandwidth_utilization_pct.p95".to_owned(),
+                    observed: round1(stats.p95),
+                    threshold,
+                    unit: "percent".to_owned(),
+                    entity: Some(DiagnosticEntity {
+                        interface: Some(name),
+                        luid: Some(luid),
+                        ..DiagnosticEntity::default()
+                    }),
+                },
+            );
+        }
+    }
+}
+
+fn diagnose_procs_window(
+    ctx: &mut EvalContext,
+    snapshots: &[Snapshot],
+    procs_summary: Option<&crate::summary::ProcsWindowSummary>,
+    total_phys_mem: Option<u64>,
+    selected: bool,
+) {
+    if !selected {
+        ctx.mark_skipped(
+            "process_health",
+            DiagnosticCategory::Process,
+            "section not selected",
+        );
+        return;
+    }
+    let Some(procs) = procs_summary.filter(|p| p.samples_available > 0) else {
+        ctx.mark_skipped(
+            "process_health",
+            DiagnosticCategory::Process,
+            "no available process samples in window",
+        );
+        return;
+    };
+
+    diagnose_summary_procs(ctx, &procs.by_cpu, &procs.by_mem, total_phys_mem);
+
+    // Evaluate multi-process subtree CPU dominance across raw window frames.
+    ctx.mark_evaluated("process_subtree_cpu_dominance");
+    let mut subtree_peaks: HashMap<ProcessIdentity, (String, Vec<f64>)> = HashMap::new();
+    for snap in snapshots {
+        let Some(list) = state_ref(&snap.processes) else {
+            continue;
+        };
+        for (idx, sub_cpu) in find_dominant_subtrees(list) {
+            let entry = &list[idx];
+            let slot = subtree_peaks
+                .entry(entry.identity)
+                .or_insert_with(|| (entry.name.clone(), Vec::new()));
+            slot.1.push(sub_cpu);
+        }
+    }
+
+    for (identity, (name, values)) in subtree_peaks {
+        if let Some(stats) = ScalarStats::from_f64(&values)
+            && let Some((severity, threshold)) = eval_high_threshold(stats.p95, 70.0, 90.0)
+        {
+            ctx.push_finding(
+                "process_subtree_cpu_dominance",
+                severity,
+                DiagnosticCategory::Process,
+                format!(
+                    "Process subtree rooted at {name} (PID {}) reached {:.1}% p95 CPU in window",
+                    identity.pid,
+                    round1(stats.p95)
+                ),
+                DiagnosticEvidence {
+                    metric: "process.subtree_cpu_pct.p95".to_owned(),
+                    observed: round1(stats.p95),
+                    threshold,
+                    unit: "percent".to_owned(),
+                    entity: Some(DiagnosticEntity {
+                        pid: Some(identity.pid),
+                        create_time_100ns: Some(identity.create_time_100ns),
+                        name: Some(name),
+                        ..DiagnosticEntity::default()
+                    }),
+                },
+            );
+        }
+    }
 }
 
 fn diagnose_summary_procs(
@@ -1816,7 +2231,157 @@ mod tests {
         let fixtures = win11_16core_dual_gpu_desktop();
         let report = diagnose_snapshot(&fixtures[2], JsonSections::all());
         assert_ne!(report.checks_evaluated.len(), 0);
+        // Normal desktop fixture must NOT blame Windows kernel System (PID 4) as a critical subtree.
+        assert!(
+            !report.findings.iter().any(|f| {
+                f.code == "process_subtree_cpu_dominance"
+                    && f.evidence.entity.as_ref().and_then(|e| e.pid) == Some(4)
+            }),
+            "PID 4 System must not trigger process_subtree_cpu_dominance"
+        );
         // Same input produces identical output.
         assert_eq!(report, diagnose_snapshot(&fixtures[2], JsonSections::all()));
+    }
+
+    #[test]
+    fn subtree_attribution_blames_deepest_workload_root_and_ignores_solo_leaf_wrappers() {
+        // Multi-worker build tree: explorer -> pwsh -> cargo -> {rustc1, rustc2}
+        let mut snap = healthy_snapshot();
+        snap.processes = DataState::Available(vec![
+            make_proc(4, 0, 1, "System", 2.0, 100_000),
+            make_proc(100, 4, 10, "explorer.exe", 1.0, 500_000),
+            make_proc(200, 100, 20, "pwsh.exe", 1.0, 200_000),
+            make_proc(300, 200, 30, "cargo.exe", 10.0, 400_000),
+            make_proc(301, 300, 40, "rustc.exe", 35.0, 800_000),
+            make_proc(302, 300, 41, "rustc.exe", 35.0, 800_000),
+        ]);
+        let report = diagnose_snapshot(&snap, JsonSections::all());
+        let sub_findings: Vec<&DiagnosticFinding> = report
+            .findings
+            .iter()
+            .filter(|f| f.code == "process_subtree_cpu_dominance")
+            .collect();
+        assert_eq!(sub_findings.len(), 1);
+        assert_eq!(
+            sub_findings[0].evidence.entity.as_ref().and_then(|e| e.pid),
+            Some(300),
+            "must attribute subtree dominance to cargo.exe (PID 300), not explorer/pwsh/System"
+        );
+
+        // Single runaway leaf under pwsh must NOT emit a spurious subtree finding on pwsh.
+        let mut solo_snap = healthy_snapshot();
+        solo_snap.processes = DataState::Available(vec![
+            make_proc(100, 4, 10, "explorer.exe", 1.0, 500_000),
+            make_proc(200, 100, 20, "pwsh.exe", 1.0, 200_000),
+            make_proc(300, 200, 30, "solo_hog.exe", 82.0, 400_000),
+        ]);
+        let solo_report = diagnose_snapshot(&solo_snap, JsonSections::all());
+        assert!(
+            solo_report
+                .findings
+                .iter()
+                .any(|f| f.code == "process_cpu_dominance")
+        );
+        assert!(
+            !solo_report
+                .findings
+                .iter()
+                .any(|f| f.code == "process_subtree_cpu_dominance")
+        );
+    }
+
+    #[test]
+    fn window_diagnostics_pair_memory_samples_honor_gpu_temp_max_net_down_and_unfiltered_procs() {
+        // Sample 0: commit 30/40 GiB (75%), GPU at 84C with temp_max 84C (critical!), NIC up at 88%.
+        let mut s0 = healthy_snapshot();
+        s0.timestamp_ms = 1_000;
+        if let DataState::Available(ref mut mem) = s0.mem {
+            mem.commit_used_bytes = 30_000_000_000;
+            mem.commit_limit_bytes = 40_000_000_000;
+            mem.pagefile_used_bytes = 4_000_000_000;
+            mem.pagefile_total_bytes = 8_000_000_000;
+        }
+        if let DataState::Available(ref mut gpu) = s0.gpus[0] {
+            gpu.temp_celsius = Some(84.0);
+            gpu.temp_max_celsius = Some(84.0);
+        }
+        if let DataState::Available(ref mut net) = s0.net {
+            net[0].is_up = true;
+            net[0].rx_bytes_per_sec = 110_000_000; // 880 Mbps / 1 Gbps = 88%
+        }
+        s0.processes = DataState::Available(vec![
+            make_proc(500, 4, 50, "hidden_hog.exe", 90.0, 1_000_000_000),
+            make_proc(501, 4, 51, "normal.exe", 1.0, 100_000_000),
+        ]);
+
+        // Sample 1: Windows expanded pagefile mid-window -> commit 42/56 GiB (still 75%!),
+        // NIC disconnects on final tick (`is_up = false`).
+        let mut s1 = s0.clone();
+        s1.timestamp_ms = 2_000;
+        if let DataState::Available(ref mut mem) = s1.mem {
+            mem.commit_used_bytes = 42_000_000_000;
+            mem.commit_limit_bytes = 56_000_000_000;
+            mem.pagefile_used_bytes = 12_000_000_000;
+            mem.pagefile_total_bytes = 24_000_000_000;
+        }
+        if let DataState::Available(ref mut net) = s1.net {
+            net[0].is_up = false;
+            net[0].rx_bytes_per_sec = 0;
+        }
+
+        // Build a heavily filtered & truncated summary (`--filter normal --top 1`), then attach
+        // window diagnostics: must still catch `hidden_hog.exe`, GPU 84C critical, NIC 88%, and
+        // MUST NOT emit a false commit/pagefile alarm from cross-sample extrema pairing.
+        let filter = QueryFilter::compile(Some("normal")).expect("filter");
+        let query = HeadlessQuery {
+            top: Some(1),
+            filter: Some("normal".to_owned()),
+            ..HeadlessQuery::default()
+        };
+        let summary = JsonSummaryEnvelope::from_snapshots(
+            &[s0.clone(), s1.clone()],
+            "0.1.1",
+            None,
+            JsonSections::all(),
+            &query,
+            &filter,
+            false,
+        )
+        .with_window_diagnostics(&[s0, s1], JsonSections::all());
+
+        let diag = summary.diagnostics.expect("window diagnostics");
+        assert!(
+            !diag
+                .findings
+                .iter()
+                .any(|f| f.code == "memory_commit_pressure"),
+            "mid-window pagefile expansion at steady 75% must not trigger commit alarm"
+        );
+        assert!(
+            !diag
+                .findings
+                .iter()
+                .any(|f| f.code == "memory_pagefile_pressure"),
+            "mid-window pagefile expansion at steady 50% must not trigger pagefile alarm"
+        );
+        let gpu_temp = diag
+            .findings
+            .iter()
+            .find(|f| f.code == "gpu_thermal_pressure")
+            .expect("gpu temp finding");
+        assert_eq!(gpu_temp.severity, DiagnosticSeverity::Critical);
+        assert!(
+            diag.findings
+                .iter()
+                .any(|f| f.code == "net_high_bandwidth_utilization"),
+            "adapter active at 88% before disconnecting must still trigger finding"
+        );
+        assert!(
+            diag.findings.iter().any(|f| {
+                f.code == "process_cpu_dominance"
+                    && f.evidence.entity.as_ref().and_then(|e| e.pid) == Some(500)
+            }),
+            "filtered-out process hidden_hog.exe must still be diagnosed"
+        );
     }
 }
