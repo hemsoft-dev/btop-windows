@@ -1,9 +1,8 @@
 //! End-to-end CLI integration tests for headless `--json` mode, subsystem selection,
 //! warmup sampling, and machine-readable stderr error contracts.
 
-use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use btop_model::{
     JSON_SCHEMA_VERSION, JsonErrorEnvelope, JsonSnapshotEnvelope, JsonSummaryEnvelope,
@@ -484,6 +483,10 @@ fn json_streaming_count_and_replay_summary_with_series() {
     assert_eq!(summary.schema_version, JSON_SCHEMA_VERSION);
     assert_eq!(summary.sample_count, 3);
     assert!(summary.window_ms > 0);
+    assert!(
+        !summary.sections.iter().any(|s| s == "services"),
+        "summary sections must not advertise unsupported services"
+    );
     let cpu = summary.cpu.expect("cpu summary");
     assert_eq!(cpu.samples_available, 3);
     assert!(cpu.total_busy_pct.max >= cpu.total_busy_pct.min);
@@ -496,13 +499,25 @@ fn json_streaming_count_and_replay_summary_with_series() {
     assert_ne!(procs.by_mem.len(), 0);
     let series = summary.series.expect("series");
     assert_eq!(series.len(), 3);
+
+    // 3. Single-frame replay summary reports deterministic window_ms = 0.
+    let single_out = Command::new(btop_bin())
+        .args(["--json", "--summary", "--count", "1", "--replay"])
+        .arg(&fixture)
+        .output()
+        .expect("run single-frame replay summary");
+    assert!(single_out.status.success());
+    let single_sum: JsonSummaryEnvelope =
+        serde_json::from_slice(&single_out.stdout).expect("parse single replay summary");
+    assert_eq!(single_sum.sample_count, 1);
+    assert_eq!(single_sum.window_ms, 0);
 }
 
 #[test]
-fn json_streaming_broken_pipe_and_invalid_flag_combinations() {
-    // 1. Invalid streaming/summary combinations emit structured `cli_usage` JSON on stderr.
+fn json_streaming_and_summary_reject_invalid_flag_combinations() {
     for args in [
         &["--json", "--summary", "--count", "0"][..],
+        &["--json", "--summary", "--sections", "services"][..],
         &["--json", "--count", "2", "--pretty"][..],
         &["--json", "--interval-ms", "50"][..],
         &["--json", "--window-ms", "500"][..],
@@ -517,8 +532,14 @@ fn json_streaming_broken_pipe_and_invalid_flag_combinations() {
             serde_json::from_slice(&bad.stderr).expect("structured stderr json");
         assert_eq!(parsed.error.code, "cli_usage");
     }
+}
 
-    // 2. Broken pipe during continuous streaming (`--count 0`) exits cleanly with no panic.
+#[cfg(windows)]
+#[test]
+fn json_streaming_broken_pipe_exits_cleanly() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
     let mut child = Command::new(btop_bin())
         .args([
             "--json",

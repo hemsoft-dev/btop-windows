@@ -233,6 +233,24 @@ fn parse_headless_params(
         None => JsonSections::all(),
     };
 
+    if cli.summary
+        && !sections.cpu
+        && !sections.mem
+        && !sections.disks
+        && !sections.net
+        && !sections.procs
+        && !sections.gpus
+        && !sections.battery
+    {
+        emit_error(
+            true,
+            cli.pretty,
+            "cli_usage",
+            "--summary does not support --sections services alone; include at least one time-series section (cpu, mem, disks, net, procs, gpus, battery)",
+        );
+        return Err(ExitCode::from(2));
+    }
+
     let sort = match cli.sort.as_deref() {
         Some(val) => match ProcSortField::parse_str(val) {
             Ok(field) => field,
@@ -537,6 +555,15 @@ fn run_headless_stream(
     let mut stdout = io::stdout().lock();
     match stream_headless_snapshots(source, options, ctx, &stop_flag, &mut stdout, &mut waiter) {
         Ok(_) => ExitCode::SUCCESS,
+        Err(btop_windows::AppError::Io(err)) => {
+            emit_error(
+                true,
+                false,
+                "io_error",
+                &format!("failed to write streaming JSON output: {err}"),
+            );
+            ExitCode::FAILURE
+        }
         Err(err) => {
             emit_error(
                 true,

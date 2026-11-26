@@ -205,7 +205,8 @@ pub fn collect_headless_summary<F>(
 where
     F: FnMut(Duration) -> bool,
 {
-    source.set_services_active(options.sections.services);
+    // Summary mode does not emit Windows Services data; never activate SCM polling.
+    source.set_services_active(false);
     let mut snapshots = Vec::new();
     let window_start = Instant::now();
 
@@ -223,7 +224,6 @@ where
                     let span_ms = snap.timestamp_ms.saturating_sub(start_ts);
                     snapshots.push(snap);
                     if let Some(target_window) = options.window_ms
-                        && options.count.is_none()
                         && span_ms >= target_window
                     {
                         break;
@@ -293,7 +293,11 @@ where
         }
     }
 
-    let measured_ms = u64::try_from(window_start.elapsed().as_millis()).ok();
+    let measured_ms = if options.is_replay {
+        None
+    } else {
+        u64::try_from(window_start.elapsed().as_millis()).ok()
+    };
     Ok(JsonSummaryEnvelope::from_snapshots(
         &snapshots,
         ctx.btop_version,
@@ -717,9 +721,10 @@ mod tests {
     #[test]
     fn collect_headless_summary_aggregates_replay_without_sleeping() {
         let fixtures = win11_16core_dual_gpu_desktop();
-        let mut replay = ReplaySource::from_snapshots(fixtures.clone())
-            .expect("replay")
-            .with_looping(false);
+        let mut src = RecordingSource {
+            snapshots: fixtures.clone(),
+            ..RecordingSource::default()
+        };
         let stop = AtomicBool::new(false);
         let mut slept = false;
         let query = HeadlessQuery::default();
@@ -729,7 +734,7 @@ mod tests {
             btop_version: "0.1.1",
         };
         let summary = collect_headless_summary(
-            &mut replay,
+            &mut src,
             HeadlessSummaryOptions {
                 sections: JsonSections::all(),
                 explicit_sample_ms: None,
@@ -749,7 +754,37 @@ mod tests {
         )
         .expect("summary");
         assert!(!slept);
+        assert_eq!(src.services_active_calls, vec![false]);
+        assert!(!summary.sections.iter().any(|s| s == "services"));
         assert_eq!(summary.sample_count, fixtures.len());
         assert_eq!(summary.series.as_ref().map(Vec::len), Some(fixtures.len()));
+
+        // Combined `--window-ms` + `--count` stops at whichever bound is reached first.
+        let mut bounded = RecordingSource {
+            snapshots: fixtures.clone(),
+            ..RecordingSource::default()
+        };
+        let step_ms = fixtures[1]
+            .timestamp_ms
+            .saturating_sub(fixtures[0].timestamp_ms);
+        let bounded_sum = collect_headless_summary(
+            &mut bounded,
+            HeadlessSummaryOptions {
+                sections: JsonSections::all(),
+                explicit_sample_ms: None,
+                count: Some(10),
+                window_ms: Some(step_ms),
+                interval_ms: 500,
+                include_series: false,
+                pretty: false,
+                is_replay: true,
+            },
+            ctx,
+            &stop,
+            |_| true,
+        )
+        .expect("bounded summary");
+        assert_eq!(bounded_sum.sample_count, 2);
+        assert_eq!(bounded_sum.window_ms, step_ms);
     }
 }

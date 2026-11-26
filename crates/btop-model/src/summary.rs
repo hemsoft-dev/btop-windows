@@ -343,6 +343,7 @@ impl JsonSummaryEnvelope {
             sections: sections
                 .selected_names()
                 .into_iter()
+                .filter(|&name| name != "services")
                 .map(str::to_owned)
                 .collect(),
             cpu,
@@ -746,6 +747,7 @@ fn summarize_procs(
             .total_cmp(&a.avg_cpu_pct)
             .then_with(|| b.peak_cpu_pct.total_cmp(&a.peak_cpu_pct))
             .then_with(|| a.pid.cmp(&b.pid))
+            .then_with(|| a.create_time_100ns.cmp(&b.create_time_100ns))
     });
     by_cpu.truncate(limit);
 
@@ -755,6 +757,7 @@ fn summarize_procs(
             .cmp(&a.peak_working_set_bytes)
             .then_with(|| b.avg_working_set_bytes.cmp(&a.avg_working_set_bytes))
             .then_with(|| a.pid.cmp(&b.pid))
+            .then_with(|| a.create_time_100ns.cmp(&b.create_time_100ns))
     });
     by_mem.truncate(limit);
 
