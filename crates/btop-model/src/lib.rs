@@ -3,11 +3,18 @@
 
 #![forbid(unsafe_code)]
 
+pub mod diagnose;
 pub mod fixtures;
 pub mod json_output;
 pub mod jsonl;
 pub mod proc_query;
 pub mod summary;
+
+pub use diagnose::{
+    DiagnosticCategory, DiagnosticEntity, DiagnosticEvidence, DiagnosticFinding,
+    DiagnosticSeverity, DiagnosticsReport, HealthStatus, SkippedCheck, diagnose_snapshot,
+    diagnose_window,
+};
 
 pub use json_output::{
     JSON_SCHEMA_VERSION, JsonErrorBody, JsonErrorEnvelope, JsonSections, JsonSnapshotEnvelope,

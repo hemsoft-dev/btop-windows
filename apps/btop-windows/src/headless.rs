@@ -36,6 +36,7 @@ pub struct HeadlessJsonOptions {
     pub sample_ms: u64,
     pub pretty: bool,
     pub is_replay: bool,
+    pub diagnose: bool,
 }
 
 /// Options controlling multi-sample NDJSON streaming (`--count`, `--interval-ms`).
@@ -46,6 +47,7 @@ pub struct HeadlessStreamOptions {
     pub count: usize,
     pub interval_ms: u64,
     pub is_replay: bool,
+    pub diagnose: bool,
 }
 
 /// Options controlling aggregated time-window summary mode (`--summary`).
@@ -59,6 +61,7 @@ pub struct HeadlessSummaryOptions {
     pub include_series: bool,
     pub pretty: bool,
     pub is_replay: bool,
+    pub diagnose: bool,
 }
 
 /// Collects a snapshot for headless `--json` output, enabling SCM polling only when requested
@@ -174,13 +177,14 @@ where
         prev_ts_ms = Some(snap.timestamp_ms);
         last_tick_at = Instant::now();
 
-        let envelope = JsonSnapshotEnvelope::from_snapshot_with_query(
+        let envelope = JsonSnapshotEnvelope::from_snapshot_with_options(
             snap,
             ctx.btop_version,
             sample_window_ms,
             options.sections,
             ctx.query,
             ctx.filter,
+            options.diagnose,
         );
 
         match write_json_envelope(writer, &envelope, false) {
@@ -298,7 +302,7 @@ where
     } else {
         u64::try_from(window_start.elapsed().as_millis()).ok()
     };
-    Ok(JsonSummaryEnvelope::from_snapshots(
+    let mut summary = JsonSummaryEnvelope::from_snapshots(
         &snapshots,
         ctx.btop_version,
         measured_ms,
@@ -306,7 +310,11 @@ where
         ctx.query,
         ctx.filter,
         options.include_series,
-    ))
+    );
+    if options.diagnose {
+        summary = summary.with_window_diagnostics(&snapshots, options.sections);
+    }
+    Ok(summary)
 }
 
 fn write_serialized_json<W: Write>(
@@ -560,6 +568,7 @@ mod tests {
             sample_ms: 250,
             pretty: false,
             is_replay: false,
+            diagnose: false,
         };
         let (snap, _window) = collect_headless_snapshot(&mut src, opts, |d| {
             slept = Some(d);
@@ -582,6 +591,7 @@ mod tests {
             sample_ms: 0,
             pretty: false,
             is_replay: false,
+            diagnose: false,
         };
         let (snap0, window0) = collect_headless_snapshot(&mut src_static, opts_static, |_| {
             slept_static = true;
@@ -608,6 +618,7 @@ mod tests {
                 sample_ms: 500,
                 pretty: false,
                 is_replay: true,
+                diagnose: false,
             },
             |_| slept = true,
         )
@@ -631,6 +642,7 @@ mod tests {
                 sample_ms: 500,
                 pretty: false,
                 is_replay: true,
+                diagnose: false,
             },
             |_| slept = true,
         )
@@ -679,6 +691,7 @@ mod tests {
                 count: 2,
                 interval_ms: 500,
                 is_replay: true,
+                diagnose: false,
             },
             ctx,
             &stop,
@@ -708,6 +721,7 @@ mod tests {
                 count: 0,
                 interval_ms: 100,
                 is_replay: true,
+                diagnose: false,
             },
             ctx,
             &stop,
@@ -744,6 +758,7 @@ mod tests {
                 include_series: true,
                 pretty: false,
                 is_replay: true,
+                diagnose: true,
             },
             ctx,
             &stop,
@@ -758,6 +773,16 @@ mod tests {
         assert!(!summary.sections.iter().any(|s| s == "services"));
         assert_eq!(summary.sample_count, fixtures.len());
         assert_eq!(summary.series.as_ref().map(Vec::len), Some(fixtures.len()));
+        let diag = summary
+            .diagnostics
+            .as_ref()
+            .expect("summary diagnostics must be attached");
+        assert_ne!(diag.checks_evaluated.len(), 0);
+        assert!(
+            diag.checks_evaluated
+                .iter()
+                .any(|c| c == "process_subtree_cpu_dominance")
+        );
 
         // Combined `--window-ms` + `--count` stops at whichever bound is reached first.
         let mut bounded = RecordingSource {
@@ -778,6 +803,7 @@ mod tests {
                 include_series: false,
                 pretty: false,
                 is_replay: true,
+                diagnose: false,
             },
             ctx,
             &stop,

@@ -643,3 +643,108 @@ fn live_windows_streaming_and_summary_populate_real_metrics() {
         Some(summary.sample_count)
     );
 }
+
+#[test]
+fn json_diagnose_attaches_deterministic_report_for_snapshot_and_summary() {
+    let fixture = fixture_path();
+
+    // 1. Single-snapshot --diagnose on committed dual-GPU fixture.
+    let snap_out = Command::new(btop_bin())
+        .args(["--json", "--diagnose", "--replay"])
+        .arg(&fixture)
+        .output()
+        .expect("run replay --diagnose");
+    assert!(
+        snap_out.status.success(),
+        "diagnose failed: {}",
+        String::from_utf8_lossy(&snap_out.stderr)
+    );
+    let snap_env: JsonSnapshotEnvelope =
+        serde_json::from_slice(&snap_out.stdout).expect("parse diagnose snapshot");
+    let diag = snap_env.diagnostics.expect("diagnostics attached");
+    assert_ne!(diag.checks_evaluated.len(), 0);
+
+    // 2. Section subset skips unselected sections cleanly without false warnings.
+    let subset_out = Command::new(btop_bin())
+        .args(["--json", "--diagnose", "--sections", "cpu,mem", "--replay"])
+        .arg(&fixture)
+        .output()
+        .expect("run replay --diagnose --sections cpu,mem");
+    assert!(subset_out.status.success());
+    let subset_env: JsonSnapshotEnvelope =
+        serde_json::from_slice(&subset_out.stdout).expect("parse subset diagnose");
+    let subset_diag = subset_env.diagnostics.expect("subset diagnostics");
+    assert!(
+        subset_diag
+            .skipped_checks
+            .iter()
+            .any(|s| s.check == "disk_health" && s.reason == "section not selected")
+    );
+    assert!(
+        subset_diag
+            .skipped_checks
+            .iter()
+            .any(|s| s.check == "gpu_health" && s.reason == "section not selected")
+    );
+
+    // 3. Combined --summary --diagnose on committed dual-GPU fixture (even with restrictive --filter/--top).
+    let sum_out = Command::new(btop_bin())
+        .args([
+            "--json",
+            "--summary",
+            "--diagnose",
+            "--top",
+            "1",
+            "--filter",
+            "nonexistent-filter-token",
+            "--replay",
+        ])
+        .arg(&fixture)
+        .output()
+        .expect("run replay --summary --diagnose");
+    assert!(sum_out.status.success());
+    let sum_env: JsonSummaryEnvelope =
+        serde_json::from_slice(&sum_out.stdout).expect("parse summary diagnose");
+    let sum_diag = sum_env.diagnostics.expect("summary diagnostics");
+    assert_ne!(sum_diag.checks_evaluated.len(), 0);
+    assert!(
+        sum_diag
+            .checks_evaluated
+            .iter()
+            .any(|c| c == "process_subtree_cpu_dominance")
+    );
+
+    // 4. --diagnose without --json fails cleanly with plain clap stderr (not JSON).
+    let no_json = Command::new(btop_bin())
+        .args(["--diagnose"])
+        .output()
+        .expect("run --diagnose without --json");
+    assert!(!no_json.status.success());
+    assert!(serde_json::from_slice::<JsonErrorEnvelope>(&no_json.stderr).is_err());
+}
+
+#[cfg(windows)]
+#[test]
+fn live_windows_diagnose_handles_unavailable_sensors_honestly() {
+    let out = Command::new(btop_bin())
+        .args(["--json", "--diagnose", "--sample-ms", "250"])
+        .output()
+        .expect("run live --diagnose");
+    assert!(
+        out.status.success(),
+        "live diagnose failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let env: JsonSnapshotEnvelope =
+        serde_json::from_slice(&out.stdout).expect("parse live diagnose json");
+    let diag = env.diagnostics.expect("live diagnostics");
+    assert_ne!(diag.checks_evaluated.len(), 0);
+    // System Idle Process (PID 0) must never appear as a CPU dominance finding.
+    assert!(
+        !diag.findings.iter().any(|f| {
+            f.code == "process_cpu_dominance"
+                && f.evidence.entity.as_ref().and_then(|e| e.pid) == Some(0)
+        }),
+        "PID 0 must not trigger process_cpu_dominance"
+    );
+}

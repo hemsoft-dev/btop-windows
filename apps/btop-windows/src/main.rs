@@ -160,6 +160,10 @@ struct Cli {
     /// Include a compact timestamped scalar series array inside --summary JSON output
     #[arg(long = "include-series", requires = "summary")]
     include_series: bool,
+
+    /// Attach pure deterministic system health and bottleneck diagnostics to --json output
+    #[arg(long = "diagnose", requires = "json")]
+    diagnose: bool,
 }
 
 fn emit_error(json_mode: bool, pretty: bool, code: &str, message: &str) {
@@ -446,6 +450,7 @@ fn dispatch_headless(
             include_series: cli.include_series,
             pretty: cli.pretty,
             is_replay,
+            diagnose: cli.diagnose,
         };
         return run_headless_summary(source, options, ctx);
     }
@@ -460,6 +465,7 @@ fn dispatch_headless(
             count,
             interval_ms: cli.interval_ms.unwrap_or(DEFAULT_INTERVAL_MS),
             is_replay,
+            diagnose: cli.diagnose,
         };
         return run_headless_stream(source, options, ctx);
     }
@@ -472,6 +478,7 @@ fn dispatch_headless(
         sample_ms,
         pretty: cli.pretty,
         is_replay,
+        diagnose: cli.diagnose,
     };
     run_headless_json(source, options, query, compiled_filter)
 }
@@ -521,13 +528,14 @@ fn run_headless_json(
             }
         };
 
-    let envelope = JsonSnapshotEnvelope::from_snapshot_with_query(
+    let envelope = JsonSnapshotEnvelope::from_snapshot_with_options(
         snapshot,
         env!("CARGO_PKG_VERSION"),
         sample_window_ms,
         options.sections,
         query,
         compiled_filter,
+        options.diagnose,
     );
 
     if let Err(err) = write_json_envelope(&mut io::stdout().lock(), &envelope, options.pretty) {
