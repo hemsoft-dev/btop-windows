@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::diagnose::{DiagnosticsReport, diagnose_summary, diagnose_window};
+use crate::diagnose::{DiagnosticsReport, diagnose_window};
 use crate::json_output::{JSON_SCHEMA_VERSION, JsonSections};
 use crate::proc_query::{HeadlessQuery, QueryFilter, build_acyclic_adjacency};
 use crate::{
@@ -305,9 +305,8 @@ pub struct JsonSummaryEnvelope {
 
 impl JsonSummaryEnvelope {
     /// Attaches deterministic window-level health diagnostics computed directly from raw
-    /// un-truncated `snapshots` (prefer this over [`Self::with_diagnostics`] whenever raw
-    /// snapshots are available so process filters/truncation and mid-window limit changes
-    /// cannot distort findings).
+    /// un-truncated `snapshots` so process filters/truncation and mid-window limit changes
+    /// cannot distort findings.
     #[must_use]
     pub fn with_window_diagnostics(
         mut self,
@@ -315,13 +314,6 @@ impl JsonSummaryEnvelope {
         sections: JsonSections,
     ) -> Self {
         self.diagnostics = Some(diagnose_window(snapshots, sections));
-        self
-    }
-
-    /// Attaches deterministic window-level health diagnostics from this summary envelope alone.
-    #[must_use]
-    pub fn with_diagnostics(mut self, sections: JsonSections) -> Self {
-        self.diagnostics = Some(diagnose_summary(&self, sections));
         self
     }
     /// Aggregates `snapshots` into a deterministic time-window summary envelope honoring

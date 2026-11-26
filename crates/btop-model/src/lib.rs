@@ -13,7 +13,7 @@ pub mod summary;
 pub use diagnose::{
     DiagnosticCategory, DiagnosticEntity, DiagnosticEvidence, DiagnosticFinding,
     DiagnosticSeverity, DiagnosticsReport, HealthStatus, SkippedCheck, diagnose_snapshot,
-    diagnose_summary, diagnose_window,
+    diagnose_window,
 };
 
 pub use json_output::{

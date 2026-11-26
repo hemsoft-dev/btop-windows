@@ -851,7 +851,7 @@ fn evaluate_gpu_thermals_and_power(
 ) {
     if let Some(t) = inp.temp_c.filter(|v| v.is_finite()) {
         cov.temp = true;
-        let warn = (inp.temp_crit_c - 8.0).max(75.0);
+        let warn = (inp.temp_crit_c - 8.0).max(40.0);
         if let Some((severity, threshold)) = eval_high_threshold(t, warn, inp.temp_crit_c) {
             ctx.push_finding(
                 "gpu_thermal_pressure",
@@ -1179,71 +1179,6 @@ fn diagnose_proc_memory(
     }
 }
 
-/// Evaluates pure deterministic health and bottleneck diagnostics on an aggregated [`JsonSummaryEnvelope`].
-pub fn diagnose_summary(
-    summary: &JsonSummaryEnvelope,
-    sections: JsonSections,
-) -> DiagnosticsReport {
-    let mut ctx = EvalContext::default();
-
-    diagnose_cpu_summary(&mut ctx, summary.cpu.as_ref(), sections.cpu);
-
-    let total_phys_mem = summary
-        .mem
-        .as_ref()
-        .map(|m| m.total_bytes)
-        .filter(|&b| b > 0);
-    if !sections.mem {
-        ctx.mark_skipped(
-            "memory_health",
-            DiagnosticCategory::Memory,
-            "section not selected",
-        );
-    } else if let Some(ref mem) = summary.mem {
-        diagnose_mem_values(
-            &mut ctx,
-            mem.total_bytes,
-            mem.available_bytes.min,
-            mem.commit_used_bytes.max,
-            mem.commit_limit_bytes.min,
-            mem.pagefile_used_bytes.max,
-            mem.pagefile_total_bytes,
-            mem.compressed_bytes.map(|s| s.max),
-            "mem_window",
-        );
-    } else {
-        ctx.mark_skipped(
-            "memory_health",
-            DiagnosticCategory::Memory,
-            "no available memory samples in window",
-        );
-    }
-
-    diagnose_disks_summary(&mut ctx, summary.disks.as_deref(), sections.disks);
-    diagnose_net_summary(&mut ctx, summary.net.as_deref(), sections.net);
-    diagnose_gpus_summary(&mut ctx, summary.gpus.as_deref(), sections.gpus);
-
-    if !sections.procs {
-        ctx.mark_skipped(
-            "process_health",
-            DiagnosticCategory::Process,
-            "section not selected",
-        );
-    } else if let Some(ref procs) = summary.procs
-        && procs.samples_available > 0
-    {
-        diagnose_summary_procs(&mut ctx, &procs.by_cpu, &procs.by_mem, total_phys_mem);
-    } else {
-        ctx.mark_skipped(
-            "process_health",
-            DiagnosticCategory::Process,
-            "no available process samples in window",
-        );
-    }
-
-    ctx.finish()
-}
-
 fn diagnose_cpu_summary(
     ctx: &mut EvalContext,
     cpu: Option<&crate::summary::CpuSummary>,
@@ -1444,84 +1379,18 @@ fn diagnose_disks_summary(
     }
 }
 
-fn diagnose_net_summary(
-    ctx: &mut EvalContext,
-    net: Option<&[crate::summary::NetSummary]>,
-    selected: bool,
-) {
-    if !selected {
-        ctx.mark_skipped(
-            "network_health",
-            DiagnosticCategory::Network,
-            "section not selected",
-        );
-        return;
-    }
-    let Some(net) = net else {
-        ctx.mark_skipped(
-            "network_health",
-            DiagnosticCategory::Network,
-            "no available network samples in window",
-        );
-        return;
-    };
-
-    let mut eval_bw = false;
-    for iface in net {
-        if !iface.is_up {
-            continue;
-        }
-        let Some(link_bps) = iface.link_speed_bps.filter(|&b| b > 0) else {
-            continue;
-        };
-        eval_bw = true;
-        let p95_bps = iface
-            .rx_bytes_per_sec
-            .p95
-            .max(iface.tx_bytes_per_sec.p95)
-            .saturating_mul(8);
-        if let Some(util_pct) = ratio_pct_u64(p95_bps, link_bps)
-            && let Some((severity, threshold)) = eval_high_threshold(util_pct, 80.0, 95.0)
-        {
-            ctx.push_finding(
-                "net_high_bandwidth_utilization",
-                severity,
-                DiagnosticCategory::Network,
-                format!(
-                    "Network interface {} p95 throughput reached {:.1}% of link speed",
-                    iface.name,
-                    round1(util_pct)
-                ),
-                DiagnosticEvidence {
-                    metric: "net.bandwidth_utilization_pct.p95".to_owned(),
-                    observed: round1(util_pct),
-                    threshold,
-                    unit: "percent".to_owned(),
-                    entity: Some(DiagnosticEntity {
-                        interface: Some(iface.name.clone()),
-                        luid: Some(iface.luid),
-                        ..DiagnosticEntity::default()
-                    }),
-                },
-            );
-        }
-    }
-    if eval_bw {
-        ctx.mark_evaluated("net_high_bandwidth_utilization");
-    } else {
-        ctx.mark_skipped(
-            "net_high_bandwidth_utilization",
-            DiagnosticCategory::Network,
-            "no active network interface with known link speed",
-        );
-    }
+#[derive(Default)]
+struct GpuWindowAccum {
+    index: u8,
+    name: String,
+    vram_pcts: Vec<f64>,
+    utils: Vec<f64>,
+    temps: Vec<f64>,
+    temp_max_c: Option<f32>,
+    power_pcts: Vec<f64>,
 }
 
-fn diagnose_gpus_summary(
-    ctx: &mut EvalContext,
-    gpus: Option<&[crate::summary::GpuSummary]>,
-    selected: bool,
-) {
+fn diagnose_gpus_window(ctx: &mut EvalContext, snapshots: &[Snapshot], selected: bool) {
     if !selected {
         ctx.mark_skipped(
             "gpu_health",
@@ -1530,44 +1399,174 @@ fn diagnose_gpus_summary(
         );
         return;
     }
-    let Some(gpus) = gpus.filter(|g| !g.is_empty()) else {
+
+    let mut per_gpu: HashMap<u8, GpuWindowAccum> = HashMap::new();
+    for snap in snapshots {
+        for state in &snap.gpus {
+            let Some(gpu) = state_ref(state) else {
+                continue;
+            };
+            push_gpu_window_sample(&mut per_gpu, gpu);
+        }
+    }
+
+    if per_gpu.is_empty() {
         ctx.mark_skipped(
             "gpu_health",
             DiagnosticCategory::Gpu,
             "no available GPU samples in window",
         );
         return;
-    };
+    }
+
+    let mut accs: Vec<GpuWindowAccum> = per_gpu.into_values().collect();
+    accs.sort_by_key(|a| a.index);
 
     let mut cov = GpuCheckCoverage::default();
-    for gpu in gpus {
-        let temp_crit_c = gpu
-            .temp_max_celsius
-            .filter(|m| m.is_finite() && *m > 50.0)
-            .map_or(90.0, f64::from);
-        let inp = GpuEvalInputs {
-            index: gpu.index,
-            name: &gpu.name,
-            vram_used: gpu.vram_used_bytes.map(|s| s.max),
-            vram_total: gpu.vram_total_bytes,
-            util_pct: gpu.utilization_pct.map(|s| s.p95),
-            temp_c: gpu.temp_celsius.map(|s| s.max),
-            temp_crit_c,
-            power_w: gpu.power_watts.map(|s| s.p95),
-            power_limit_w: gpu.power_limit_watts.map(f64::from),
-            metric_suffix: ".window",
-        };
-        evaluate_single_gpu(ctx, &mut cov, &inp);
+    for acc in accs {
+        evaluate_gpu_window(ctx, &mut cov, &acc);
     }
     record_optional_gpu_checks(ctx, &cov);
+}
+
+fn push_gpu_window_sample(per_gpu: &mut HashMap<u8, GpuWindowAccum>, gpu: &GpuSnapshot) {
+    let acc = per_gpu.entry(gpu.index).or_insert_with(|| GpuWindowAccum {
+        index: gpu.index,
+        ..GpuWindowAccum::default()
+    });
+    acc.name.clone_from(&gpu.name);
+    if let (Some(used), Some(total)) = (gpu.vram_used_bytes, gpu.vram_total_bytes)
+        && let Some(pct) = ratio_pct_u64(used, total)
+    {
+        acc.vram_pcts.push(pct);
+    }
+    if let Some(util) = gpu.utilization_pct.filter(|v| v.is_finite()) {
+        acc.utils.push(f64::from(util));
+    }
+    if let Some(temp) = gpu.temp_celsius.filter(|v| v.is_finite()) {
+        acc.temps.push(f64::from(temp));
+    }
+    if let Some(max_t) = gpu.temp_max_celsius.filter(|v| v.is_finite() && *v > 50.0) {
+        acc.temp_max_c = Some(acc.temp_max_c.map_or(max_t, |prev| prev.min(max_t)));
+    }
+    if let (Some(power), Some(limit)) = (gpu.power_watts, gpu.power_limit_watts)
+        && power.is_finite()
+        && limit.is_finite()
+        && limit > 0.0
+    {
+        acc.power_pcts
+            .push((f64::from(power) / f64::from(limit)) * 100.0);
+    }
+}
+
+fn evaluate_gpu_window(ctx: &mut EvalContext, cov: &mut GpuCheckCoverage, acc: &GpuWindowAccum) {
+    let entity = DiagnosticEntity {
+        gpu_index: Some(acc.index),
+        gpu_name: Some(acc.name.clone()),
+        ..DiagnosticEntity::default()
+    };
+    if let Some(vram) = ScalarStats::from_f64(&acc.vram_pcts) {
+        cov.vram = true;
+        if let Some((severity, threshold)) = eval_high_threshold(vram.max, 85.0, 95.0) {
+            ctx.push_finding(
+                "gpu_vram_pressure",
+                severity,
+                DiagnosticCategory::Gpu,
+                format!(
+                    "GPU {} ({}) peak VRAM reached {:.1}%",
+                    acc.index,
+                    acc.name,
+                    round1(vram.max)
+                ),
+                DiagnosticEvidence {
+                    metric: "gpu.vram_used_pct.max".to_owned(),
+                    observed: round1(vram.max),
+                    threshold,
+                    unit: "percent".to_owned(),
+                    entity: Some(entity.clone()),
+                },
+            );
+        }
+    }
+    if let Some(util) = ScalarStats::from_f64(&acc.utils) {
+        cov.util = true;
+        if let Some((severity, threshold)) = eval_high_threshold(util.p95, 95.0, 99.0) {
+            ctx.push_finding(
+                "gpu_compute_saturation",
+                severity,
+                DiagnosticCategory::Gpu,
+                format!(
+                    "GPU {} ({}) p95 utilization is saturated at {:.1}%",
+                    acc.index,
+                    acc.name,
+                    round1(util.p95)
+                ),
+                DiagnosticEvidence {
+                    metric: "gpu.utilization_pct.p95".to_owned(),
+                    observed: round1(util.p95),
+                    threshold,
+                    unit: "percent".to_owned(),
+                    entity: Some(entity.clone()),
+                },
+            );
+        }
+    }
+    if let Some(temp) = ScalarStats::from_f64(&acc.temps) {
+        cov.temp = true;
+        let crit = acc.temp_max_c.map_or(90.0, f64::from);
+        let warn = (crit - 8.0).max(40.0);
+        if let Some((severity, threshold)) = eval_high_threshold(temp.max, warn, crit) {
+            ctx.push_finding(
+                "gpu_thermal_pressure",
+                severity,
+                DiagnosticCategory::Gpu,
+                format!(
+                    "GPU {} ({}) peak temperature reached {:.1} C",
+                    acc.index,
+                    acc.name,
+                    round1(temp.max)
+                ),
+                DiagnosticEvidence {
+                    metric: "gpu.temp_celsius.max".to_owned(),
+                    observed: round1(temp.max),
+                    threshold: round1(threshold),
+                    unit: "celsius".to_owned(),
+                    entity: Some(entity.clone()),
+                },
+            );
+        }
+    }
+    if let Some(power) = ScalarStats::from_f64(&acc.power_pcts) {
+        cov.power = true;
+        if let Some((severity, threshold)) = eval_high_threshold(power.p95, 92.0, 98.0) {
+            ctx.push_finding(
+                "gpu_power_limit_saturation",
+                severity,
+                DiagnosticCategory::Gpu,
+                format!(
+                    "GPU {} ({}) p95 power draw reached {:.1}% of power limit",
+                    acc.index,
+                    acc.name,
+                    round1(power.p95)
+                ),
+                DiagnosticEvidence {
+                    metric: "gpu.power_limit_pct.p95".to_owned(),
+                    observed: round1(power.p95),
+                    threshold,
+                    unit: "percent".to_owned(),
+                    entity: Some(entity),
+                },
+            );
+        }
+    }
 }
 
 /// Evaluates pure deterministic health and bottleneck diagnostics directly over a raw un-truncated
 /// slice of [`Snapshot`] frames (used by `--summary --diagnose`).
 ///
-/// Computing memory/network/GPU ratios per sample before window aggregation prevents cross-sample
-/// extrema distortion (e.g., mid-window pagefile expansion) and ensures `--filter`/`--pid`/`--top`
-/// projections never hide runaway processes or subtrees.
+/// Computing memory, network, and GPU ratios per sample before window aggregation prevents
+/// cross-sample extrema distortion (e.g., mid-window pagefile expansion or GPU power-limit changes)
+/// and ensures `--filter`/`--pid`/`--top` projections never hide runaway processes or subtrees.
 pub fn diagnose_window(snapshots: &[Snapshot], sections: JsonSections) -> DiagnosticsReport {
     let unfiltered_query = HeadlessQuery {
         top: Some(0),
@@ -1588,7 +1587,7 @@ pub fn diagnose_window(snapshots: &[Snapshot], sections: JsonSections) -> Diagno
     diagnose_mem_window(&mut ctx, snapshots, sections.mem);
     diagnose_disks_summary(&mut ctx, full_summary.disks.as_deref(), sections.disks);
     diagnose_net_window(&mut ctx, snapshots, sections.net);
-    diagnose_gpus_summary(&mut ctx, full_summary.gpus.as_deref(), sections.gpus);
+    diagnose_gpus_window(&mut ctx, snapshots, sections.gpus);
 
     let total_phys_mem = snapshots.iter().rev().find_map(|s| {
         state_ref(&s.mem)
@@ -1872,23 +1871,47 @@ fn diagnose_procs_window(
 
     diagnose_summary_procs(ctx, &procs.by_cpu, &procs.by_mem, total_phys_mem);
 
-    // Evaluate multi-process subtree CPU dominance across raw window frames.
+    // Evaluate multi-process subtree CPU dominance across ALL raw window frames so p95 reflects
+    // the full window rather than only spiking frames.
     ctx.mark_evaluated("process_subtree_cpu_dominance");
-    let mut subtree_peaks: HashMap<ProcessIdentity, (String, Vec<f64>)> = HashMap::new();
-    for snap in snapshots {
-        let Some(list) = state_ref(&snap.processes) else {
-            continue;
-        };
-        for (idx, sub_cpu) in find_dominant_subtrees(list) {
+    let mut candidate_roots: HashMap<ProcessIdentity, String> = HashMap::new();
+    let proc_frames: Vec<&[ProcessEntry]> = snapshots
+        .iter()
+        .filter_map(|s| state_ref(&s.processes).map(Vec::as_slice))
+        .collect();
+    for list in &proc_frames {
+        for (idx, _sub_cpu) in find_dominant_subtrees(list) {
             let entry = &list[idx];
-            let slot = subtree_peaks
+            candidate_roots
                 .entry(entry.identity)
-                .or_insert_with(|| (entry.name.clone(), Vec::new()));
-            slot.1.push(sub_cpu);
+                .or_insert_with(|| entry.name.clone());
         }
     }
 
-    for (identity, (name, values)) in subtree_peaks {
+    if candidate_roots.is_empty() {
+        return;
+    }
+
+    let mut subtree_series: HashMap<ProcessIdentity, Vec<f64>> = candidate_roots
+        .keys()
+        .map(|&id| (id, Vec::with_capacity(proc_frames.len())))
+        .collect();
+
+    for list in &proc_frames {
+        let (_parent_idx, children) = build_acyclic_adjacency(list);
+        let totals = compute_subtree_totals(list, &children);
+        let by_id: HashMap<ProcessIdentity, f64> = list
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.identity, f64::from(totals[i].0)))
+            .collect();
+        for (id, series) in &mut subtree_series {
+            series.push(by_id.get(id).copied().unwrap_or(0.0));
+        }
+    }
+
+    for (identity, values) in subtree_series {
+        let name = candidate_roots.get(&identity).cloned().unwrap_or_default();
         if let Some(stats) = ScalarStats::from_f64(&values)
             && let Some((severity, threshold)) = eval_high_threshold(stats.p95, 70.0, 90.0)
         {
@@ -2383,5 +2406,62 @@ mod tests {
             }),
             "filtered-out process hidden_hog.exe must still be diagnosed"
         );
+    }
+
+    #[test]
+    fn window_subtree_p95_uses_all_frames_and_gpu_thresholds_handle_low_target_and_dynamic_boost() {
+        // 1. 20 frames: 19 calm frames at 5% subtree CPU + 1 transient spike at 92%.
+        // True p95 across 20 frames (index 18) is 5.0%, so NO subtree finding should fire.
+        let mut frames = Vec::with_capacity(20);
+        for i in 0u64..20 {
+            let mut s = healthy_snapshot();
+            s.timestamp_ms = 1_000 + i * 1_000;
+            let (c0, c1, c2) = if i == 19 {
+                (12.0, 40.0, 40.0)
+            } else {
+                (1.0, 2.0, 2.0)
+            };
+            s.processes = DataState::Available(vec![
+                make_proc(300, 4, 30, "cargo.exe", c0, 400_000),
+                make_proc(301, 300, 40, "rustc.exe", c1, 800_000),
+                make_proc(302, 300, 41, "rustc.exe", c2, 800_000),
+            ]);
+            // Dynamic Boost power limit drops mid-window from 300W -> 150W while load stays at 67%.
+            if let DataState::Available(ref mut gpu) = s.gpus[0] {
+                if i < 10 {
+                    gpu.power_watts = Some(200.0);
+                    gpu.power_limit_watts = Some(300.0);
+                } else {
+                    gpu.power_watts = Some(100.0);
+                    gpu.power_limit_watts = Some(150.0);
+                }
+                // Quiet laptop thermal target <= 75C: 66C with max 72C (warn = 64C) must warn!
+                gpu.temp_max_celsius = Some(72.0);
+                gpu.temp_celsius = Some(66.0);
+            }
+            frames.push(s);
+        }
+
+        let report = diagnose_window(&frames, JsonSections::all());
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.code == "process_subtree_cpu_dominance"),
+            "1-of-20 transient subtree spike must not inflate p95"
+        );
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.code == "gpu_power_limit_saturation"),
+            "mid-window power limit drop at steady 67% must not falsely saturate"
+        );
+        let temp_finding = report
+            .findings
+            .iter()
+            .find(|f| f.code == "gpu_thermal_pressure")
+            .expect("66C against 72C target must emit warning");
+        assert_eq!(temp_finding.severity, DiagnosticSeverity::Warning);
     }
 }
