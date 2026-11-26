@@ -11,8 +11,8 @@ use std::time::Duration;
 use btop_collect::{FreqMode, LiveCollector, ReplaySource, SnapshotSource};
 use btop_config::Config;
 use btop_model::{
-    HeadlessQuery, JsonSections, JsonSnapshotEnvelope, ProcSortField, QueryFilter,
-    ServiceStateFilter, SnapshotRecorder,
+    HeadlessQuery, JsonSections, JsonSnapshotEnvelope, ProcSortField, QueryFilter, SchemaMode,
+    ServiceStateFilter, SnapshotRecorder, build_json_schema,
 };
 use btop_sys::{TimerWake, WaitableWakeTimer, install_headless_ctrl_c_handler};
 use btop_term::CrosstermInput;
@@ -164,6 +164,16 @@ struct Cli {
     /// Attach pure deterministic system health and bottleneck diagnostics to --json output
     #[arg(long = "diagnose", requires = "json")]
     diagnose: bool,
+
+    /// Print Draft 2020-12 JSON Schema for headless --json output and exit (all, snapshot, summary, diagnose, error)
+    #[arg(
+        long = "schema",
+        value_name = "MODE",
+        num_args = 0..=1,
+        default_missing_value = "all",
+        conflicts_with_all = ["json", "default_config", "record"]
+    )]
+    schema: Option<String>,
 }
 
 fn emit_error(json_mode: bool, pretty: bool, code: &str, message: &str) {
@@ -346,6 +356,10 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    if let Some(mode_raw) = cli.schema.as_deref() {
+        return run_schema_output(mode_raw);
+    }
+
     let headless_params = if cli.json {
         match parse_headless_params(&cli) {
             Ok(params) => Some(params),
@@ -421,6 +435,35 @@ fn main() -> ExitCode {
         Ok(_) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_schema_output(mode_raw: &str) -> ExitCode {
+    let mode = match SchemaMode::parse_str(mode_raw) {
+        Ok(mode) => mode,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return ExitCode::from(2);
+        }
+    };
+    let schema = build_json_schema(mode);
+    match serde_json::to_string_pretty(&schema) {
+        Ok(text) => {
+            use std::io::Write as _;
+            let mut stdout = io::stdout().lock();
+            if let Err(err) = writeln!(stdout, "{text}").and_then(|()| stdout.flush()) {
+                if err.kind() == io::ErrorKind::BrokenPipe {
+                    return ExitCode::SUCCESS;
+                }
+                eprintln!("error: failed to write JSON schema: {err}");
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: failed to serialize JSON schema: {err}");
             ExitCode::FAILURE
         }
     }

@@ -8,6 +8,7 @@ pub mod fixtures;
 pub mod json_output;
 pub mod jsonl;
 pub mod proc_query;
+pub mod schema;
 pub mod summary;
 
 pub use diagnose::{
@@ -27,6 +28,10 @@ pub use jsonl::{
 pub use proc_query::{
     HeadlessQuery, ProcSortField, ProcessTreeNode, ProcsQueryMeta, QueryFilter, ServiceJsonEntry,
     ServiceLinkedProcess, ServiceStateFilter, ServicesQueryMeta, build_acyclic_adjacency,
+};
+pub use schema::{
+    JSON_SCHEMA_DRAFT_2020_12, SchemaMode, VALID_SCHEMA_MODES, build_json_schema,
+    validate_against_schema,
 };
 pub use summary::{
     BatterySummary, CpuSummary, DEFAULT_SUMMARY_TOP, DiskSummary, GpuSummary, JsonSummaryEnvelope,
