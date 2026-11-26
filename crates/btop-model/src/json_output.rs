@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::diagnose::{DiagnosticsReport, diagnose_snapshot};
 use crate::proc_query::{
     HeadlessQuery, ProcessTreeNode, ProcsQueryMeta, QueryFilter, ServiceJsonEntry,
     ServicesQueryMeta, query_flat_procs, query_proc_tree, query_services,
@@ -152,6 +153,8 @@ pub struct JsonSnapshotEnvelope {
     pub gpus: Option<Vec<DataState<GpuSnapshot>>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub battery: Option<DataState<BatterySnapshot>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<DiagnosticsReport>,
 }
 
 impl JsonSnapshotEnvelope {
@@ -183,6 +186,30 @@ impl JsonSnapshotEnvelope {
         query: &HeadlessQuery,
         compiled_filter: &QueryFilter,
     ) -> Self {
+        Self::from_snapshot_with_options(
+            snapshot,
+            btop_version,
+            sample_window_ms,
+            sections,
+            query,
+            compiled_filter,
+            false,
+        )
+    }
+
+    /// Projects an immutable [`Snapshot`] into a versioned JSON envelope, optionally attaching
+    /// deterministic health diagnostics computed over the full un-truncated snapshot.
+    pub fn from_snapshot_with_options(
+        snapshot: Snapshot,
+        btop_version: impl Into<String>,
+        sample_window_ms: u64,
+        sections: JsonSections,
+        query: &HeadlessQuery,
+        compiled_filter: &QueryFilter,
+        include_diagnostics: bool,
+    ) -> Self {
+        let diagnostics = include_diagnostics.then(|| diagnose_snapshot(&snapshot, sections));
+
         let Snapshot {
             timestamp_ms,
             hostname,
@@ -245,6 +272,7 @@ impl JsonSnapshotEnvelope {
             services_meta,
             gpus: sections.gpus.then_some(gpus),
             battery: sections.battery.then_some(battery),
+            diagnostics,
         }
     }
 }

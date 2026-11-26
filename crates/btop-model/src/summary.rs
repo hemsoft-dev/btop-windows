@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::diagnose::{DiagnosticsReport, diagnose_summary};
 use crate::json_output::{JSON_SCHEMA_VERSION, JsonSections};
 use crate::proc_query::{HeadlessQuery, QueryFilter, build_acyclic_adjacency};
 use crate::{
@@ -132,6 +133,10 @@ pub struct MemSummary {
     pub commit_used_bytes: U64Stats,
     pub commit_limit_bytes: U64Stats,
     pub pagefile_used_bytes: U64Stats,
+    #[serde(default)]
+    pub pagefile_total_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compressed_bytes: Option<U64Stats>,
 }
 
 /// Aggregated per-volume disk capacity, throughput, and utilization metrics over a window.
@@ -159,6 +164,10 @@ pub struct NetSummary {
     pub luid: u64,
     pub name: String,
     pub description: String,
+    #[serde(default)]
+    pub is_up: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_speed_bps: Option<u64>,
     pub samples_available: usize,
     pub rx_bytes_per_sec: U64Stats,
     pub tx_bytes_per_sec: U64Stats,
@@ -181,6 +190,8 @@ pub struct GpuSummary {
     pub vram_total_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub power_watts: Option<ScalarStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power_limit_watts: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temp_celsius: Option<ScalarStats>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -286,9 +297,17 @@ pub struct JsonSummaryEnvelope {
     pub battery: Option<BatterySummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub series: Option<Vec<SummarySeriesPoint>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<DiagnosticsReport>,
 }
 
 impl JsonSummaryEnvelope {
+    /// Attaches deterministic window-level health diagnostics for `--summary --diagnose`.
+    #[must_use]
+    pub fn with_diagnostics(mut self, sections: JsonSections) -> Self {
+        self.diagnostics = Some(diagnose_summary(&self, sections));
+        self
+    }
     /// Aggregates `snapshots` into a deterministic time-window summary envelope honoring
     /// `sections`, process filters/PID scoping/top-N (`query`), and optional `include_series`.
     pub fn from_snapshots(
@@ -354,6 +373,7 @@ impl JsonSummaryEnvelope {
             gpus,
             battery,
             series,
+            diagnostics: None,
         }
     }
 }
@@ -421,15 +441,19 @@ fn summarize_mem(snapshots: &[Snapshot]) -> Option<MemSummary> {
     let commit_used: Vec<u64> = mems.iter().map(|m| m.commit_used_bytes).collect();
     let commit_limit: Vec<u64> = mems.iter().map(|m| m.commit_limit_bytes).collect();
     let pagefile_used: Vec<u64> = mems.iter().map(|m| m.pagefile_used_bytes).collect();
+    let compressed: Vec<u64> = mems.iter().filter_map(|m| m.compressed_bytes).collect();
+    let last = mems[mems.len() - 1];
 
     Some(MemSummary {
-        total_bytes: mems[mems.len() - 1].total_bytes,
+        total_bytes: last.total_bytes,
         samples_available: mems.len(),
         used_bytes: U64Stats::from_u64(&used)?,
         available_bytes: U64Stats::from_u64(&avail)?,
         commit_used_bytes: U64Stats::from_u64(&commit_used)?,
         commit_limit_bytes: U64Stats::from_u64(&commit_limit)?,
         pagefile_used_bytes: U64Stats::from_u64(&pagefile_used)?,
+        pagefile_total_bytes: last.pagefile_total_bytes,
+        compressed_bytes: U64Stats::from_u64(&compressed),
     })
 }
 
@@ -505,6 +529,8 @@ struct NetAccum {
     luid: u64,
     name: String,
     description: String,
+    is_up: bool,
+    link_speed_bps: Option<u64>,
     rx_bps: Vec<u64>,
     tx_bps: Vec<u64>,
     last_rx_total: Option<u64>,
@@ -533,6 +559,8 @@ fn summarize_net(snapshots: &[Snapshot]) -> Vec<NetSummary> {
                 luid: acc.luid,
                 name: acc.name,
                 description: acc.description,
+                is_up: acc.is_up,
+                link_speed_bps: acc.link_speed_bps,
                 samples_available: acc.rx_bps.len(),
                 rx_bytes_per_sec,
                 tx_bytes_per_sec,
@@ -552,6 +580,10 @@ fn push_net_sample(map: &mut HashMap<u64, NetAccum>, iface: &NetInterfaceSnapsho
     });
     entry.name.clone_from(&iface.name);
     entry.description.clone_from(&iface.description);
+    entry.is_up = iface.is_up;
+    if iface.link_speed_bps.is_some() {
+        entry.link_speed_bps = iface.link_speed_bps;
+    }
     entry.rx_bps.push(iface.rx_bytes_per_sec);
     entry.tx_bps.push(iface.tx_bytes_per_sec);
     if let Some(prev) = entry.last_rx_total {
@@ -578,6 +610,7 @@ struct GpuAccum {
     vram_used: Vec<u64>,
     vram_total: Option<u64>,
     power: Vec<f32>,
+    power_limit: Option<f32>,
     temp: Vec<f32>,
     core_clock: Vec<f64>,
 }
@@ -604,6 +637,7 @@ fn summarize_gpus(snapshots: &[Snapshot]) -> Vec<GpuSummary> {
             vram_used_bytes: U64Stats::from_u64(&acc.vram_used),
             vram_total_bytes: acc.vram_total,
             power_watts: ScalarStats::from_f32(&acc.power),
+            power_limit_watts: acc.power_limit,
             temp_celsius: ScalarStats::from_f32(&acc.temp),
             core_clock_mhz: ScalarStats::from_f64(&acc.core_clock),
         })
@@ -631,6 +665,9 @@ fn push_gpu_sample(map: &mut HashMap<u8, GpuAccum>, gpu: &GpuSnapshot) {
     }
     if let Some(p) = gpu.power_watts {
         entry.power.push(p);
+    }
+    if gpu.power_limit_watts.is_some() {
+        entry.power_limit = gpu.power_limit_watts;
     }
     if let Some(t) = gpu.temp_celsius {
         entry.temp.push(t);
