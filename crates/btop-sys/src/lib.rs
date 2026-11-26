@@ -915,6 +915,56 @@ mod win {
             }
         }
     }
+
+    static HEADLESS_STOP_SLOT: std::sync::Mutex<
+        Option<(Arc<std::sync::atomic::AtomicBool>, TimerWaker)>,
+    > = std::sync::Mutex::new(None);
+    static HEADLESS_CTRL_INSTALLED: std::sync::Once = std::sync::Once::new();
+
+    unsafe extern "system" fn headless_ctrl_handler(ctrl_type: u32) -> i32 {
+        use windows_sys::Win32::System::Console::{
+            CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT,
+            CTRL_SHUTDOWN_EVENT,
+        };
+        let handled_gracefully = matches!(ctrl_type, CTRL_C_EVENT | CTRL_BREAK_EVENT);
+        if handled_gracefully
+            || matches!(
+                ctrl_type,
+                CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT
+            )
+        {
+            if let Ok(guard) = HEADLESS_STOP_SLOT.lock()
+                && let Some((ref flag, ref waker)) = *guard
+            {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                waker.wake();
+            }
+            i32::from(handled_gracefully)
+        } else {
+            0
+        }
+    }
+
+    /// Installs a `Ctrl+C` / `Ctrl+Break` handler for headless streaming/summary mode that sets
+    /// the returned flag and immediately wakes `waker` so the caller can exit cleanly.
+    pub fn install_headless_ctrl_c_handler(
+        waker: TimerWaker,
+    ) -> Arc<std::sync::atomic::AtomicBool> {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Ok(mut guard) = HEADLESS_STOP_SLOT.lock() {
+            *guard = Some((Arc::clone(&flag), waker));
+        }
+        HEADLESS_CTRL_INSTALLED.call_once(|| {
+            // SAFETY: `headless_ctrl_handler` matches Win32 `PHANDLER_ROUTINE`.
+            unsafe {
+                let _ = windows_sys::Win32::System::Console::SetConsoleCtrlHandler(
+                    Some(headless_ctrl_handler),
+                    1,
+                );
+            }
+        });
+        flag
+    }
 }
 
 #[cfg(not(windows))]
@@ -1026,21 +1076,28 @@ mod stub {
             }
         }
     }
+
+    /// Portable no-op Ctrl+C handler stub for non-Windows builds.
+    pub fn install_headless_ctrl_c_handler(
+        _waker: TimerWaker,
+    ) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::new(std::sync::atomic::AtomicBool::new(false))
+    }
 }
 
 #[cfg(not(windows))]
 pub use stub::{
-    TimerWake, TimerWaker, WaitableWakeTimer, query_core_efficiency_classes,
-    query_process_information, query_processor_performance, query_self_cpu_time_100ns,
-    query_self_private_working_set_bytes, read_cpu_model_name, read_cpu_nominal_mhz,
-    system_uptime_secs, total_physical_memory_bytes,
+    TimerWake, TimerWaker, WaitableWakeTimer, install_headless_ctrl_c_handler,
+    query_core_efficiency_classes, query_process_information, query_processor_performance,
+    query_self_cpu_time_100ns, query_self_private_working_set_bytes, read_cpu_model_name,
+    read_cpu_nominal_mhz, system_uptime_secs, total_physical_memory_bytes,
 };
 #[cfg(windows)]
 pub use win::{
-    TimerWake, TimerWaker, WaitableWakeTimer, query_core_efficiency_classes,
-    query_process_information, query_processor_performance, query_self_cpu_time_100ns,
-    query_self_private_working_set_bytes, read_cpu_model_name, read_cpu_nominal_mhz,
-    system_uptime_secs, total_physical_memory_bytes,
+    TimerWake, TimerWaker, WaitableWakeTimer, install_headless_ctrl_c_handler,
+    query_core_efficiency_classes, query_process_information, query_processor_performance,
+    query_self_cpu_time_100ns, query_self_private_working_set_bytes, read_cpu_model_name,
+    read_cpu_nominal_mhz, system_uptime_secs, total_physical_memory_bytes,
 };
 
 #[cfg(test)]
