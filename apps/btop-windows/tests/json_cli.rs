@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use btop_model::{
-    JSON_SCHEMA_VERSION, JsonErrorEnvelope, JsonSnapshotEnvelope, JsonSummaryEnvelope,
+    JSON_SCHEMA_DRAFT_2020_12, JSON_SCHEMA_VERSION, JsonErrorEnvelope, JsonSnapshotEnvelope,
+    JsonSummaryEnvelope, validate_against_schema,
 };
 
 fn btop_bin() -> &'static str {
@@ -747,4 +748,95 @@ fn live_windows_diagnose_handles_unavailable_sensors_honestly() {
         }),
         "PID 0 must not trigger process_cpu_dominance"
     );
+}
+
+#[test]
+fn cli_schema_emits_draft_2020_12_and_validates_real_cli_outputs() {
+    let fixture = fixture_path();
+
+    let run_schema = |args: &[&str]| -> serde_json::Value {
+        let out = Command::new(btop_bin())
+            .args(args)
+            .output()
+            .expect("run btop --schema");
+        assert!(
+            out.status.success(),
+            "schema failed for {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stderr.len(), 0);
+        let val: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("parse schema json");
+        assert_eq!(val["$schema"], JSON_SCHEMA_DRAFT_2020_12);
+        val
+    };
+
+    let all_schema = run_schema(&["--schema"]);
+    let snap_schema = run_schema(&["--schema", "snapshot"]);
+    let sum_schema = run_schema(&["--schema", "summary"]);
+    let diag_schema = run_schema(&["--schema", "diagnose"]);
+    let err_schema = run_schema(&["--schema", "error"]);
+
+    // 1. Validate `--json --sections all --diagnose` and `--json --tree --top 5 --diagnose`.
+    for extra in [
+        &["--json", "--sections", "all", "--diagnose", "--replay"][..],
+        &["--json", "--tree", "--top", "5", "--diagnose", "--replay"][..],
+    ] {
+        let out = Command::new(btop_bin())
+            .args(extra)
+            .arg(&fixture)
+            .output()
+            .expect("run replay snapshot");
+        assert!(out.status.success());
+        let val: serde_json::Value = serde_json::from_slice(&out.stdout).expect("parse json");
+        validate_against_schema(&snap_schema, &val).expect("conforms to snapshot schema");
+        validate_against_schema(&all_schema, &val).expect("conforms to all schema");
+        validate_against_schema(&diag_schema, &val["diagnostics"])
+            .expect("diagnostics conforms to diagnose schema");
+    }
+
+    // 2. Validate `--json --summary --include-series --diagnose`.
+    let sum_out = Command::new(btop_bin())
+        .args([
+            "--json",
+            "--summary",
+            "--include-series",
+            "--diagnose",
+            "--replay",
+        ])
+        .arg(&fixture)
+        .output()
+        .expect("run replay summary");
+    assert!(sum_out.status.success());
+    let sum_val: serde_json::Value = serde_json::from_slice(&sum_out.stdout).expect("parse sum");
+    validate_against_schema(&sum_schema, &sum_val).expect("conforms to summary schema");
+    validate_against_schema(&all_schema, &sum_val).expect("summary conforms to all schema");
+
+    // 3. Validate stderr JsonErrorEnvelope against error schema and all schema.
+    let bad_out = Command::new(btop_bin())
+        .args(["--json", "--sort", "bogus"])
+        .output()
+        .expect("run invalid sort");
+    assert!(!bad_out.status.success());
+    let err_val: serde_json::Value = serde_json::from_slice(&bad_out.stderr).expect("parse err");
+    validate_against_schema(&err_schema, &err_val).expect("conforms to error schema");
+    validate_against_schema(&all_schema, &err_val).expect("error conforms to all schema");
+
+    // 4. Invalid `--schema` mode exits 2 with plain stderr; `--schema --json` emits cli_usage JSON.
+    let bad_mode = Command::new(btop_bin())
+        .args(["--schema", "bogus"])
+        .output()
+        .expect("run invalid schema mode");
+    assert_eq!(bad_mode.status.code(), Some(2));
+    assert_eq!(bad_mode.stdout.len(), 0);
+    assert!(serde_json::from_slice::<JsonErrorEnvelope>(&bad_mode.stderr).is_err());
+
+    let conflict = Command::new(btop_bin())
+        .args(["--schema", "--json"])
+        .output()
+        .expect("run --schema --json conflict");
+    assert_eq!(conflict.status.code(), Some(2));
+    let conflict_err: JsonErrorEnvelope =
+        serde_json::from_slice(&conflict.stderr).expect("json error for --schema --json");
+    assert_eq!(conflict_err.error.code, "cli_usage");
 }

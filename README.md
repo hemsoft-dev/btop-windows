@@ -72,6 +72,44 @@ If you already know [btop4win](https://github.com/aristocratos/btop4win) (frozen
 - **Modern btop UX plus Windows workflows.** CPU with hybrid P/E-core labels, frequency, and Task Manager utility mode; physical/commit/pagefile/cache memory accounting; local disk capacity and I/O mode; 64-bit auto-scaling network graphs; dedicated multi-GPU boxes (`5`..`0`); process tree, regex filter, pause, follow, detail overlay, and guarded process controls; plus a toggleable Windows Services (`S`) view.
 - **TrueColor themes and mouse/Vim controls.** 10 Apache-2.0 themes embedded directly in `btop.exe`, live preview in Options, full mouse click and scroll hit-testing, and optional `vim_keys`.
 - **Deterministic record and replay.** Capture live sessions with `btop --record <file>` and inspect them anywhere with `btop --replay <file>`.
+- **Headless JSON telemetry for scripts and AI agents.** Emit single snapshots (`--json`), nested process trees (`--tree --top`), NDJSON streams (`--count --interval-ms`), time-window summaries (`--summary --window-ms`), deterministic bottleneck diagnostics (`--diagnose`), and Draft 2020-12 JSON Schema (`--schema`) without opening a TTY.
+
+## Headless JSON CLI (scripts and AI agents)
+
+Run `btop --json` in any non-interactive shell, pipe, or agent tool call to query live Windows 11 telemetry or replay recorded `.jsonl` traces without entering the TUI:
+
+```powershell
+# Fast single snapshot of CPU, memory, and GPUs (default 500ms live delta warmup)
+btop --json --sections cpu,mem,gpus
+
+# Nested process tree with rolled-up subtree CPU/memory, top 5 roots sorted by CPU
+btop --json --sections procs --tree --sort cpu --top 5
+
+# Inspect one PID with its verified ancestors and descendants, or filter by !regex
+btop --json --sections procs --tree --pid 4216
+btop --json --sections procs --filter '!^(cargo|rustc)' --sort mem --top 10
+
+# Filter running Windows Services and include linked live process metadata
+btop --json --sections services --services-state running --sample-ms 0
+
+# Stream 5 live NDJSON snapshots (0 = stream until Ctrl+C or broken pipe)
+btop --json --sections cpu,mem,gpus --count 5 --interval-ms 500
+
+# Capture a 3-second spike summary (min/avg/p95/max + compact series + diagnostics)
+btop --json --summary --window-ms 3000 --interval-ms 500 --include-series --diagnose
+
+# Print the Draft 2020-12 JSON Schema (all, snapshot, summary, diagnose, error)
+btop --schema
+btop --schema snapshot
+```
+
+Every subsystem uses an explicit tagged `DataState` union (`available`, `stale`, `warming_up`, `denied`, `unavailable`) so missing sensors or access-denied PPL processes stay visible rather than turning into fabricated zeros.
+
+Exit codes in `--json` mode:
+
+- `0`: Completed cleanly (including `Ctrl+C` or broken pipe during streaming).
+- `1`: Runtime error (config, replay file, collector, or stdout I/O), written as `{"schema_version":1,"error":{"code":...,"message":...}}` to stderr.
+- `2`: CLI usage or validation error (`code: "cli_usage"` on stderr; plain stderr when `--json` is not active).
 
 ## Everyday keys and configuration
 

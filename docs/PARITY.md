@@ -27,7 +27,17 @@ Legend:
 | `-h, --help` | Parity | M1 | Prints CLI usage and exits 0. |
 | `-v, -V, --version` | Parity | M1 | Prints version. |
 | `--record <file.jsonl>` | Windows-only | M1 | Records timestamped `Snapshot` JSONL stream for debugging and tests. |
-| `--replay <file.jsonl>` | Windows-only | M1 | Replays a recorded or synthetic `Snapshot` JSONL stream through the full TUI. |
+| `--replay <file.jsonl>` | Windows-only | M1 | Replays a recorded or synthetic `Snapshot` JSONL stream through the TUI or `--json` modes. |
+| `--json` | Windows-only | v0.2 | Emits versioned JSON telemetry (`JsonSnapshotEnvelope`) to stdout without opening a TTY; errors emit `JsonErrorEnvelope` to stderr. |
+| `--pretty` | Windows-only | v0.2 | Pretty-prints single-snapshot or `--summary` JSON output (requires `--json`; conflicts with streaming `--count`). |
+| `--sections <list>` | Windows-only | v0.2 | Selects comma-separated subsystems (`cpu,mem,disks,net,procs,services,gpus,battery,all`) for `--json`. |
+| `--sample-ms <ms>` | Windows-only | v0.2 | Live warmup sampling window (`0-10000`, default `500`) so delta/rate metrics populate on the first emitted snapshot. |
+| `--tree`, `--top <N>`, `--sort <field>`, `--reverse`, `--pid <PID>` | Windows-only | v0.2 | Headless process tree graph with subtree totals, sorting (`cpu|mem|pid|name|threads|io`), truncation (`procs_meta`), and PID lineage slicing. |
+| `--services-state <state>` | Windows-only | v0.2 | Filters Windows Services (`all|running|stopped`) and attaches `process` linkage metadata in `--json` mode. |
+| `--count <N>`, `--interval-ms <ms>` | Windows-only | v0.2 | Streams `N` live-flushed NDJSON lines (`0` = stream until `Ctrl+C` or broken pipe) at `100-60000 ms` intervals. |
+| `--summary`, `--window-ms <ms>`, `--include-series` | Windows-only | v0.2 | Collects a multi-sample window and emits one aggregated `JsonSummaryEnvelope` (`min`/`avg`/`p95`/`max`, top processes, optional scalar series). |
+| `--diagnose` | Windows-only | v0.2 | Attaches deterministic `DiagnosticsReport` (`healthy|warning|critical`, `checks_evaluated`, `skipped_checks`, evidence-backed findings) to snapshot, stream, or `--summary` output. |
+| `--schema [mode]` | Windows-only | v0.2 | Prints Draft 2020-12 JSON Schema (`all|snapshot|summary|diagnose|error`) to stdout and exits `0` without a TTY or live collection. |
 
 ## 2. Panels and boxes
 

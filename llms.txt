@@ -18,7 +18,20 @@
 - Privileges: Runs non-elevated for all telemetry (including DXGI/WDDM GPU and optional `System32\nvml.dll` NVIDIA sensors); Administrator is required only to Start/Stop Windows Services
 - Config file: Portable `btop.conf` next to `btop.exe` if present, otherwise `%APPDATA%\btop\btop.conf` (override with `-c <file>`, generate starter with `btop --default-config`)
 - Themes: 10 Apache-2.0 `.theme` files embedded in `btop.exe`; custom themes searched in `--themes-dir`, exe-adjacent `themes\`, then `%APPDATA%\btop\themes`
-- Useful CLI flags: `-c/--config`, `-f/--filter`, `-p/--preset <0-9>`, `-u/--update <ms>`, `--themes-dir <dir>`, `--default-config`, `--record <file>`, `--replay <file>`, `-V/--version`, `-h/--help`
+- Useful TUI CLI flags: `-c/--config`, `-f/--filter`, `-p/--preset <0-9>`, `-u/--update <ms>`, `--themes-dir <dir>`, `--default-config`, `--record <file>`, `--replay <file>`, `-V/--version`, `-h/--help`
+
+## Headless JSON CLI (non-interactive / agent workflows)
+
+`btop.exe` supports direct JSON output without a TTY, using one persistent collector and explicit `DataState` tagged unions (`available`, `stale`, `warming_up`, `denied`, `unavailable`):
+
+- Inspect contract (Draft 2020-12 JSON Schema, no live collection): `btop --schema [all|snapshot|summary|diagnose|error]`
+- Subsystem snapshot (default `--sample-ms 500` live warmup, `0` for instant static read): `btop --json --sections cpu,mem,disks,net,procs,services,gpus,battery [--sample-ms <0-10000>] [--pretty]`
+- Process tree and filtering: `btop --json --sections procs --tree --sort <cpu|mem|pid|name|threads|io> [--reverse] [--top <N>] [--pid <PID>] [--filter <substr|!regex>]`
+- Windows Services filter: `btop --json --sections services --services-state <all|running|stopped> [--filter <substr|!regex>]`
+- NDJSON streaming (`--count 0` streams until `Ctrl+C` or broken pipe): `btop --json --sections cpu,mem,gpus --count <N> --interval-ms <100-60000>`
+- Time-window spike summary (`min`/`avg`/`p95`/`max`, top processes, optional scalar series): `btop --json --summary [--window-ms <100-300000>] [--count <N>] [--interval-ms <100-60000>] [--include-series]`
+- Deterministic health and bottleneck diagnostics (`healthy|warning|critical`, evaluated/skipped checks, evidence-backed findings): `btop --json --diagnose` (combinable with `--summary`, `--count`, and `--replay <file>`)
+- Exit codes: `0` success (including broken pipe or `Ctrl+C` during stream), `1` runtime error (`JsonErrorEnvelope` on stderr), `2` CLI usage error (`code: "cli_usage"` on stderr when `--json` is active)
 
 ## Documentation index
 
