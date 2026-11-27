@@ -536,6 +536,21 @@ pub fn sort_processes(
         .collect()
 }
 
+/// Returns `true` when the snapshot's Services subsystem can be opened in the TUI.
+///
+/// On Windows, the on-demand SCM collector reports `DataState::Unavailable("services view inactive")`
+/// while closed so it avoids polling SCM until requested; any other `Unavailable` reason (such as
+/// Linux/macOS v1) means OS service management is unsupported and the `S:svc` tab stays hidden.
+pub fn is_services_view_supported(services: &DataState<Vec<btop_model::ServiceEntry>>) -> bool {
+    match services {
+        DataState::Unavailable(reason) => reason == "services view inactive",
+        DataState::Available(_)
+        | DataState::Stale { .. }
+        | DataState::WarmingUp
+        | DataState::Denied => true,
+    }
+}
+
 /// Renders the Process box (`⁴proc`) inside `rect`.
 pub fn render_proc_box(
     grid: &mut Grid,
@@ -562,7 +577,7 @@ pub fn render_proc_box(
     let active = view.active_processes(snapshot);
     let built = active.map(|procs| build_visible_rows(procs, view));
     let total_visible = built.as_ref().map_or(0, |(rows, _)| rows.len());
-    let services_available = !matches!(snapshot.services, DataState::Unavailable(_));
+    let services_available = is_services_view_supported(&snapshot.services);
     render_proc_chrome(grid, rect, view, total_visible, services_available, theme);
 
     let inner = Rect {

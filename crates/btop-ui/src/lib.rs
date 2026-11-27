@@ -42,7 +42,7 @@ pub use menu::{
 pub use menu_render::{dim_grid, help_visible_rows, options_visible_rows, render_overlay_menu};
 pub use net_box::{AUTO_SCALE_FLOOR_BPS, NetViewState, compute_net_scale_ceilings, format_bitrate};
 pub use proc_actions::{ProcActionModal, UiPriorityClass, modal_rect};
-pub use proc_box::{ProcSort, ProcViewState};
+pub use proc_box::{ProcSort, ProcViewState, is_services_view_supported};
 pub use proc_detail::{
     detail_overlay_height, format_detail_field, format_elapsed_uptime, format_parent_label,
 };

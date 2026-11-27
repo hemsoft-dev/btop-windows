@@ -865,9 +865,10 @@ fn toggle_services_view(
     if !has_proc_panel(size, ui_state) {
         return false;
     }
-    // Never replace the process list with an empty placeholder when OS services are unavailable
-    // (e.g. Linux/macOS v1), while still allowing an active Services view to toggle back off.
-    if !ui_state.services.active && matches!(snapshot.services, DataState::Unavailable(_)) {
+    // Never replace the process list with an empty placeholder when OS services are unsupported
+    // (e.g. Linux/macOS v1), while preserving on-demand Windows SCM activation (`services view inactive`)
+    // and allowing an active Services view to toggle back off.
+    if !ui_state.services.active && !btop_ui::is_services_view_supported(&snapshot.services) {
         return false;
     }
     // Always exit any active filter editor on either side so a hidden panel never traps keys.
@@ -3602,6 +3603,29 @@ mod tests {
         assert!(!toggle_services_view(
             size,
             &snap,
+            &mut state,
+            None,
+            &mut prev_grid
+        ));
+        assert!(!state.services.active);
+
+        // Windows on-demand SCM reports `Unavailable("services view inactive")` while closed
+        // and must remain toggleable via `S`.
+        let win_inactive_snap = btop_model::Snapshot {
+            services: DataState::Unavailable("services view inactive".to_owned()),
+            ..btop_model::Snapshot::default()
+        };
+        assert!(toggle_services_view(
+            size,
+            &win_inactive_snap,
+            &mut state,
+            None,
+            &mut prev_grid
+        ));
+        assert!(state.services.active);
+        assert!(toggle_services_view(
+            size,
+            &win_inactive_snap,
             &mut state,
             None,
             &mut prev_grid
