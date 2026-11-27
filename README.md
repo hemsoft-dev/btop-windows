@@ -250,12 +250,15 @@ docs/
 ## Documentation and contributing
 
 - [Contributing Guide](CONTRIBUTING.md)
+- [Domain Glossary](GLOSSARY.md)
 - [Agent Instructions (AGENTS.md)](AGENTS.md) and [llms.txt](llms.txt)
 - [Functional Specification](docs/SPEC.md)
 - [System Architecture](docs/ARCHITECTURE.md)
 - [Upstream Parity Matrix](docs/PARITY.md)
 - [ADR-0001: Tech Stack, Renderer, and Telemetry Architecture](docs/adr/0001-tech-stack-and-renderer.md)
 - [ADR-0002: Windows 11 x64 GPU Baseline API (DXGI + WDDM PDH)](docs/adr/0002-gpu-baseline-api.md)
+- [ADR-0003: Cross-Platform Local TUI and `sysinfo` Capability Boundary](docs/adr/0003-cross-platform-local-tui.md)
+- [ADR-0004: Pull-Based Tailscale Fleet Agent, `NodeSample` Contract, and Read-Only Boundary](docs/adr/0004-tailscale-fleet-architecture.md)
 
 ## License
 

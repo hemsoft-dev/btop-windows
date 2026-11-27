@@ -43,3 +43,6 @@
 - [docs/PARITY.md](https://github.com/hemsoft-dev/btop-windows/blob/main/docs/PARITY.md): Upstream btop v1.4.8 config, CLI, keybinding, and theme parity map
 - [docs/adr/0001-tech-stack-and-renderer.md](https://github.com/hemsoft-dev/btop-windows/blob/main/docs/adr/0001-tech-stack-and-renderer.md): Rust stack and custom VT diff renderer decision
 - [docs/adr/0002-gpu-baseline-api.md](https://github.com/hemsoft-dev/btop-windows/blob/main/docs/adr/0002-gpu-baseline-api.md): DXGI + WDDM PDH + optional NVML GPU telemetry decision
+- [docs/adr/0003-cross-platform-local-tui.md](https://github.com/hemsoft-dev/btop-windows/blob/main/docs/adr/0003-cross-platform-local-tui.md): 4-target cross-platform local TUI, `btop-fleet` Unix binary name, and `sysinfo` capability boundary
+- [docs/adr/0004-tailscale-fleet-architecture.md](https://github.com/hemsoft-dev/btop-windows/blob/main/docs/adr/0004-tailscale-fleet-architecture.md): Pull-based Tailscale Fleet Agent, `NodeSample` wire contract, 10-minute RAM `Ring`, and permanent read-only boundary
+- [GLOSSARY.md](https://github.com/hemsoft-dev/btop-windows/blob/main/GLOSSARY.md): Canonical domain language for local and Tailscale fleet monitoring
