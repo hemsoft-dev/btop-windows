@@ -16,6 +16,10 @@ workspace = true
 [dependencies]
 btop-windows = { path = "../btop-windows" }
 
+[target.'cfg(unix)'.dependencies]
+btop-sys.workspace = true
+btop-ui.workspace = true
+
 [dev-dependencies]
 btop-model.workspace = true
 serde_json.workspace = true

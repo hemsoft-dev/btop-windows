@@ -11,9 +11,13 @@ pub mod proc;
 pub mod replay;
 pub mod sampler;
 pub mod services;
+pub mod unix;
 
 use btop_model::Snapshot;
 use thiserror::Error;
+
+#[cfg(unix)]
+pub use unix::UnixLiveCollector;
 
 pub use battery::{
     BATTERY_FLAG_CHARGING, BATTERY_FLAG_NO_BATTERY, BatteryCollector, decode_power_status,

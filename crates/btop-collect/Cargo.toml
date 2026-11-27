@@ -14,3 +14,6 @@ arc-swap.workspace = true
 btop-model.workspace = true
 btop-sys.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+sysinfo.workspace = true

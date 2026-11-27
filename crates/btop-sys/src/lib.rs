@@ -43,8 +43,9 @@ pub use pdh::{CpuPdhQuery, CpuPdhSample};
 pub use power::{RawPowerStatus, local_utc_offset_secs, query_system_power_status};
 pub use proc_actions::{
     PriorityClass, PriorityUpdateOutcome, ProcActionError, graceful_close_process,
-    guard_process_identity, guard_terminate_decision, query_process_priority, set_process_priority,
-    terminate_process,
+    guard_process_identity, guard_terminate_decision, guard_unix_signal_decision,
+    is_linux_kernel_thread, parse_linux_proc_stat_identity, query_process_priority,
+    set_process_priority, terminate_process, unix_start_time_secs_to_identity,
 };
 pub use proc_info::{
     ProcFieldQuery, RawProcessMetadata, SidAccountCache, SystemProcessIdInformation,

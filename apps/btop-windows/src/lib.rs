@@ -2000,11 +2000,20 @@ fn handle_proc_action_shortcut(
     match code {
         KeyCode::Char('t') => match (hooks.graceful_close_process)(id.pid, id.create_time_100ns) {
             Ok(count) => {
-                let plural = if count == 1 { "" } else { "s" };
-                state.proc.action_status = Some(format!(
-                    "Sent WM_CLOSE to {name} (PID {}, {count} window{plural})",
-                    id.pid
-                ));
+                #[cfg(windows)]
+                {
+                    let plural = if count == 1 { "" } else { "s" };
+                    state.proc.action_status = Some(format!(
+                        "Sent WM_CLOSE to {name} (PID {}, {count} window{plural})",
+                        id.pid
+                    ));
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = count;
+                    state.proc.action_status =
+                        Some(format!("Sent SIGTERM to {name} (PID {})", id.pid));
+                }
             }
             Err(err) => {
                 let notice = ProcActionModal::ActionNotice {
