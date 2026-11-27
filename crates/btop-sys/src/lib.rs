@@ -1161,6 +1161,96 @@ mod stub {
         false
     }
 
+    #[cfg(unix)]
+    static UNIX_SIGNAL_PIPE_WR: std::sync::atomic::AtomicI32 =
+        std::sync::atomic::AtomicI32::new(-1);
+    #[cfg(unix)]
+    static UNIX_STOP_SLOT: Mutex<Option<(Arc<std::sync::atomic::AtomicBool>, TimerWaker)>> =
+        Mutex::new(None);
+
+    #[cfg(unix)]
+    unsafe extern "C" fn unix_headless_signal_handler(sig: libc::c_int) {
+        use std::sync::atomic::Ordering;
+
+        let already_signaled = UNIX_HEADLESS_SIGNAL.swap(true, Ordering::SeqCst);
+        if already_signaled {
+            // Second signal terminates immediately via default OS disposition.
+            // SAFETY: Resetting signal disposition and re-raising are POSIX async-signal-safe.
+            unsafe {
+                let mut sa: libc::sigaction = core::mem::zeroed();
+                sa.sa_sigaction = libc::SIG_DFL;
+                sa.sa_flags = 0;
+                libc::sigemptyset(&raw mut sa.sa_mask);
+                let _ = libc::sigaction(sig, &raw const sa, core::ptr::null_mut());
+                let _ = libc::raise(sig);
+            }
+            return;
+        }
+        let fd = UNIX_SIGNAL_PIPE_WR.load(Ordering::Acquire);
+        if fd >= 0 {
+            let byte = 1u8;
+            // SAFETY: `write` on a non-blocking pipe fd is async-signal-safe per POSIX.
+            unsafe {
+                let _ = libc::write(fd, (&raw const byte).cast::<libc::c_void>(), 1);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn spawn_unix_signal_watcher(rd: libc::c_int) -> std::io::Result<std::thread::JoinHandle<()>> {
+        use std::sync::atomic::Ordering;
+
+        // Mask `SIGINT` and `SIGTERM` across thread creation so the watcher thread inherits
+        // a blocked mask and never steals process-directed termination signals from the main
+        // CLI thread (which may be blocked in stdout write).
+        let mut block_set: libc::sigset_t = unsafe { core::mem::zeroed() };
+        let mut prev_set: libc::sigset_t = unsafe { core::mem::zeroed() };
+        // SAFETY: Valid stack-allocated `sigset_t` structs.
+        let masked = unsafe {
+            libc::sigemptyset(&raw mut block_set);
+            libc::sigaddset(&raw mut block_set, libc::SIGINT);
+            libc::sigaddset(&raw mut block_set, libc::SIGTERM);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &raw const block_set, &raw mut prev_set) == 0
+        };
+
+        let spawned = std::thread::Builder::new()
+            .name("btop-sigwait".to_owned())
+            .spawn(move || {
+                let mut buf = [0u8; 16];
+                loop {
+                    // SAFETY: Blocking read on dedicated pipe read end.
+                    let n = unsafe {
+                        libc::read(rd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len())
+                    };
+                    if n > 0 {
+                        let guard = match UNIX_STOP_SLOT.lock() {
+                            Ok(g) => g,
+                            Err(p) => p.into_inner(),
+                        };
+                        if let Some((ref stop_flag, ref waker)) = *guard {
+                            stop_flag.store(true, Ordering::SeqCst);
+                            waker.wake();
+                        }
+                    } else if n == 0 {
+                        break;
+                    }
+                }
+            });
+
+        if masked {
+            // SAFETY: Restoring this thread's saved signal mask after thread spawn.
+            unsafe {
+                let _ = libc::pthread_sigmask(
+                    libc::SIG_SETMASK,
+                    &raw const prev_set,
+                    core::ptr::null_mut(),
+                );
+            }
+        }
+
+        spawned
+    }
+
     /// Installs a `SIGINT` / `SIGTERM` handler for headless streaming/summary mode on Unix that
     /// sets the returned flag and immediately wakes `waker` via an async-signal-safe self-pipe.
     ///
@@ -1172,40 +1262,13 @@ mod stub {
         waker: TimerWaker,
     ) -> Arc<std::sync::atomic::AtomicBool> {
         use std::sync::Once;
-        use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+        use std::sync::atomic::{AtomicBool, Ordering};
 
-        static SIGNAL_PIPE_WR: AtomicI32 = AtomicI32::new(-1);
-        static STOP_SLOT: Mutex<Option<(Arc<AtomicBool>, TimerWaker)>> = Mutex::new(None);
         static INSTALLED: Once = Once::new();
-
-        unsafe extern "C" fn handle_signal(sig: libc::c_int) {
-            let already_signaled = UNIX_HEADLESS_SIGNAL.swap(true, Ordering::SeqCst);
-            if already_signaled {
-                // Second signal terminates immediately via default OS disposition.
-                // SAFETY: Resetting signal disposition and re-raising are POSIX async-signal-safe.
-                unsafe {
-                    let mut sa: libc::sigaction = core::mem::zeroed();
-                    sa.sa_sigaction = libc::SIG_DFL;
-                    sa.sa_flags = 0;
-                    libc::sigemptyset(&raw mut sa.sa_mask);
-                    let _ = libc::sigaction(sig, &raw const sa, core::ptr::null_mut());
-                    let _ = libc::raise(sig);
-                }
-                return;
-            }
-            let fd = SIGNAL_PIPE_WR.load(Ordering::Acquire);
-            if fd >= 0 {
-                let byte = 1u8;
-                // SAFETY: `write` on a non-blocking pipe fd is async-signal-safe per POSIX.
-                unsafe {
-                    let _ = libc::write(fd, (&raw const byte).cast::<libc::c_void>(), 1);
-                }
-            }
-        }
 
         UNIX_HEADLESS_SIGNAL.store(false, Ordering::SeqCst);
         let flag = Arc::new(AtomicBool::new(false));
-        match STOP_SLOT.lock() {
+        match UNIX_STOP_SLOT.lock() {
             Ok(mut guard) => *guard = Some((Arc::clone(&flag), waker)),
             Err(poisoned) => *poisoned.into_inner() = Some((Arc::clone(&flag), waker)),
         }
@@ -1213,8 +1276,7 @@ mod stub {
         INSTALLED.call_once(|| {
             let mut fds = [-1 as libc::c_int; 2];
             // SAFETY: Creating a local self-pipe and configuring non-blocking write.
-            let pipe_ok = unsafe { libc::pipe(fds.as_mut_ptr()) == 0 };
-            if !pipe_ok {
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
                 return;
             }
             let (rd, wr) = (fds[0], fds[1]);
@@ -1227,59 +1289,11 @@ mod stub {
                 let _ = libc::fcntl(rd, libc::F_SETFD, libc::FD_CLOEXEC);
                 let _ = libc::fcntl(wr, libc::F_SETFD, libc::FD_CLOEXEC);
             }
-            SIGNAL_PIPE_WR.store(wr, Ordering::Release);
+            UNIX_SIGNAL_PIPE_WR.store(wr, Ordering::Release);
 
-            // Mask `SIGINT` and `SIGTERM` across thread creation so the watcher thread inherits
-            // a blocked mask and never steals process-directed termination signals from the main
-            // CLI thread (which may be blocked in stdout write).
-            let mut block_set: libc::sigset_t = unsafe { core::mem::zeroed() };
-            let mut prev_set: libc::sigset_t = unsafe { core::mem::zeroed() };
-            // SAFETY: Valid stack-allocated `sigset_t` structs.
-            let masked = unsafe {
-                libc::sigemptyset(&raw mut block_set);
-                libc::sigaddset(&raw mut block_set, libc::SIGINT);
-                libc::sigaddset(&raw mut block_set, libc::SIGTERM);
-                libc::pthread_sigmask(libc::SIG_BLOCK, &raw const block_set, &raw mut prev_set) == 0
-            };
-
-            let spawned = std::thread::Builder::new()
-                .name("btop-sigwait".to_owned())
-                .spawn(move || {
-                    let mut buf = [0u8; 16];
-                    loop {
-                        // SAFETY: Blocking read on dedicated pipe read end.
-                        let n = unsafe {
-                            libc::read(rd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len())
-                        };
-                        if n > 0 {
-                            let guard = match STOP_SLOT.lock() {
-                                Ok(g) => g,
-                                Err(p) => p.into_inner(),
-                            };
-                            if let Some((ref stop_flag, ref waker)) = *guard {
-                                stop_flag.store(true, Ordering::SeqCst);
-                                waker.wake();
-                            }
-                        } else if n == 0 {
-                            break;
-                        }
-                    }
-                });
-
-            if masked {
-                // SAFETY: Restoring this thread's saved signal mask after thread spawn.
-                unsafe {
-                    let _ = libc::pthread_sigmask(
-                        libc::SIG_SETMASK,
-                        &raw const prev_set,
-                        core::ptr::null_mut(),
-                    );
-                }
-            }
-
-            if spawned.is_err() {
+            if spawn_unix_signal_watcher(rd).is_err() {
                 // Leave default OS signal termination intact if the watcher thread could not start.
-                SIGNAL_PIPE_WR.store(-1, Ordering::Release);
+                UNIX_SIGNAL_PIPE_WR.store(-1, Ordering::Release);
                 // SAFETY: Closing pipe descriptors owned solely by this failed init path.
                 unsafe {
                     let _ = libc::close(rd);
@@ -1289,11 +1303,12 @@ mod stub {
             }
 
             for sig in [libc::SIGINT, libc::SIGTERM] {
-                // SAFETY: Installing async-signal-safe `handle_signal` without `SA_RESTART`
-                // so blocked stdout writes observe `EINTR` and exit promptly.
+                // SAFETY: Installing async-signal-safe `unix_headless_signal_handler` without
+                // `SA_RESTART` so blocked stdout writes observe `EINTR` and exit promptly.
                 unsafe {
                     let mut sa: libc::sigaction = core::mem::zeroed();
-                    sa.sa_sigaction = handle_signal as *const () as libc::sighandler_t;
+                    sa.sa_sigaction =
+                        unix_headless_signal_handler as *const () as libc::sighandler_t;
                     sa.sa_flags = 0;
                     libc::sigemptyset(&raw mut sa.sa_mask);
                     let _ = libc::sigaction(sig, &raw const sa, core::ptr::null_mut());
