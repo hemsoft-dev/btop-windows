@@ -448,7 +448,7 @@ mod live {
                 .iter()
                 .map(|(name, data)| {
                     (
-                        name.clone(),
+                        name.to_string_lossy().into_owned(),
                         (data.total_received(), data.total_transmitted()),
                     )
                 })
@@ -512,7 +512,7 @@ mod live {
                             group: 0,
                             number: u8::try_from(idx).unwrap_or(u8::MAX),
                         },
-                        busy_pct: normalize_unix_cpu_pct(cpu.cpu_usage()),
+                        busy_pct: normalize_unix_cpu_pct(cpu.usage()),
                         kind: CoreKind::Uniform,
                         temp_celsius: None,
                     }
@@ -562,10 +562,10 @@ mod live {
 
         fn sample_disks(&mut self, elapsed_ms: u64) -> Vec<btop_model::DiskSnapshot> {
             self.disks.refresh_specifics(true, disk_refresh_kind());
-            let mut next_totals = HashMap::with_capacity(self.disks.list().len());
-            let mut raw = Vec::with_capacity(self.disks.list().len());
+            let mut next_totals = HashMap::with_capacity(self.disks.len());
+            let mut raw = Vec::with_capacity(self.disks.len());
 
-            for disk in self.disks.list() {
+            for disk in self.disks.iter() {
                 let mount = disk.mount_point().to_string_lossy().into_owned();
                 let fs_type = disk.file_system().to_string_lossy().into_owned();
                 let device = disk.name().to_string_lossy().into_owned();
@@ -598,20 +598,21 @@ mod live {
 
         fn sample_networks(&mut self, elapsed_ms: u64) -> Vec<NetInterfaceSnapshot> {
             self.networks.refresh(true);
-            let mut next_totals = HashMap::with_capacity(self.networks.list().len());
+            let mut next_totals = HashMap::with_capacity(self.networks.iter().count());
             let mut out = Vec::new();
 
-            for (name, data) in self.networks.list() {
+            for (raw_name, data) in self.networks.iter() {
+                let name = raw_name.to_string_lossy().into_owned();
                 let rx_total = data.total_received();
                 let tx_total = data.total_transmitted();
                 next_totals.insert(name.clone(), (rx_total, tx_total));
 
-                if !should_include_unix_interface(name) {
+                if !should_include_unix_interface(&name) {
                     continue;
                 }
 
                 let (rx_rate, tx_rate) =
-                    if let Some(&(prev_rx, prev_tx)) = self.prev_net_totals.get(name) {
+                    if let Some(&(prev_rx, prev_tx)) = self.prev_net_totals.get(&name) {
                         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                         let rx = clamped_rate_per_sec(prev_rx, rx_total, elapsed_ms).round() as u64;
                         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -644,9 +645,9 @@ mod live {
                     .filter(|&speed| speed > 0);
 
                 out.push(NetInterfaceSnapshot {
-                    luid: stable_interface_luid(name),
-                    name: name.clone(),
+                    luid: stable_interface_luid(&name),
                     description: name.clone(),
+                    name,
                     is_up,
                     ipv4,
                     ipv6,

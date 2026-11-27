@@ -611,7 +611,7 @@ mod unix {
             return Err(ProcActionError::NotFound(pid));
         };
         let mut info: libc::proc_bsdinfo = unsafe { core::mem::zeroed() };
-        let size = i32::try_from(core::mem::size_of::<libc::proc_bsdinfo>()).unwrap_or(0);
+        let size = i32::try_from(size_of::<libc::proc_bsdinfo>()).unwrap_or(0);
         // SAFETY: Valid output buffer for `PROC_PIDTBSDINFO` of exact size `size`.
         let rc = unsafe {
             libc::proc_pidinfo(
