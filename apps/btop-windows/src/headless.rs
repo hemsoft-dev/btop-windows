@@ -337,6 +337,12 @@ fn write_all_interruptible<W: Write>(
             || btop_sys::headless_signal_received()
     };
     while !buf.is_empty() {
+        if is_stopped() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "headless output interrupted by signal",
+            ));
+        }
         match writer.write(buf) {
             Ok(0) => {
                 return Err(std::io::Error::new(
@@ -354,6 +360,12 @@ fn write_all_interruptible<W: Write>(
         }
     }
     loop {
+        if is_stopped() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "headless flush interrupted by signal",
+            ));
+        }
         match writer.flush() {
             Ok(()) => return Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
@@ -947,6 +959,19 @@ mod tests {
         let err = write_all_interruptible(&mut w_stop, b"hello\n", Some(&stop2))
             .expect_err("must stop promptly on EINTR when stop_flag is raised");
         assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+
+        // 3. Pre-flagged stop_flag aborts before issuing any write().
+        let stop3 = AtomicBool::new(true);
+        let mut w_pre = InterruptingWriter {
+            stop_flag: &stop3,
+            interrupts_left: 0,
+            set_stop_on_interrupt: false,
+            written: Vec::new(),
+        };
+        let err3 = write_all_interruptible(&mut w_pre, b"hello\n", Some(&stop3))
+            .expect_err("must abort before write when stop_flag is already raised");
+        assert_eq!(err3.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(w_pre.written.len(), 0);
     }
 
     #[test]
