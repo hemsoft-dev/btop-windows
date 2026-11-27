@@ -965,6 +965,16 @@ mod win {
         });
         flag
     }
+
+    /// Returns `true` if a headless `Ctrl+C` / `Ctrl+Break` event was received.
+    pub fn headless_signal_received() -> bool {
+        if let Ok(guard) = HEADLESS_STOP_SLOT.lock()
+            && let Some((ref flag, _)) = *guard
+        {
+            return flag.load(std::sync::atomic::Ordering::SeqCst);
+        }
+        false
+    }
 }
 
 #[cfg(not(windows))]
@@ -1077,8 +1087,27 @@ mod stub {
         }
     }
 
+    #[cfg(unix)]
+    static UNIX_HEADLESS_SIGNAL: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Returns `true` if a headless `SIGINT` / `SIGTERM` signal has been received on Unix.
+    #[cfg(unix)]
+    pub fn headless_signal_received() -> bool {
+        UNIX_HEADLESS_SIGNAL.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(not(unix))]
+    pub fn headless_signal_received() -> bool {
+        false
+    }
+
     /// Installs a `SIGINT` / `SIGTERM` handler for headless streaming/summary mode on Unix that
     /// sets the returned flag and immediately wakes `waker` via an async-signal-safe self-pipe.
+    ///
+    /// Signal handlers are installed only after the pipe and watcher thread both start cleanly,
+    /// without `SA_RESTART` so blocked stdout writes return `EINTR` immediately; a second signal
+    /// falls back to the OS default termination disposition.
     #[cfg(unix)]
     pub fn install_headless_ctrl_c_handler(
         waker: TimerWaker,
@@ -1090,7 +1119,21 @@ mod stub {
         static STOP_SLOT: Mutex<Option<(Arc<AtomicBool>, TimerWaker)>> = Mutex::new(None);
         static INSTALLED: Once = Once::new();
 
-        unsafe extern "C" fn handle_signal(_sig: libc::c_int) {
+        unsafe extern "C" fn handle_signal(sig: libc::c_int) {
+            let already_signaled = UNIX_HEADLESS_SIGNAL.swap(true, Ordering::SeqCst);
+            if already_signaled {
+                // Second signal terminates immediately via default OS disposition.
+                // SAFETY: Resetting signal disposition and re-raising are POSIX async-signal-safe.
+                unsafe {
+                    let mut sa: libc::sigaction = core::mem::zeroed();
+                    sa.sa_sigaction = libc::SIG_DFL;
+                    sa.sa_flags = 0;
+                    libc::sigemptyset(&raw mut sa.sa_mask);
+                    let _ = libc::sigaction(sig, &raw const sa, core::ptr::null_mut());
+                    let _ = libc::raise(sig);
+                }
+                return;
+            }
             let fd = SIGNAL_PIPE_WR.load(Ordering::Acquire);
             if fd >= 0 {
                 let byte = 1u8;
@@ -1101,6 +1144,7 @@ mod stub {
             }
         }
 
+        UNIX_HEADLESS_SIGNAL.store(false, Ordering::SeqCst);
         let flag = Arc::new(AtomicBool::new(false));
         match STOP_SLOT.lock() {
             Ok(mut guard) => *guard = Some((Arc::clone(&flag), waker)),
@@ -1109,7 +1153,7 @@ mod stub {
 
         INSTALLED.call_once(|| {
             let mut fds = [-1 as libc::c_int; 2];
-            // SAFETY: Creating a local self-pipe and configuring non-blocking write + signal handlers.
+            // SAFETY: Creating a local self-pipe and configuring non-blocking write.
             let pipe_ok = unsafe { libc::pipe(fds.as_mut_ptr()) == 0 };
             if !pipe_ok {
                 return;
@@ -1126,7 +1170,7 @@ mod stub {
             }
             SIGNAL_PIPE_WR.store(wr, Ordering::Release);
 
-            let _ = std::thread::Builder::new()
+            let spawned = std::thread::Builder::new()
                 .name("btop-sigwait".to_owned())
                 .spawn(move || {
                     let mut buf = [0u8; 16];
@@ -1150,12 +1194,24 @@ mod stub {
                     }
                 });
 
+            if spawned.is_err() {
+                // Leave default OS signal termination intact if the watcher thread could not start.
+                SIGNAL_PIPE_WR.store(-1, Ordering::Release);
+                // SAFETY: Closing pipe descriptors owned solely by this failed init path.
+                unsafe {
+                    let _ = libc::close(rd);
+                    let _ = libc::close(wr);
+                }
+                return;
+            }
+
             for sig in [libc::SIGINT, libc::SIGTERM] {
-                // SAFETY: Installing async-signal-safe `handle_signal` for `SIGINT` / `SIGTERM`.
+                // SAFETY: Installing async-signal-safe `handle_signal` without `SA_RESTART`
+                // so blocked stdout writes observe `EINTR` and exit promptly.
                 unsafe {
                     let mut sa: libc::sigaction = core::mem::zeroed();
                     sa.sa_sigaction = handle_signal as *const () as libc::sighandler_t;
-                    sa.sa_flags = libc::SA_RESTART;
+                    sa.sa_flags = 0;
                     libc::sigemptyset(&raw mut sa.sa_mask);
                     let _ = libc::sigaction(sig, &raw const sa, core::ptr::null_mut());
                 }
@@ -1176,17 +1232,17 @@ mod stub {
 
 #[cfg(not(windows))]
 pub use stub::{
-    TimerWake, TimerWaker, WaitableWakeTimer, install_headless_ctrl_c_handler,
-    query_core_efficiency_classes, query_process_information, query_processor_performance,
-    query_self_cpu_time_100ns, query_self_private_working_set_bytes, read_cpu_model_name,
-    read_cpu_nominal_mhz, system_uptime_secs, total_physical_memory_bytes,
+    TimerWake, TimerWaker, WaitableWakeTimer, headless_signal_received,
+    install_headless_ctrl_c_handler, query_core_efficiency_classes, query_process_information,
+    query_processor_performance, query_self_cpu_time_100ns, query_self_private_working_set_bytes,
+    read_cpu_model_name, read_cpu_nominal_mhz, system_uptime_secs, total_physical_memory_bytes,
 };
 #[cfg(windows)]
 pub use win::{
-    TimerWake, TimerWaker, WaitableWakeTimer, install_headless_ctrl_c_handler,
-    query_core_efficiency_classes, query_process_information, query_processor_performance,
-    query_self_cpu_time_100ns, query_self_private_working_set_bytes, read_cpu_model_name,
-    read_cpu_nominal_mhz, system_uptime_secs, total_physical_memory_bytes,
+    TimerWake, TimerWaker, WaitableWakeTimer, headless_signal_received,
+    install_headless_ctrl_c_handler, query_core_efficiency_classes, query_process_information,
+    query_processor_performance, query_self_cpu_time_100ns, query_self_private_working_set_bytes,
+    read_cpu_model_name, read_cpu_nominal_mhz, system_uptime_secs, total_physical_memory_bytes,
 };
 
 #[cfg(test)]

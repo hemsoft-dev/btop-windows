@@ -97,6 +97,7 @@ pub(crate) fn unix_config_root(
 ) -> Option<PathBuf> {
     if let Some(xdg) = xdg_config_home
         && !xdg.as_os_str().is_empty()
+        && xdg.is_absolute()
     {
         return Some(xdg.to_path_buf());
     }
@@ -976,6 +977,18 @@ mod tests {
         );
         assert_eq!(
             resolve_unix_config_location_with(None, Some(&exe_dir), None, Some(&home)),
+            Some(ConfigLocation::AppData(
+                home.join(".config").join("btop-fleet").join("btop.conf")
+            ))
+        );
+        // Per the XDG Base Directory Specification, relative XDG_CONFIG_HOME values are ignored.
+        assert_eq!(
+            resolve_unix_config_location_with(
+                None,
+                Some(&exe_dir),
+                Some(Path::new("relative/xdg")),
+                Some(&home)
+            ),
             Some(ConfigLocation::AppData(
                 home.join(".config").join("btop-fleet").join("btop.conf")
             ))

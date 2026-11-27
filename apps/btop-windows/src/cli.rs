@@ -24,7 +24,7 @@ use crate::headless::{
     HeadlessStreamOptions, HeadlessSummaryOptions, MAX_INTERVAL_MS, MAX_SAMPLE_MS,
     MAX_SUMMARY_WINDOW_MS, MIN_INTERVAL_MS, collect_headless_snapshot, collect_headless_summary,
     raw_args_request_json, raw_args_request_pretty, stream_headless_snapshots, write_json_envelope,
-    write_json_error, write_json_summary,
+    write_json_error, write_json_summary_interruptible,
 };
 use crate::{AppError, ConfigOverrides, load_config, run_tui_loop};
 
@@ -653,8 +653,16 @@ fn run_headless_summary(
         }
     };
 
-    if let Err(err) = write_json_summary(&mut io::stdout().lock(), &summary, options.pretty) {
-        if err.kind() == io::ErrorKind::BrokenPipe {
+    if let Err(err) = write_json_summary_interruptible(
+        &mut io::stdout().lock(),
+        &summary,
+        options.pretty,
+        &stop_flag,
+    ) {
+        if err.kind() == io::ErrorKind::BrokenPipe
+            || (err.kind() == io::ErrorKind::Interrupted
+                && (stop_flag.load(Ordering::SeqCst) || btop_sys::headless_signal_received()))
+        {
             return ExitCode::SUCCESS;
         }
         emit_error(

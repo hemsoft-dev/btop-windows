@@ -334,20 +334,28 @@ mod unix {
     use std::io::{self, IsTerminal, Write as _};
     use std::mem::MaybeUninit;
     use std::sync::Once;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
     use super::{ENTER_SEQUENCE, LEAVE_SEQUENCE, TermError};
     use crate::Size;
 
-    /// Sync wrapper for saved POSIX `termios`, written once before enabling raw mode
-    /// and read only after `TERMIOS_SAVED` is published with `Release`/`Acquire`.
+    const STATE_INACTIVE: u8 = 0;
+    const STATE_ENTERING: u8 = 1;
+    const STATE_ACTIVE: u8 = 2;
+    const STATE_RESTORING: u8 = 3;
+    const STATE_TERMINATED: u8 = 4;
+
+    /// Sync wrapper for saved POSIX `termios`, written only while holding exclusive
+    /// `STATE_ENTERING` and read only in `STATE_ACTIVE`, `STATE_RESTORING`, or
+    /// `STATE_TERMINATED` (which permanently prevents any future `enter()` write).
     struct SavedTermiosSlot(UnsafeCell<MaybeUninit<libc::termios>>);
 
-    // SAFETY: Access is serialized by `ACTIVE` (`compare_exchange`) before write and
-    // guarded by `TERMIOS_SAVED` (`Release` on write, `Acquire` on read).
+    // SAFETY: `STATE` enforces strict single-writer ownership during `STATE_ENTERING`
+    // and immutable read-only access in `STATE_ACTIVE`, `STATE_RESTORING`, and
+    // `STATE_TERMINATED` (which never transitions back to `STATE_INACTIVE`).
     unsafe impl Sync for SavedTermiosSlot {}
 
-    static ACTIVE: AtomicBool = AtomicBool::new(false);
+    static STATE: AtomicU8 = AtomicU8::new(STATE_INACTIVE);
     static TERMIOS_SAVED: AtomicBool = AtomicBool::new(false);
     static SAVED_TERMIOS: SavedTermiosSlot =
         SavedTermiosSlot(UnsafeCell::new(MaybeUninit::uninit()));
@@ -362,9 +370,12 @@ mod unix {
 
     /// Async-signal-safe terminal restore for `SIGINT` / `SIGTERM`, then re-raises default action.
     unsafe extern "C" fn unix_signal_handler(sig: libc::c_int) {
-        if ACTIVE.swap(false, Ordering::AcqRel) {
+        let prev = STATE.swap(STATE_TERMINATED, Ordering::AcqRel);
+        if prev == STATE_ACTIVE || prev == STATE_RESTORING {
             let bytes = LEAVE_SEQUENCE.as_bytes();
             // SAFETY: `libc::write` and `libc::tcsetattr` are POSIX async-signal-safe.
+            // `STATE_TERMINATED` permanently blocks `enter()` from ever writing `SAVED_TERMIOS`,
+            // and `SAVED_TERMIOS` was fully initialized before `STATE_ACTIVE` was published.
             unsafe {
                 let _ = libc::write(
                     libc::STDOUT_FILENO,
@@ -411,18 +422,33 @@ mod unix {
 
     /// Restores the POSIX terminal if a `TerminalGuard` is currently active. Idempotent.
     pub fn restore_terminal_now() {
-        if !ACTIVE.swap(false, Ordering::AcqRel) {
+        if STATE
+            .compare_exchange(
+                STATE_ACTIVE,
+                STATE_RESTORING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
             return;
         }
         let _ = write_all_stdout(LEAVE_SEQUENCE);
         if crossterm::terminal::disable_raw_mode().is_err() && TERMIOS_SAVED.load(Ordering::Acquire)
         {
-            // SAFETY: `SAVED_TERMIOS` was initialized before `TERMIOS_SAVED` became true.
+            // SAFETY: `SAVED_TERMIOS` is immutable while in `STATE_RESTORING` or `STATE_TERMINATED`.
             unsafe {
                 let saved = (&*SAVED_TERMIOS.0.get()).assume_init_ref();
                 let _ = libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, saved);
             }
         }
+        // Transition back to `STATE_INACTIVE` only if a signal did not latch `STATE_TERMINATED`.
+        let _ = STATE.compare_exchange(
+            STATE_RESTORING,
+            STATE_INACTIVE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     /// RAII guard owning POSIX raw input mode, alternate screen, SGR mouse, and focus tracking.
@@ -434,37 +460,62 @@ mod unix {
     impl TerminalGuard {
         /// Enters POSIX raw mode and alternate screen, installing panic and signal restore hooks.
         pub fn enter() -> Result<Self, TermError> {
-            if ACTIVE
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            if STATE
+                .compare_exchange(
+                    STATE_INACTIVE,
+                    STATE_ENTERING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
                 .is_err()
             {
                 return Err(TermError::AlreadyActive);
             }
 
             if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-                ACTIVE.store(false, Ordering::Release);
+                let _ = STATE.compare_exchange(
+                    STATE_ENTERING,
+                    STATE_INACTIVE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
                 return Err(TermError::VtUnsupported);
             }
 
-            // Capture original termios for async-signal-safe restoration before mutating modes.
+            // Capture original termios while holding exclusive `STATE_ENTERING` before installing
+            // signal hooks or mutating terminal modes.
+            TERMIOS_SAVED.store(false, Ordering::Release);
             let mut orig: libc::termios = unsafe { std::mem::zeroed() };
             // SAFETY: `STDIN_FILENO` was just verified to be a terminal.
             if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &raw mut orig) } == 0 {
-                // SAFETY: `ACTIVE` lock guarantees single writer before `TERMIOS_SAVED` is set.
+                // SAFETY: `STATE_ENTERING` guarantees exclusive write access to `SAVED_TERMIOS`.
                 unsafe {
                     (*SAVED_TERMIOS.0.get()).write(orig);
                 }
                 TERMIOS_SAVED.store(true, Ordering::Release);
             }
 
+            // Install panic and signal restore hooks and publish `STATE_ACTIVE` before mutating
+            // raw mode so a signal arriving during `enable_raw_mode()` still restores `termios`.
+            install_global_restore_hooks();
+            if STATE
+                .compare_exchange(
+                    STATE_ENTERING,
+                    STATE_ACTIVE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                return Err(TermError::AlreadyActive);
+            }
+
             if let Err(err) = crossterm::terminal::enable_raw_mode() {
-                ACTIVE.store(false, Ordering::Release);
+                restore_terminal_now();
                 return Err(TermError::Console(format!(
                     "failed to enable raw terminal mode: {err}"
                 )));
             }
-
-            install_global_restore_hooks();
 
             if let Err(err) = write_all_stdout(ENTER_SEQUENCE) {
                 restore_terminal_now();
@@ -495,25 +546,42 @@ mod unix {
 
     #[cfg(test)]
     mod tests {
+        use std::sync::Mutex;
+
         use super::*;
 
+        static TEST_LOCK: Mutex<()> = Mutex::new(());
+
         #[test]
-        fn second_enter_is_rejected_when_active() {
-            assert!(
-                ACTIVE
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            );
-            let err = TerminalGuard::enter().expect_err("second guard must fail");
-            assert!(matches!(err, TermError::AlreadyActive));
-            ACTIVE.store(false, Ordering::Release);
+        fn second_enter_is_rejected_when_active_or_terminated() {
+            let _guard = TEST_LOCK.lock().expect("lock unix backend tests");
+            STATE.store(STATE_ACTIVE, Ordering::SeqCst);
+            assert!(matches!(
+                TerminalGuard::enter(),
+                Err(TermError::AlreadyActive)
+            ));
+
+            STATE.store(STATE_TERMINATED, Ordering::SeqCst);
+            assert!(matches!(
+                TerminalGuard::enter(),
+                Err(TermError::AlreadyActive)
+            ));
+
+            STATE.store(STATE_INACTIVE, Ordering::SeqCst);
         }
 
         #[test]
-        fn restore_when_inactive_is_a_safe_noop() {
-            ACTIVE.store(false, Ordering::Release);
+        fn restore_when_inactive_or_terminated_is_a_safe_noop() {
+            let _guard = TEST_LOCK.lock().expect("lock unix backend tests");
+            STATE.store(STATE_INACTIVE, Ordering::SeqCst);
             restore_terminal_now();
-            assert!(!ACTIVE.load(Ordering::Acquire));
+            assert_eq!(STATE.load(Ordering::Acquire), STATE_INACTIVE);
+
+            STATE.store(STATE_TERMINATED, Ordering::SeqCst);
+            restore_terminal_now();
+            assert_eq!(STATE.load(Ordering::Acquire), STATE_TERMINATED);
+
+            STATE.store(STATE_INACTIVE, Ordering::SeqCst);
         }
     }
 }

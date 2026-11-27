@@ -44,6 +44,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
       - name: Clippy workspace
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test workspace
@@ -79,6 +81,8 @@ jobs:
       - name: Build binary and run CLI smoke checks
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           cargo build -p btop-windows --target x86_64-pc-windows-msvc
           .\target\x86_64-pc-windows-msvc\debug\btop.exe --version
           .\target\x86_64-pc-windows-msvc\debug\btop.exe --default-config | Out-Null

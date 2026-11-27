@@ -187,9 +187,16 @@ where
             options.diagnose,
         );
 
-        match write_json_envelope(writer, &envelope, false) {
+        match write_json_envelope_interruptible(writer, &envelope, false, stop_flag) {
             Ok(()) => emitted += 1,
-            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => break,
+            Err(err)
+                if err.kind() == std::io::ErrorKind::BrokenPipe
+                    || (err.kind() == std::io::ErrorKind::Interrupted
+                        && (stop_flag.load(Ordering::SeqCst)
+                            || btop_sys::headless_signal_received())) =>
+            {
+                break;
+            }
             Err(err) => return Err(AppError::Io(err)),
         }
     }
@@ -317,14 +324,53 @@ where
     Ok(summary)
 }
 
+fn write_all_interruptible<W: Write>(
+    writer: &mut W,
+    mut buf: &[u8],
+    stop_flag: Option<&AtomicBool>,
+) -> Result<(), std::io::Error> {
+    let is_stopped = || {
+        stop_flag.is_some_and(|flag| flag.load(Ordering::SeqCst))
+            || btop_sys::headless_signal_received()
+    };
+    while !buf.is_empty() {
+        match writer.write(buf) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write whole JSON buffer",
+                ));
+            }
+            Ok(n) => buf = &buf[n..],
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                if is_stopped() {
+                    return Err(err);
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    loop {
+        match writer.flush() {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                if is_stopped() {
+                    return Err(err);
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 fn write_serialized_json<W: Write>(
     writer: &mut W,
     serialized: serde_json::Result<String>,
+    stop_flag: Option<&AtomicBool>,
 ) -> Result<(), std::io::Error> {
     let mut text = serialized.map_err(std::io::Error::other)?;
     text.push('\n');
-    writer.write_all(text.as_bytes())?;
-    writer.flush()
+    write_all_interruptible(writer, text.as_bytes(), stop_flag)
 }
 
 /// Serializes `envelope` as compact or pretty JSON followed by a trailing newline.
@@ -338,7 +384,23 @@ pub fn write_json_envelope<W: Write>(
     } else {
         serde_json::to_string(envelope)
     };
-    write_serialized_json(writer, serialized)
+    write_serialized_json(writer, serialized, None)
+}
+
+/// Like [`write_json_envelope`], but stops promptly on `EINTR` when `stop_flag` or a
+/// termination signal has been raised instead of retrying a blocked stdout pipe forever.
+pub fn write_json_envelope_interruptible<W: Write>(
+    writer: &mut W,
+    envelope: &JsonSnapshotEnvelope,
+    pretty: bool,
+    stop_flag: &AtomicBool,
+) -> Result<(), std::io::Error> {
+    let serialized = if pretty {
+        serde_json::to_string_pretty(envelope)
+    } else {
+        serde_json::to_string(envelope)
+    };
+    write_serialized_json(writer, serialized, Some(stop_flag))
 }
 
 /// Serializes `summary` as compact or pretty JSON followed by a trailing newline.
@@ -352,7 +414,22 @@ pub fn write_json_summary<W: Write>(
     } else {
         serde_json::to_string(summary)
     };
-    write_serialized_json(writer, serialized)
+    write_serialized_json(writer, serialized, None)
+}
+
+/// Like [`write_json_summary`], stopping promptly on `EINTR` once `stop_flag` is set.
+pub fn write_json_summary_interruptible<W: Write>(
+    writer: &mut W,
+    summary: &JsonSummaryEnvelope,
+    pretty: bool,
+    stop_flag: &AtomicBool,
+) -> Result<(), std::io::Error> {
+    let serialized = if pretty {
+        serde_json::to_string_pretty(summary)
+    } else {
+        serde_json::to_string(summary)
+    };
+    write_serialized_json(writer, serialized, Some(stop_flag))
 }
 
 /// Writes a structured JSON error envelope to `writer` (typically `stderr`).
@@ -812,5 +889,60 @@ mod tests {
         .expect("bounded summary");
         assert_eq!(bounded_sum.sample_count, 2);
         assert_eq!(bounded_sum.window_ms, step_ms);
+    }
+
+    #[test]
+    fn write_all_interruptible_retries_spurious_eintr_and_stops_when_flagged() {
+        struct InterruptingWriter<'a> {
+            stop_flag: &'a AtomicBool,
+            interrupts_left: usize,
+            set_stop_on_interrupt: bool,
+            written: Vec<u8>,
+        }
+
+        impl Write for InterruptingWriter<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if self.interrupts_left > 0 {
+                    self.interrupts_left -= 1;
+                    if self.set_stop_on_interrupt {
+                        self.stop_flag.store(true, Ordering::SeqCst);
+                    }
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "simulated EINTR",
+                    ));
+                }
+                self.written.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // 1. Spurious EINTR without stop_flag set retries and completes cleanly.
+        let stop = AtomicBool::new(false);
+        let mut w_retry = InterruptingWriter {
+            stop_flag: &stop,
+            interrupts_left: 2,
+            set_stop_on_interrupt: false,
+            written: Vec::new(),
+        };
+        write_all_interruptible(&mut w_retry, b"hello\n", Some(&stop))
+            .expect("spurious EINTR must retry");
+        assert_eq!(w_retry.written, b"hello\n");
+
+        // 2. EINTR accompanied by stop_flag returns Interrupted promptly instead of hanging.
+        let stop2 = AtomicBool::new(false);
+        let mut w_stop = InterruptingWriter {
+            stop_flag: &stop2,
+            interrupts_left: 5,
+            set_stop_on_interrupt: true,
+            written: Vec::new(),
+        };
+        let err = write_all_interruptible(&mut w_stop, b"hello\n", Some(&stop2))
+            .expect_err("must stop promptly on EINTR when stop_flag is raised");
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
     }
 }
