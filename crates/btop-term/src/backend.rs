@@ -6,7 +6,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum TermError {
     #[error(
-        "virtual terminal mode is not supported by this console; run btop-windows in Windows Terminal on Windows 11"
+        "virtual terminal mode is not supported by this console; run inside a modern UTF-8 terminal"
     )]
     VtUnsupported,
     #[error("console handle error: {0}")]
@@ -15,7 +15,7 @@ pub enum TermError {
     Input(String),
     #[error("a terminal guard is already active")]
     AlreadyActive,
-    #[error("live terminal backend is only supported on Windows")]
+    #[error("live terminal backend is not supported on this platform")]
     UnsupportedPlatform,
 }
 
@@ -328,12 +328,202 @@ mod win {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+mod unix {
+    use std::cell::UnsafeCell;
+    use std::io::{self, IsTerminal, Write as _};
+    use std::mem::MaybeUninit;
+    use std::sync::Once;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::{ENTER_SEQUENCE, LEAVE_SEQUENCE, TermError};
+    use crate::Size;
+
+    /// Sync wrapper for saved POSIX `termios`, written once before enabling raw mode
+    /// and read only after `TERMIOS_SAVED` is published with `Release`/`Acquire`.
+    struct SavedTermiosSlot(UnsafeCell<MaybeUninit<libc::termios>>);
+
+    // SAFETY: Access is serialized by `ACTIVE` (`compare_exchange`) before write and
+    // guarded by `TERMIOS_SAVED` (`Release` on write, `Acquire` on read).
+    unsafe impl Sync for SavedTermiosSlot {}
+
+    static ACTIVE: AtomicBool = AtomicBool::new(false);
+    static TERMIOS_SAVED: AtomicBool = AtomicBool::new(false);
+    static SAVED_TERMIOS: SavedTermiosSlot =
+        SavedTermiosSlot(UnsafeCell::new(MaybeUninit::uninit()));
+    static HOOKS_INSTALLED: Once = Once::new();
+
+    fn write_all_stdout(text: &str) -> Result<(), TermError> {
+        let mut out = io::stdout().lock();
+        out.write_all(text.as_bytes())
+            .and_then(|()| out.flush())
+            .map_err(|err| TermError::Console(format!("stdout write failed: {err}")))
+    }
+
+    /// Async-signal-safe terminal restore for `SIGINT` / `SIGTERM`, then re-raises default action.
+    unsafe extern "C" fn unix_signal_handler(sig: libc::c_int) {
+        if ACTIVE.swap(false, Ordering::AcqRel) {
+            let bytes = LEAVE_SEQUENCE.as_bytes();
+            // SAFETY: `libc::write` and `libc::tcsetattr` are POSIX async-signal-safe.
+            unsafe {
+                let _ = libc::write(
+                    libc::STDOUT_FILENO,
+                    bytes.as_ptr().cast::<libc::c_void>(),
+                    bytes.len(),
+                );
+                if TERMIOS_SAVED.load(Ordering::Acquire) {
+                    let saved = (&*SAVED_TERMIOS.0.get()).assume_init_ref();
+                    let _ = libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, saved);
+                }
+            }
+        }
+        // SAFETY: Reset signal to default disposition and re-raise so exit status reflects signal.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = libc::SIG_DFL;
+            sa.sa_flags = 0;
+            libc::sigemptyset(&raw mut sa.sa_mask);
+            let _ = libc::sigaction(sig, &raw const sa, std::ptr::null_mut());
+            let _ = libc::raise(sig);
+        }
+    }
+
+    fn install_global_restore_hooks() {
+        HOOKS_INSTALLED.call_once(|| {
+            let previous_hook = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                restore_terminal_now();
+                previous_hook(info);
+            }));
+
+            for sig in [libc::SIGINT, libc::SIGTERM] {
+                // SAFETY: `unix_signal_handler` uses only async-signal-safe POSIX calls.
+                unsafe {
+                    let mut sa: libc::sigaction = std::mem::zeroed();
+                    sa.sa_sigaction = unix_signal_handler as *const () as libc::sighandler_t;
+                    sa.sa_flags = 0;
+                    libc::sigemptyset(&raw mut sa.sa_mask);
+                    let _ = libc::sigaction(sig, &raw const sa, std::ptr::null_mut());
+                }
+            }
+        });
+    }
+
+    /// Restores the POSIX terminal if a `TerminalGuard` is currently active. Idempotent.
+    pub fn restore_terminal_now() {
+        if !ACTIVE.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let _ = write_all_stdout(LEAVE_SEQUENCE);
+        if crossterm::terminal::disable_raw_mode().is_err() && TERMIOS_SAVED.load(Ordering::Acquire)
+        {
+            // SAFETY: `SAVED_TERMIOS` was initialized before `TERMIOS_SAVED` became true.
+            unsafe {
+                let saved = (&*SAVED_TERMIOS.0.get()).assume_init_ref();
+                let _ = libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, saved);
+            }
+        }
+    }
+
+    /// RAII guard owning POSIX raw input mode, alternate screen, SGR mouse, and focus tracking.
+    #[derive(Debug)]
+    pub struct TerminalGuard {
+        _private: (),
+    }
+
+    impl TerminalGuard {
+        /// Enters POSIX raw mode and alternate screen, installing panic and signal restore hooks.
+        pub fn enter() -> Result<Self, TermError> {
+            if ACTIVE
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Err(TermError::AlreadyActive);
+            }
+
+            if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+                ACTIVE.store(false, Ordering::Release);
+                return Err(TermError::VtUnsupported);
+            }
+
+            // Capture original termios for async-signal-safe restoration before mutating modes.
+            let mut orig: libc::termios = unsafe { std::mem::zeroed() };
+            // SAFETY: `STDIN_FILENO` was just verified to be a terminal.
+            if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &raw mut orig) } == 0 {
+                // SAFETY: `ACTIVE` lock guarantees single writer before `TERMIOS_SAVED` is set.
+                unsafe {
+                    (*SAVED_TERMIOS.0.get()).write(orig);
+                }
+                TERMIOS_SAVED.store(true, Ordering::Release);
+            }
+
+            if let Err(err) = crossterm::terminal::enable_raw_mode() {
+                ACTIVE.store(false, Ordering::Release);
+                return Err(TermError::Console(format!(
+                    "failed to enable raw terminal mode: {err}"
+                )));
+            }
+
+            install_global_restore_hooks();
+
+            if let Err(err) = write_all_stdout(ENTER_SEQUENCE) {
+                restore_terminal_now();
+                return Err(err);
+            }
+
+            Ok(Self { _private: () })
+        }
+
+        /// Queries current visible viewport dimensions from the POSIX terminal.
+        pub fn size(&self) -> Result<Size, TermError> {
+            let (width, height) = crossterm::terminal::size()
+                .map_err(|err| TermError::Console(format!("terminal size query failed: {err}")))?;
+            Ok(Size { width, height })
+        }
+
+        /// Writes an encoded ANSI/VT frame in a single stdout write + flush pass.
+        pub fn write_frame(&mut self, frame: &str) -> Result<(), TermError> {
+            write_all_stdout(frame)
+        }
+    }
+
+    impl Drop for TerminalGuard {
+        fn drop(&mut self) {
+            restore_terminal_now();
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn second_enter_is_rejected_when_active() {
+            assert!(
+                ACTIVE
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            );
+            let err = TerminalGuard::enter().expect_err("second guard must fail");
+            assert!(matches!(err, TermError::AlreadyActive));
+            ACTIVE.store(false, Ordering::Release);
+        }
+
+        #[test]
+        fn restore_when_inactive_is_a_safe_noop() {
+            ACTIVE.store(false, Ordering::Release);
+            restore_terminal_now();
+            assert!(!ACTIVE.load(Ordering::Acquire));
+        }
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
 mod stub {
     use super::TermError;
     use crate::Size;
 
-    /// Non-Windows stub allowing portable crates and tests to compile on Linux.
+    /// Fallback stub for unsupported non-Windows, non-Unix targets.
     #[derive(Debug)]
     pub struct TerminalGuard;
 
@@ -358,8 +548,10 @@ mod stub {
     pub fn restore_terminal_now() {}
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, unix)))]
 pub use stub::{TerminalGuard, restore_terminal_now};
+#[cfg(unix)]
+pub use unix::{TerminalGuard, restore_terminal_now};
 #[cfg(windows)]
 pub use win::{TerminalGuard, restore_terminal_now};
 

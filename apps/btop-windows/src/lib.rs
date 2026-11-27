@@ -1,5 +1,6 @@
 //! Runtime session loop shared by the `btop-windows` binary and integration tests.
 
+pub mod cli;
 pub mod headless;
 mod menu_input;
 

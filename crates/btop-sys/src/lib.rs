@@ -1077,7 +1077,96 @@ mod stub {
         }
     }
 
-    /// Portable no-op Ctrl+C handler stub for non-Windows builds.
+    /// Installs a `SIGINT` / `SIGTERM` handler for headless streaming/summary mode on Unix that
+    /// sets the returned flag and immediately wakes `waker` via an async-signal-safe self-pipe.
+    #[cfg(unix)]
+    pub fn install_headless_ctrl_c_handler(
+        waker: TimerWaker,
+    ) -> Arc<std::sync::atomic::AtomicBool> {
+        use std::sync::Once;
+        use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
+        static SIGNAL_PIPE_WR: AtomicI32 = AtomicI32::new(-1);
+        static STOP_SLOT: Mutex<Option<(Arc<AtomicBool>, TimerWaker)>> = Mutex::new(None);
+        static INSTALLED: Once = Once::new();
+
+        unsafe extern "C" fn handle_signal(_sig: libc::c_int) {
+            let fd = SIGNAL_PIPE_WR.load(Ordering::Acquire);
+            if fd >= 0 {
+                let byte = 1u8;
+                // SAFETY: `write` on a non-blocking pipe fd is async-signal-safe per POSIX.
+                unsafe {
+                    let _ = libc::write(fd, (&raw const byte).cast::<libc::c_void>(), 1);
+                }
+            }
+        }
+
+        let flag = Arc::new(AtomicBool::new(false));
+        match STOP_SLOT.lock() {
+            Ok(mut guard) => *guard = Some((Arc::clone(&flag), waker)),
+            Err(poisoned) => *poisoned.into_inner() = Some((Arc::clone(&flag), waker)),
+        }
+
+        INSTALLED.call_once(|| {
+            let mut fds = [-1 as libc::c_int; 2];
+            // SAFETY: Creating a local self-pipe and configuring non-blocking write + signal handlers.
+            let pipe_ok = unsafe { libc::pipe(fds.as_mut_ptr()) == 0 };
+            if !pipe_ok {
+                return;
+            }
+            let (rd, wr) = (fds[0], fds[1]);
+            // SAFETY: Setting `O_NONBLOCK` on write end so signal handler can never block.
+            unsafe {
+                let flags = libc::fcntl(wr, libc::F_GETFL);
+                if flags >= 0 {
+                    let _ = libc::fcntl(wr, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                }
+                let _ = libc::fcntl(rd, libc::F_SETFD, libc::FD_CLOEXEC);
+                let _ = libc::fcntl(wr, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            SIGNAL_PIPE_WR.store(wr, Ordering::Release);
+
+            let _ = std::thread::Builder::new()
+                .name("btop-sigwait".to_owned())
+                .spawn(move || {
+                    let mut buf = [0u8; 16];
+                    loop {
+                        // SAFETY: Blocking read on dedicated pipe read end.
+                        let n = unsafe {
+                            libc::read(rd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len())
+                        };
+                        if n > 0 {
+                            let guard = match STOP_SLOT.lock() {
+                                Ok(g) => g,
+                                Err(p) => p.into_inner(),
+                            };
+                            if let Some((ref stop_flag, ref waker)) = *guard {
+                                stop_flag.store(true, Ordering::SeqCst);
+                                waker.wake();
+                            }
+                        } else if n == 0 {
+                            break;
+                        }
+                    }
+                });
+
+            for sig in [libc::SIGINT, libc::SIGTERM] {
+                // SAFETY: Installing async-signal-safe `handle_signal` for `SIGINT` / `SIGTERM`.
+                unsafe {
+                    let mut sa: libc::sigaction = core::mem::zeroed();
+                    sa.sa_sigaction = handle_signal as *const () as libc::sighandler_t;
+                    sa.sa_flags = libc::SA_RESTART;
+                    libc::sigemptyset(&raw mut sa.sa_mask);
+                    let _ = libc::sigaction(sig, &raw const sa, core::ptr::null_mut());
+                }
+            }
+        });
+
+        flag
+    }
+
+    /// Portable no-op Ctrl+C handler stub for non-Windows, non-Unix targets.
+    #[cfg(not(unix))]
     pub fn install_headless_ctrl_c_handler(
         _waker: TimerWaker,
     ) -> Arc<std::sync::atomic::AtomicBool> {

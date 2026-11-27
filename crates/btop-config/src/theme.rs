@@ -606,14 +606,26 @@ pub struct ThemeSearchPaths {
 }
 
 impl ThemeSearchPaths {
-    /// Builds standard Windows 11 search paths with optional `--themes-dir` override.
+    /// Builds platform-appropriate theme search paths with optional `--themes-dir` override.
     pub fn resolve(cli_themes_dir: Option<&Path>) -> Self {
         let exe_dir = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|dir| dir.join("themes")));
+        #[cfg(windows)]
         let appdata_dir = std::env::var_os("APPDATA")
             .filter(|v| !v.is_empty())
             .map(|dir| PathBuf::from(dir).join("btop").join("themes"));
+        #[cfg(not(windows))]
+        let appdata_dir = {
+            let xdg = std::env::var_os("XDG_CONFIG_HOME")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from);
+            let home = std::env::var_os("HOME")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from);
+            crate::unix_config_root(xdg.as_deref(), home.as_deref())
+                .map(|root| root.join("btop-fleet").join("themes"))
+        };
         Self {
             cli_dir: cli_themes_dir.map(Path::to_path_buf),
             exe_dir,
