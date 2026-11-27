@@ -104,6 +104,26 @@ impl SnapshotRecorder {
     /// separator is written before the first appended snapshot so existing JSONL records
     /// remain intact.
     pub fn open(path: &Path) -> Result<Self, JsonlError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            // Refuse to follow symlinks or append sensitive command-line snapshots into any
+            // pre-existing group/world-accessible file (chmod cannot revoke already-open readers).
+            if let Ok(meta) = std::fs::symlink_metadata(path) {
+                if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+                    return Err(JsonlError::Io(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "refusing to append snapshot recording to a symlink or non-regular file",
+                    )));
+                }
+                if (meta.permissions().mode() & 0o077) != 0 {
+                    return Err(JsonlError::Io(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "refusing to append snapshot recording to a group- or world-accessible file (expected mode 0600)",
+                    )));
+                }
+            }
+        }
         let mut opts = OpenOptions::new();
         opts.read(true).create(true).append(true);
         #[cfg(unix)]
@@ -115,9 +135,15 @@ impl SnapshotRecorder {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            // Tighten pre-existing files as well so recordings containing process command lines
-            // are never left group- or world-readable.
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            // Re-verify the opened descriptor's mode before writing any bytes to close any
+            // race between `symlink_metadata` and `open`.
+            let meta = file.metadata()?;
+            if !meta.file_type().is_file() || (meta.permissions().mode() & 0o077) != 0 {
+                return Err(JsonlError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "refusing to write snapshot recording to a file accessible by other users",
+                )));
+            }
         }
         let mut needs_leading_newline = false;
         if file.metadata()?.len() > 0 {
@@ -296,6 +322,7 @@ mod tests {
         let path = std::env::temp_dir().join(unique);
         let fixtures = win11_8core_single_gpu_desktop();
 
+        // Newly created recording gets mode 0600.
         let recorder = SnapshotRecorder::open(&path).expect("open recorder");
         recorder.record(fixtures[0].clone());
         let _ = recorder.finish().expect("finish recorder");
@@ -305,7 +332,27 @@ mod tests {
             .permissions()
             .mode()
             & 0o777;
-        let _ = std::fs::remove_file(&path);
         assert_eq!(mode, 0o600);
+
+        // Appending to an already-owner-only (0600) file succeeds cleanly.
+        let append_ok = SnapshotRecorder::open(&path).expect("append to 0600 recording");
+        append_ok.record(fixtures[1].clone());
+        let _ = append_ok.finish().expect("finish append");
+
+        // Widening the file to 0644 must cause `open` to fail closed without appending.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("set 0644 permissions");
+        let len_before = std::fs::metadata(&path).expect("stat before").len();
+        let err = SnapshotRecorder::open(&path)
+            .expect_err("must refuse appending to world-readable recording");
+        assert!(matches!(
+            err,
+            JsonlError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(
+            std::fs::metadata(&path).expect("stat after").len(),
+            len_before
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

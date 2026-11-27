@@ -109,9 +109,12 @@ pub fn should_include_unix_disk(
     {
         return false;
     }
-    if IGNORED_UNIX_MOUNT_PREFIXES
-        .iter()
-        .any(|prefix| mount_matches_prefix(mount_point, prefix))
+    // Preserve `/run/media` (Linux removable and local drives mounted by udisks2) while filtering
+    // runtime tmpfs trees under `/run`.
+    if !mount_matches_prefix(mount_point, "/run/media")
+        && IGNORED_UNIX_MOUNT_PREFIXES
+            .iter()
+            .any(|prefix| mount_matches_prefix(mount_point, prefix))
     {
         return false;
     }
@@ -345,6 +348,42 @@ pub fn normalize_unix_proc_cpu_pct(raw_proc_pct: f32, logical_cpus: usize) -> f3
     (raw_proc_pct / denom).clamp(0.0, 100.0)
 }
 
+/// Parses Linux `/proc/stat`'s `procs_running <N>` counter (runnable CPU tasks excluding
+/// `TASK_UNINTERRUPTIBLE` disk I/O waiters).
+pub fn parse_linux_procs_running(proc_stat: &str) -> Option<u32> {
+    for line in proc_stat.lines() {
+        if let Some(rest) = line.strip_prefix("procs_running ")
+            && let Ok(count) = rest.trim().parse::<u32>()
+        {
+            return Some(count);
+        }
+    }
+    None
+}
+
+/// Verifies that live kernel metadata queried by PID still belongs to the exact process row
+/// captured by `sysinfo` (matching parent PID, start time within 1s, and kernel `comm` prefix)
+/// so PID reuse between `sysinfo` refresh and metadata lookup never mixes two processes.
+pub fn unix_meta_matches_sysinfo(
+    sysinfo_parent_pid: u32,
+    sysinfo_start_time_secs: u64,
+    sysinfo_name: &str,
+    meta: &btop_sys::UnixProcessMeta,
+) -> bool {
+    if meta.parent_pid != sysinfo_parent_pid {
+        return false;
+    }
+    if sysinfo_start_time_secs > 0 && meta.start_time_secs.abs_diff(sysinfo_start_time_secs) > 1 {
+        return false;
+    }
+    if meta.comm.is_empty() || sysinfo_name.is_empty() {
+        return false;
+    }
+    sysinfo_name == meta.comm
+        || sysinfo_name.starts_with(&meta.comm)
+        || meta.comm.starts_with(sysinfo_name)
+}
+
 #[cfg(unix)]
 mod live {
     use std::collections::HashMap;
@@ -355,18 +394,22 @@ mod live {
         CoreKind, CoreSample, CpuSnapshot, DataState, LogicalCpuId, NetInterfaceSnapshot,
         ProcessEntry, ProcessIdentity, Snapshot,
     };
-    use btop_sys::{
-        query_unix_process_meta, unix_mount_device_name, unix_start_time_secs_to_identity,
-    };
+    use btop_sys::{ProcActionError, query_unix_process_meta, unix_mount_device_name};
     use sysinfo::{
-        CpuRefreshKind, DiskRefreshKind, Disks, InterfaceOperationalState, MemoryRefreshKind,
-        Networks, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind, Users,
+        CpuRefreshKind, DiskRefreshKind, Disks, InterfaceOperationalState,
+        MINIMUM_CPU_UPDATE_INTERVAL, MemoryRefreshKind, Networks, ProcessRefreshKind,
+        ProcessesToUpdate, RefreshKind, System, UpdateKind, Users,
     };
 
+    #[cfg(target_os = "linux")]
+    use super::parse_linux_procs_running;
     use super::{
         RawUnixDisk, compute_unix_mem_snapshot, deduplicate_unix_disks, normalize_unix_cpu_pct,
         normalize_unix_proc_cpu_pct, should_include_unix_interface, stable_interface_luid,
+        unix_meta_matches_sysinfo,
     };
+    #[cfg(target_os = "linux")]
+    use crate::cpu::RunQueueEwma;
     use crate::math::clamped_rate_per_sec;
     use crate::{CollectError, SnapshotSource};
 
@@ -423,6 +466,10 @@ mod live {
         disks: Disks,
         networks: Networks,
         users: Users,
+        cpu_baseline_at: Instant,
+        cpu_measured: bool,
+        #[cfg(target_os = "linux")]
+        runq: RunQueueEwma,
         last_sample_at: Instant,
         last_users_refresh: Instant,
         prev_net_totals: HashMap<String, (u64, u64)>,
@@ -487,6 +534,10 @@ mod live {
                 disks,
                 networks,
                 users,
+                cpu_baseline_at: now,
+                cpu_measured: false,
+                #[cfg(target_os = "linux")]
+                runq: RunQueueEwma::default(),
                 last_sample_at: now,
                 last_users_refresh: now,
                 prev_net_totals,
@@ -494,7 +545,45 @@ mod live {
             })
         }
 
-        fn sample_cpu(&self) -> CpuSnapshot {
+        #[cfg(target_os = "linux")]
+        fn sample_run_queue_ewma(&mut self, elapsed_ms: u64) -> [f32; 3] {
+            let runnable = std::fs::read_to_string("/proc/stat")
+                .ok()
+                .and_then(|s| parse_linux_procs_running(&s))
+                .map_or(0, |n| n.saturating_sub(1));
+            #[allow(clippy::cast_precision_loss)]
+            let dt_secs = (elapsed_ms as f64) / 1000.0;
+            self.runq.update(runnable, dt_secs)
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        #[allow(clippy::unused_self)]
+        fn sample_run_queue_ewma(&mut self, _elapsed_ms: u64) -> [f32; 3] {
+            // On macOS, XNU `getloadavg` counts only runnable CPU threads (unlike Linux `/proc/loadavg`
+            // which includes uninterruptible disk I/O waiters).
+            System::load_average().ok().map_or([0.0; 3], |la| {
+                #[allow(clippy::cast_possible_truncation)]
+                [
+                    if la.one.is_finite() {
+                        la.one as f32
+                    } else {
+                        0.0
+                    },
+                    if la.five.is_finite() {
+                        la.five as f32
+                    } else {
+                        0.0
+                    },
+                    if la.fifteen.is_finite() {
+                        la.fifteen as f32
+                    } else {
+                        0.0
+                    },
+                ]
+            })
+        }
+
+        fn sample_cpu(&mut self, elapsed_ms: u64) -> CpuSnapshot {
             let cpus = self.sys.cpus();
             let model_name = cpus
                 .first()
@@ -538,26 +627,7 @@ mod live {
                 .checked_div(freq_count)
                 .and_then(|v| u32::try_from(v).ok());
 
-            let load_avg = System::load_average().ok().map_or([0.0; 3], |la| {
-                #[allow(clippy::cast_possible_truncation)]
-                [
-                    if la.one.is_finite() {
-                        la.one as f32
-                    } else {
-                        0.0
-                    },
-                    if la.five.is_finite() {
-                        la.five as f32
-                    } else {
-                        0.0
-                    },
-                    if la.fifteen.is_finite() {
-                        la.fifteen as f32
-                    } else {
-                        0.0
-                    },
-                ]
-            });
+            let run_queue_ewma = self.sample_run_queue_ewma(elapsed_ms);
 
             CpuSnapshot {
                 model_name,
@@ -567,7 +637,7 @@ mod live {
                 freq_range_mhz: None,
                 package_temp_celsius: None,
                 package_watts: None,
-                run_queue_ewma: load_avg,
+                run_queue_ewma,
                 uptime_secs: System::uptime().unwrap_or(0),
                 cores,
             }
@@ -709,12 +779,28 @@ mod live {
                     .user_id()
                     .and_then(|uid| self.users.get_user_by_id(uid))
                     .map(|u| u.name().to_owned());
-                let kernel_meta = query_unix_process_meta(raw_pid).ok();
-                let create_time_100ns = kernel_meta.map_or_else(
-                    || unix_start_time_secs_to_identity(proc_info.start_time()),
-                    |m| m.create_time_100ns,
-                );
-                let threads = kernel_meta.map_or_else(
+                // Cross-check kernel metadata against the `sysinfo` row (parent PID, start second,
+                // and `comm`) so a recycled PID can never mix an old row's display fields with a
+                // replacement process's actionable identity.
+                let verified_meta = match query_unix_process_meta(raw_pid) {
+                    Ok(meta) => {
+                        if !unix_meta_matches_sysinfo(
+                            parent_pid,
+                            proc_info.start_time(),
+                            &name,
+                            &meta,
+                        ) {
+                            continue;
+                        }
+                        Some(meta)
+                    }
+                    Err(ProcActionError::NotFound(_)) => continue,
+                    Err(_) => None,
+                };
+                // Fail closed (`create_time_100ns = 0`) if kernel metadata could not be verified
+                // (e.g. restricted permissions) so unverified rows can never be signaled.
+                let create_time_100ns = verified_meta.as_ref().map_or(0, |m| m.create_time_100ns);
+                let threads = verified_meta.as_ref().map_or_else(
                     || {
                         proc_info.tasks().map_or(1, |tasks| {
                             u32::try_from(tasks.len()).unwrap_or(u32::MAX).max(1)
@@ -722,11 +808,12 @@ mod live {
                     },
                     |m| m.num_threads.max(1),
                 );
-                let private_bytes = kernel_meta
+                let private_bytes = verified_meta
+                    .as_ref()
                     .and_then(|m| m.private_rss_bytes)
                     .unwrap_or_else(|| proc_info.memory());
                 let disk_io = proc_info.disk_usage();
-                let is_kernel = kernel_meta.is_some_and(|m| m.is_kernel_thread)
+                let is_kernel = verified_meta.as_ref().is_some_and(|m| m.is_kernel_thread)
                     || proc_info
                         .thread_kind()
                         .is_some_and(|k| matches!(k, sysinfo::ThreadKind::Kernel));
@@ -769,7 +856,13 @@ mod live {
                 self.last_users_refresh = now;
             }
 
-            self.sys.refresh_cpu_specifics(cpu_refresh_kind());
+            let cpu_ready = self.cpu_measured
+                || now.saturating_duration_since(self.cpu_baseline_at)
+                    >= MINIMUM_CPU_UPDATE_INTERVAL;
+            if cpu_ready {
+                self.sys.refresh_cpu_specifics(cpu_refresh_kind());
+                self.cpu_measured = true;
+            }
             self.sys
                 .refresh_memory_specifics(MemoryRefreshKind::everything());
             self.sys.refresh_processes_specifics(
@@ -785,8 +878,12 @@ mod live {
             )
             .unwrap_or(u64::MAX);
 
-            let cpu = self.sample_cpu();
-            let logical_cpus = cpu.cores.len().max(1);
+            let logical_cpus = self.sys.cpus().len().max(1);
+            let cpu_state = if cpu_ready {
+                DataState::Available(self.sample_cpu(elapsed_ms))
+            } else {
+                DataState::WarmingUp
+            };
             let mem = compute_unix_mem_snapshot(
                 self.sys.total_memory(),
                 self.sys.available_memory(),
@@ -804,7 +901,7 @@ mod live {
                 hostname: self.hostname.clone(),
                 username: self.username.clone(),
                 total_phys_mem_bytes,
-                cpu: DataState::Available(cpu),
+                cpu: cpu_state,
                 mem: DataState::Available(mem),
                 disks: DataState::Available(disks),
                 net: DataState::Available(net),
@@ -854,6 +951,12 @@ mod tests {
             "apfs",
             "/dev/disk4s1",
             1_000_000_000_000
+        ));
+        assert!(should_include_unix_disk(
+            "/run/media/franz/ExternalUSB",
+            "ext4",
+            "/dev/sdb1",
+            2_000_000_000_000
         ));
 
         assert!(!should_include_unix_disk(
@@ -1150,6 +1253,39 @@ mod tests {
         assert!((normalize_unix_cpu_pct(150.0) - 100.0).abs() < f32::EPSILON);
         assert!((normalize_unix_proc_cpu_pct(400.0, 8) - 50.0).abs() < 0.01);
         assert!((normalize_unix_proc_cpu_pct(-5.0, 8) - 0.0).abs() < f32::EPSILON);
+
+        let proc_stat = "cpu 1 2 3 4\nbtime 1700000000\nprocs_running 5\nprocs_blocked 12\n";
+        assert_eq!(parse_linux_procs_running(proc_stat), Some(5));
+        assert_eq!(parse_linux_procs_running("cpu 1 2 3\n"), None);
+
+        let meta = btop_sys::UnixProcessMeta {
+            comm: "systemd-journal".to_owned(),
+            parent_pid: 1,
+            start_time_secs: 1_700_000_100,
+            create_time_100ns: btop_sys::unix_start_time_secs_to_identity(1_700_000_100),
+            is_kernel_thread: false,
+            num_threads: 2,
+            private_rss_bytes: Some(4_096_000),
+        };
+        assert!(unix_meta_matches_sysinfo(
+            1,
+            1_700_000_100,
+            "systemd-journald",
+            &meta
+        ));
+        assert!(!unix_meta_matches_sysinfo(
+            2,
+            1_700_000_100,
+            "systemd-journald",
+            &meta
+        ));
+        assert!(!unix_meta_matches_sysinfo(
+            1,
+            1_700_000_110,
+            "systemd-journald",
+            &meta
+        ));
+        assert!(!unix_meta_matches_sysinfo(1, 1_700_000_100, "bash", &meta));
     }
 
     #[cfg(unix)]
@@ -1166,7 +1302,11 @@ mod tests {
         use crate::SnapshotSource as _;
 
         let mut collector = UnixLiveCollector::new().expect("init UnixLiveCollector");
-        let _warmup = collector.next_snapshot().expect("warmup tick");
+        let warmup = collector.next_snapshot().expect("warmup tick");
+        assert!(
+            matches!(warmup.cpu, DataState::WarmingUp),
+            "immediate first Unix sample inside MINIMUM_CPU_UPDATE_INTERVAL must report WarmingUp"
+        );
         thread::sleep(Duration::from_millis(250));
         let snap = collector.next_snapshot().expect("measured tick");
 

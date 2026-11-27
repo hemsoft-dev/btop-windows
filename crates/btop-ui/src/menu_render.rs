@@ -7,7 +7,7 @@ use btop_term::{Cell, Color, Grid, HitAction, Rect, Rgb, Size};
 
 use crate::menu::{
     HELP_BINDINGS, HelpState, MainMenuChoice, MainMenuState, MessageBoxKind, MessageBoxState,
-    OptionCategory, OptionId, OptionKind, OptionsState, OverlayMenu,
+    OptionCategory, OptionId, OptionKind, OptionsState, OverlayMenu, UNIX_HELP_BINDINGS,
 };
 use crate::proc_box::clip_text;
 use crate::theme::ThemePalette;
@@ -111,17 +111,29 @@ pub fn render_overlay_menu(
     config: &Config,
     theme: &ThemePalette,
 ) {
+    render_overlay_menu_for_platform(grid, menu, false, config, theme);
+}
+
+/// Renders the active [`OverlayMenu`] on top of the dimmed `grid`, selecting Unix or Windows
+/// keybinding descriptions for the Help overlay.
+pub fn render_overlay_menu_for_platform(
+    grid: &mut Grid,
+    menu: &OverlayMenu,
+    unix_help: bool,
+    config: &Config,
+    theme: &ThemePalette,
+) {
     dim_grid(grid, theme);
     match menu {
         OverlayMenu::Main(state) => render_main_menu(grid, state, config, theme),
         OverlayMenu::Options(state) => render_options_menu(grid, state, config, theme),
-        OverlayMenu::Help(state) => render_help_menu(grid, state, config, theme),
+        OverlayMenu::Help(state) => render_help_menu(grid, state, unix_help, config, theme),
         OverlayMenu::MessageBox { dialog, return_to } => {
             if let Some(parent) = return_to.as_deref() {
                 match parent {
                     OverlayMenu::Main(s) => render_main_menu(grid, s, config, theme),
                     OverlayMenu::Options(s) => render_options_menu(grid, s, config, theme),
-                    OverlayMenu::Help(s) => render_help_menu(grid, s, config, theme),
+                    OverlayMenu::Help(s) => render_help_menu(grid, s, unix_help, config, theme),
                     OverlayMenu::MessageBox { .. } => {}
                 }
                 dim_grid(grid, theme);
@@ -624,7 +636,18 @@ fn render_options_detail(
     }
 }
 
-fn render_help_menu(grid: &mut Grid, state: &HelpState, config: &Config, theme: &ThemePalette) {
+fn render_help_menu(
+    grid: &mut Grid,
+    state: &HelpState,
+    unix_help: bool,
+    config: &Config,
+    theme: &ThemePalette,
+) {
+    let bindings = if unix_help {
+        UNIX_HELP_BINDINGS
+    } else {
+        HELP_BINDINGS
+    };
     let rect = help_rect(grid.size());
     fill_rect(grid, rect, theme.main_fg, theme.main_bg);
     draw_box_frame(
@@ -636,13 +659,18 @@ fn render_help_menu(grid: &mut Grid, state: &HelpState, config: &Config, theme: 
     );
 
     let max_x = rect.x.saturating_add(rect.width - 1);
+    let title = if unix_help {
+        "Help & Unix Keybindings (F1)"
+    } else {
+        "Help & Windows 11 Keybindings (F1)"
+    };
     let _ = draw_border_tag(
         grid,
         rect.x.saturating_add(2),
         rect.y,
         max_x,
         None,
-        "Help & Windows 11 Keybindings (F1)",
+        title,
         theme.net_box,
         theme.title,
         theme.hi_fg,
@@ -670,19 +698,20 @@ fn render_help_menu(grid: &mut Grid, state: &HelpState, config: &Config, theme: 
     );
 
     let visible = usize::from(rect.height.saturating_sub(5)).max(1);
-    let start = state.scroll_offset.min(HelpState::max_scroll(visible));
+    let max_scroll = bindings.len().saturating_sub(visible);
+    let start = state.scroll_offset.min(max_scroll);
 
     for row in 0..visible {
-        let Some(entry) = HELP_BINDINGS.get(start + row) else {
+        let Some(entry) = bindings.get(start + row) else {
             break;
         };
         let y = rect.y.saturating_add(3 + u16::try_from(row).unwrap_or(0));
         if entry.is_section {
-            let title = clip_text(
+            let section_title = clip_text(
                 &format!("── {} ──", entry.key),
                 usize::from(rect.width.saturating_sub(4)),
             );
-            grid.write_str(key_x, y, &title, theme.net_box, theme.main_bg, true);
+            grid.write_str(key_x, y, &section_title, theme.net_box, theme.main_bg, true);
         } else {
             let k = clip_text(entry.key, key_w);
             let d = clip_text(entry.description, desc_w);
@@ -691,14 +720,14 @@ fn render_help_menu(grid: &mut Grid, state: &HelpState, config: &Config, theme: 
         }
     }
 
-    let end_idx = (start + visible).min(HELP_BINDINGS.len());
+    let end_idx = (start + visible).min(bindings.len());
     let footer_y = rect.y.saturating_add(rect.height.saturating_sub(2));
     let footer = clip_text(
         &format!(
             "↑↓ / PgUp / PgDn scroll ({}-{} of {})  |  Esc / q close",
             start + 1,
             end_idx,
-            HELP_BINDINGS.len()
+            bindings.len()
         ),
         usize::from(rect.width.saturating_sub(4)),
     );
