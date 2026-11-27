@@ -674,6 +674,12 @@ mod live {
         fn sample_processes(&self, logical_cpus: usize) -> Vec<ProcessEntry> {
             let mut entries = Vec::with_capacity(self.sys.processes().len());
             for (pid, proc_info) in self.sys.processes() {
+                // On Linux, `sysinfo` exposes individual userland threads (`ThreadKind::Userland`)
+                // alongside thread-group leaders. Skip them so multi-threaded processes do not
+                // appear as duplicate rows with repeated RSS or un-signalable TIDs.
+                if matches!(proc_info.thread_kind(), Some(sysinfo::ThreadKind::Userland)) {
+                    continue;
+                }
                 let raw_pid = pid.as_u32();
                 let parent_pid = proc_info.parent().map_or(0, sysinfo::Pid::as_u32);
                 let name = proc_info.name().to_string_lossy().into_owned();
