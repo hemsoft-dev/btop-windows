@@ -807,12 +807,12 @@ fn handle_unmodified_global_key(
     if try_open_menu_shortcut(code, config, ui_state, prev_grid) {
         return LoopAction::Redraw;
     }
-    if handle_layout_key(code, ui_state, prev_grid) {
+    if handle_layout_key_for_snapshot(code, snapshot, ui_state, prev_grid) {
         sampler.set_services_active(should_poll_services(size, ui_state));
         return LoopAction::Redraw;
     }
     if code == KeyCode::Char('S') {
-        return if toggle_services_view(size, ui_state, Some(sampler), prev_grid) {
+        return if toggle_services_view(size, snapshot, ui_state, Some(sampler), prev_grid) {
             LoopAction::Redraw
         } else {
             LoopAction::None
@@ -841,13 +841,33 @@ fn handle_unmodified_global_key(
     LoopAction::None
 }
 
+fn is_gpu_box_unavailable(snapshot: &btop_model::Snapshot, box_id: BoxId) -> bool {
+    let BoxId::Gpu(idx) = box_id else {
+        return false;
+    };
+    if let Some(state) = snapshot.gpus.get(usize::from(idx)) {
+        return matches!(state, DataState::Unavailable(_));
+    }
+    !snapshot.gpus.is_empty()
+        && snapshot
+            .gpus
+            .iter()
+            .all(|g| matches!(g, DataState::Unavailable(_)))
+}
+
 fn toggle_services_view(
     size: Size,
+    snapshot: &btop_model::Snapshot,
     ui_state: &mut UiState,
     sampler: Option<&Sampler>,
     prev_grid: &mut Option<Grid>,
 ) -> bool {
     if !has_proc_panel(size, ui_state) {
+        return false;
+    }
+    // Never replace the process list with an empty placeholder when OS services are unavailable
+    // (e.g. Linux/macOS v1), while still allowing an active Services view to toggle back off.
+    if !ui_state.services.active && matches!(snapshot.services, DataState::Unavailable(_)) {
         return false;
     }
     // Always exit any active filter editor on either side so a hidden panel never traps keys.
@@ -914,6 +934,11 @@ fn handle_mouse_event(
             let Some(box_id) = BoxId::parse(&name) else {
                 return false;
             };
+            if !ui_state.layout.shown_boxes.contains(&box_id)
+                && is_gpu_box_unavailable(snapshot, box_id)
+            {
+                return false;
+            }
             if ui_state.layout.toggle_box(box_id) {
                 if let Some(s) = sampler {
                     s.set_services_active(should_poll_services(size, ui_state));
@@ -976,7 +1001,9 @@ fn handle_mouse_event(
             ui_state.net.reset_session_totals(snapshot, history);
             true
         }
-        HitAction::ToggleServicesView => toggle_services_view(size, ui_state, sampler, prev_grid),
+        HitAction::ToggleServicesView => {
+            toggle_services_view(size, snapshot, ui_state, sampler, prev_grid)
+        }
         HitAction::ProcPrevSort => {
             if ui_state.services.active {
                 ui_state.services.prev_sort();
@@ -1568,6 +1595,30 @@ fn handle_filter_edit_key(code: KeyCode, ctrl: bool, alt: bool, ui_state: &mut U
         }
         _ => false,
     }
+}
+
+fn handle_layout_key_for_snapshot(
+    code: KeyCode,
+    snapshot: &btop_model::Snapshot,
+    ui_state: &mut UiState,
+    prev_grid: &mut Option<Grid>,
+) -> bool {
+    let gpu_box = match code {
+        KeyCode::Char('5') => Some(BoxId::Gpu(0)),
+        KeyCode::Char('6') => Some(BoxId::Gpu(1)),
+        KeyCode::Char('7') => Some(BoxId::Gpu(2)),
+        KeyCode::Char('8') => Some(BoxId::Gpu(3)),
+        KeyCode::Char('9') => Some(BoxId::Gpu(4)),
+        KeyCode::Char('0') => Some(BoxId::Gpu(5)),
+        _ => None,
+    };
+    if let Some(box_id) = gpu_box
+        && !ui_state.layout.shown_boxes.contains(&box_id)
+        && is_gpu_box_unavailable(snapshot, box_id)
+    {
+        return false;
+    }
+    handle_layout_key(code, ui_state, prev_grid)
 }
 
 fn handle_layout_key(code: KeyCode, ui_state: &mut UiState, prev_grid: &mut Option<Grid>) -> bool {
@@ -3532,5 +3583,45 @@ mod tests {
         assert!(effective_live_actions(false, Some(TEST_LIVE_ACTIONS)).is_none());
         assert!(effective_live_actions(false, None).is_none());
         assert!(effective_live_actions(true, Some(TEST_LIVE_ACTIONS)).is_some());
+    }
+
+    #[test]
+    fn unavailable_services_and_gpu_panels_cannot_take_over_layout() {
+        let size = Size {
+            width: 120,
+            height: 40,
+        };
+        let snap = btop_model::Snapshot {
+            services: DataState::Unavailable("unavailable on Unix".to_owned()),
+            gpus: vec![DataState::Unavailable("unavailable on Unix".to_owned())],
+            ..btop_model::Snapshot::default()
+        };
+        let mut state = UiState::default();
+        let mut prev_grid = None;
+
+        assert!(!toggle_services_view(
+            size,
+            &snap,
+            &mut state,
+            None,
+            &mut prev_grid
+        ));
+        assert!(!state.services.active);
+
+        for ch in ['5', '6', '7', '8', '9', '0'] {
+            assert!(!handle_layout_key_for_snapshot(
+                KeyCode::Char(ch),
+                &snap,
+                &mut state,
+                &mut prev_grid,
+            ));
+        }
+        assert!(
+            state
+                .layout
+                .shown_boxes
+                .iter()
+                .all(|b| !matches!(b, BoxId::Gpu(_)))
+        );
     }
 }

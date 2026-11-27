@@ -165,16 +165,13 @@ pub fn deduplicate_unix_disks(raw: Vec<RawUnixDisk>) -> Vec<DiskSnapshot> {
         }
         let dedup_key =
             if let Some(container) = apfs_container_key(&disk.fs_type, &disk.device_name) {
-                format!("apfs:dev:{container}:{}", disk.total_bytes)
-            } else if disk.fs_type.eq_ignore_ascii_case("apfs") {
-                // On macOS, `sysinfo::Disk::name()` returns the volume label (e.g. `"Macintosh HD"`)
-                // rather than `/dev/diskNsM`. Collapse the root OS volume (`/`) and its paired APFS
-                // data volume (`/System/Volumes/Data`) sharing the same container capacity into `/`.
-                if disk.mount_point == "/" || disk.mount_point == "/System/Volumes/Data" {
-                    format!("apfs:root:{}", disk.total_bytes)
-                } else {
-                    format!("apfs:vol:{}:{}", disk.device_name, disk.total_bytes)
-                }
+                format!("apfs:dev:{container}")
+            } else if disk.fs_type.eq_ignore_ascii_case("apfs")
+                && (disk.mount_point == "/" || disk.mount_point == "/System/Volumes/Data")
+            {
+                // Fallback when `statfs` is unavailable: only collapse the macOS boot root and
+                // its paired `/System/Volumes/Data` sibling sharing identical capacity.
+                format!("apfs:root:{}", disk.total_bytes)
             } else if disk.device_name.starts_with("/dev/") {
                 format!("dev:{}:{}", disk.device_name, disk.total_bytes)
             } else {
@@ -238,6 +235,7 @@ const IGNORED_IFACE_PREFIXES: &[&str] = &[
     "docker",
     "veth",
     "br-",
+    "vmbr",
     "virbr",
     "vnet",
     "cni",
@@ -265,16 +263,22 @@ fn is_loopback_iface(lower: &str) -> bool {
             .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
 }
 
+fn is_numbered_bridge_iface(lower: &str) -> bool {
+    lower
+        .strip_prefix("br")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Returns `true` for physical Unix network interfaces, excluding loopback (`lo`/`lo0`),
-/// Tailscale and VPN tunnels (`tailscale*`, `utun*`, `tun*`, `wg*`), Docker/VM virtual bridges
-/// (`docker*`, `veth*`, `br-*`, `virbr*`, `vnet*`), and Apple virtual peer interfaces.
+/// Tailscale and VPN tunnels (`tailscale*`, `utun*`, `tun*`, `wg*`), Docker/VM/software bridges
+/// (`docker*`, `veth*`, `br0`, `br-*`, `vmbr*`, `virbr*`, `vnet*`), and Apple virtual peer interfaces.
 pub fn should_include_unix_interface(name: &str) -> bool {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return false;
     }
     let lower = trimmed.to_ascii_lowercase();
-    if is_loopback_iface(&lower) {
+    if is_loopback_iface(&lower) || is_numbered_bridge_iface(&lower) {
         return false;
     }
     !IGNORED_IFACE_PREFIXES
@@ -351,7 +355,9 @@ mod live {
         CoreKind, CoreSample, CpuSnapshot, DataState, LogicalCpuId, NetInterfaceSnapshot,
         ProcessEntry, ProcessIdentity, Snapshot,
     };
-    use btop_sys::unix_start_time_secs_to_identity;
+    use btop_sys::{
+        query_unix_process_meta, unix_mount_device_name, unix_start_time_secs_to_identity,
+    };
     use sysinfo::{
         CpuRefreshKind, DiskRefreshKind, Disks, InterfaceOperationalState, MemoryRefreshKind,
         Networks, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind, Users,
@@ -573,9 +579,14 @@ mod live {
             let mut raw = Vec::with_capacity(self.disks.len());
 
             for disk in &self.disks {
-                let mount = disk.mount_point().to_string_lossy().into_owned();
+                let mount_path = disk.mount_point();
+                let mount = mount_path.to_string_lossy().into_owned();
                 let fs_type = disk.file_system().to_string_lossy().into_owned();
-                let device = disk.name().to_string_lossy().into_owned();
+                // On macOS, `sysinfo::Disk::name()` is the volume label rather than the BSD mount
+                // device; resolve the actual `/dev/diskNsM` path via `statfs(2)` so APFS container
+                // deduplication keys on real kernel containers.
+                let device = unix_mount_device_name(mount_path)
+                    .unwrap_or_else(|| disk.name().to_string_lossy().into_owned());
                 let usage = disk.usage();
                 let prev = self.prev_disk_totals.get(&mount).copied();
                 let (read_rate, write_rate) = disk_io_rate_bytes_per_sec(
@@ -615,6 +626,10 @@ mod live {
                 next_totals.insert(name.clone(), (rx_total, tx_total));
 
                 if !should_include_unix_interface(&name) {
+                    continue;
+                }
+                #[cfg(target_os = "linux")]
+                if std::path::Path::new(&format!("/sys/class/net/{name}/bridge")).exists() {
                     continue;
                 }
 
@@ -694,17 +709,31 @@ mod live {
                     .user_id()
                     .and_then(|uid| self.users.get_user_by_id(uid))
                     .map(|u| u.name().to_owned());
-                let threads = proc_info.tasks().map_or(1, |tasks| {
-                    u32::try_from(tasks.len()).unwrap_or(u32::MAX).max(1)
-                });
+                let kernel_meta = query_unix_process_meta(raw_pid).ok();
+                let create_time_100ns = kernel_meta.map_or_else(
+                    || unix_start_time_secs_to_identity(proc_info.start_time()),
+                    |m| m.create_time_100ns,
+                );
+                let threads = kernel_meta.map_or_else(
+                    || {
+                        proc_info.tasks().map_or(1, |tasks| {
+                            u32::try_from(tasks.len()).unwrap_or(u32::MAX).max(1)
+                        })
+                    },
+                    |m| m.num_threads.max(1),
+                );
+                let private_bytes = kernel_meta
+                    .and_then(|m| m.private_rss_bytes)
+                    .unwrap_or_else(|| proc_info.memory());
                 let disk_io = proc_info.disk_usage();
-                let is_kernel = proc_info
-                    .thread_kind()
-                    .is_some_and(|k| matches!(k, sysinfo::ThreadKind::Kernel));
+                let is_kernel = kernel_meta.is_some_and(|m| m.is_kernel_thread)
+                    || proc_info
+                        .thread_kind()
+                        .is_some_and(|k| matches!(k, sysinfo::ThreadKind::Kernel));
                 entries.push(ProcessEntry {
                     identity: ProcessIdentity {
                         pid: raw_pid,
-                        create_time_100ns: unix_start_time_secs_to_identity(proc_info.start_time()),
+                        create_time_100ns,
                     },
                     parent_pid,
                     name,
@@ -715,7 +744,7 @@ mod live {
                     user_denied: false,
                     threads,
                     cpu_pct: normalize_unix_proc_cpu_pct(proc_info.cpu_usage(), logical_cpus),
-                    working_set_private_bytes: proc_info.memory(),
+                    working_set_private_bytes: private_bytes,
                     io_read_bytes: disk_io.total_read_bytes,
                     io_write_bytes: disk_io.total_written_bytes,
                     is_protected: raw_pid <= 1 || is_kernel,
@@ -981,6 +1010,86 @@ mod tests {
     }
 
     #[test]
+    fn keeps_independent_apfs_disks_distinct_while_deduplicating_container_siblings() {
+        // Two independent APFS volumes with identical label and capacity on different containers
+        // (or without `/dev/diskN` device paths) must stay distinct, while sibling volumes sharing
+        // one non-root container (`/dev/disk4s1` and `/dev/disk4s2`) must collapse into one row.
+        let mac_multi_container = deduplicate_unix_disks(vec![
+            RawUnixDisk {
+                device_name: "/dev/disk4s1".to_owned(),
+                mount_point: "/Volumes/DataA".to_owned(),
+                fs_type: "apfs".to_owned(),
+                total_bytes: 2_000_000_000_000,
+                available_bytes: 1_200_000_000_000,
+                read_bytes_per_sec: None,
+                write_bytes_per_sec: None,
+            },
+            RawUnixDisk {
+                device_name: "/dev/disk4s2".to_owned(),
+                mount_point: "/Volumes/DataB".to_owned(),
+                fs_type: "apfs".to_owned(),
+                total_bytes: 2_000_000_000_000,
+                available_bytes: 1_200_000_000_000,
+                read_bytes_per_sec: None,
+                write_bytes_per_sec: None,
+            },
+            RawUnixDisk {
+                device_name: "/dev/disk5s1".to_owned(),
+                mount_point: "/Volumes/Backup".to_owned(),
+                fs_type: "apfs".to_owned(),
+                total_bytes: 2_000_000_000_000,
+                available_bytes: 1_200_000_000_000,
+                read_bytes_per_sec: None,
+                write_bytes_per_sec: None,
+            },
+            RawUnixDisk {
+                device_name: "SameLabel".to_owned(),
+                mount_point: "/Volumes/DiskOne".to_owned(),
+                fs_type: "apfs".to_owned(),
+                total_bytes: 1_000_000_000_000,
+                available_bytes: 500_000_000_000,
+                read_bytes_per_sec: None,
+                write_bytes_per_sec: None,
+            },
+            RawUnixDisk {
+                device_name: "SameLabel".to_owned(),
+                mount_point: "/Volumes/DiskTwo".to_owned(),
+                fs_type: "apfs".to_owned(),
+                total_bytes: 1_000_000_000_000,
+                available_bytes: 500_000_000_000,
+                read_bytes_per_sec: None,
+                write_bytes_per_sec: None,
+            },
+        ]);
+        assert_eq!(mac_multi_container.len(), 4);
+        assert!(
+            mac_multi_container
+                .iter()
+                .any(|d| d.mount == "/Volumes/DataA")
+        );
+        assert!(
+            !mac_multi_container
+                .iter()
+                .any(|d| d.mount == "/Volumes/DataB")
+        );
+        assert!(
+            mac_multi_container
+                .iter()
+                .any(|d| d.mount == "/Volumes/Backup")
+        );
+        assert!(
+            mac_multi_container
+                .iter()
+                .any(|d| d.mount == "/Volumes/DiskOne")
+        );
+        assert!(
+            mac_multi_container
+                .iter()
+                .any(|d| d.mount == "/Volumes/DiskTwo")
+        );
+    }
+
+    #[test]
     fn filters_loopback_tailscale_docker_and_virtual_unix_interfaces() {
         for physical in [
             "eth0", "enp2s0", "eno1", "ens33", "wlan0", "wlp3s0", "en0", "en1",
@@ -998,7 +1107,10 @@ mod tests {
             "utun8",
             "docker0",
             "veth4a1b2c3",
+            "br0",
+            "br1",
             "br-98765432",
+            "vmbr0",
             "virbr0",
             "vnet0",
             "wg0",
@@ -1084,13 +1196,41 @@ mod tests {
         match &snap.processes {
             DataState::Available(procs) => {
                 let my_pid = std::process::id();
+                let mine = procs
+                    .iter()
+                    .find(|p| p.identity.pid == my_pid)
+                    .expect("expected current process PID in Unix process list");
                 assert!(
-                    procs.iter().any(|p| p.identity.pid == my_pid),
-                    "expected current process PID {my_pid} in Unix process list"
+                    mine.identity.create_time_100ns > btop_sys::WINDOWS_TO_UNIX_EPOCH_100NS,
+                    "Unix ProcessIdentity must use FILETIME 1601 epoch"
                 );
+                assert!(mine.threads >= 1);
             }
             other => panic!("expected Available processes on Unix, got {other:?}"),
         }
+
+        // End-to-end verification: identity collected by `UnixLiveCollector` must match
+        // `btop_sys::graceful_close_process` directly (independent of the guard's own helper).
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn disposable sleep child");
+        let child_pid = child.id();
+        let snap_with_child = collector.next_snapshot().expect("snapshot with child");
+        let child_identity = match &snap_with_child.processes {
+            DataState::Available(procs) => procs
+                .iter()
+                .find(|p| p.identity.pid == child_pid)
+                .map(|p| p.identity)
+                .expect("child process present in UnixLiveCollector snapshot"),
+            other => panic!("expected Available processes, got {other:?}"),
+        };
+        assert_eq!(
+            btop_sys::graceful_close_process(child_identity.pid, child_identity.create_time_100ns),
+            Ok(1)
+        );
+        let status = child.wait().expect("reap signaled child");
+        assert!(!status.success());
 
         assert!(matches!(snap.services, DataState::Unavailable(_)));
         assert!(matches!(snap.battery, DataState::Unavailable(_)));

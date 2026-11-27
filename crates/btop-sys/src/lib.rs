@@ -41,11 +41,16 @@ pub use nvml::{
 };
 pub use pdh::{CpuPdhQuery, CpuPdhSample};
 pub use power::{RawPowerStatus, local_utc_offset_secs, query_system_power_status};
+#[cfg(unix)]
+pub use proc_actions::query_unix_process_meta;
 pub use proc_actions::{
-    PriorityClass, PriorityUpdateOutcome, ProcActionError, graceful_close_process,
-    guard_process_identity, guard_terminate_decision, guard_unix_signal_decision,
-    is_linux_kernel_thread, parse_linux_proc_stat_identity, query_process_priority,
-    set_process_priority, terminate_process, unix_start_time_secs_to_identity,
+    LinuxProcStat, PriorityClass, PriorityUpdateOutcome, ProcActionError, UnixProcessMeta,
+    WINDOWS_TO_UNIX_EPOCH_100NS, graceful_close_process, guard_process_identity,
+    guard_terminate_decision, guard_unix_signal_decision, is_linux_kernel_thread,
+    is_macos_system_process, parse_linux_proc_stat_bytes, parse_linux_proc_stat_identity,
+    parse_linux_proc_statm_private_bytes, query_process_priority, set_process_priority,
+    terminate_process, unix_linux_ticks_to_identity, unix_start_time_secs_to_identity,
+    unix_timeval_to_identity,
 };
 pub use proc_info::{
     ProcFieldQuery, RawProcessMetadata, SidAccountCache, SystemProcessIdInformation,
@@ -1561,6 +1566,31 @@ pub use win::{
     query_self_private_working_set_bytes, read_cpu_model_name, read_cpu_nominal_mhz,
     system_uptime_secs, total_physical_memory_bytes,
 };
+
+/// Resolves the underlying BSD mount source device path (e.g. `"/dev/disk3s1s1"`) for a mounted
+/// filesystem path on macOS via `statfs(2)` so APFS container deduplication keys on real kernel
+/// container devices instead of volume labels.
+#[cfg(target_os = "macos")]
+pub fn unix_mount_device_name(mount_point: &std::path::Path) -> Option<String> {
+    use std::ffi::{CStr, CString};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let c_path = CString::new(mount_point.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statfs = unsafe { core::mem::zeroed() };
+    // SAFETY: Valid NUL-terminated path and aligned `statfs` output buffer.
+    if unsafe { libc::statfs(c_path.as_ptr(), &raw mut stat) } != 0 {
+        return None;
+    }
+    // SAFETY: `f_mntfromname` is guaranteed NUL-terminated by `statfs(2)`.
+    let dev = unsafe { CStr::from_ptr(stat.f_mntfromname.as_ptr()) };
+    let text = dev.to_string_lossy();
+    (!text.is_empty()).then(|| text.into_owned())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn unix_mount_device_name(_mount_point: &std::path::Path) -> Option<String> {
+    None
+}
 
 #[cfg(test)]
 mod tests {

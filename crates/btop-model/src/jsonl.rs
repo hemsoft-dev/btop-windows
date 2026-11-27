@@ -104,11 +104,21 @@ impl SnapshotRecorder {
     /// separator is written before the first appended snapshot so existing JSONL records
     /// remain intact.
     pub fn open(path: &Path) -> Result<Self, JsonlError> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let mut opts = OpenOptions::new();
+        opts.read(true).create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            // Tighten pre-existing files as well so recordings containing process command lines
+            // are never left group- or world-readable.
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         let mut needs_leading_newline = false;
         if file.metadata()?.len() > 0 {
             file.seek(SeekFrom::End(-1))?;
@@ -269,5 +279,33 @@ mod tests {
         let loaded = parse_jsonl_file(&path).expect("reloaded stream must stay valid");
         let _ = std::fs::remove_file(&path);
         assert_eq!(loaded, fixtures);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorder_restricts_unix_file_mode_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let unique = format!(
+            "btop-windows-mode-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        );
+        let path = std::env::temp_dir().join(unique);
+        let fixtures = win11_8core_single_gpu_desktop();
+
+        let recorder = SnapshotRecorder::open(&path).expect("open recorder");
+        recorder.record(fixtures[0].clone());
+        let _ = recorder.finish().expect("finish recorder");
+
+        let mode = std::fs::metadata(&path)
+            .expect("stat recording")
+            .permissions()
+            .mode()
+            & 0o777;
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(mode, 0o600);
     }
 }

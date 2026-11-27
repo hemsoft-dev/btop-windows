@@ -171,14 +171,50 @@ pub fn guard_process_identity(
     Ok(())
 }
 
+/// Windows `FILETIME` epoch (`1601-01-01`) to Unix epoch (`1970-01-01`) offset in 100ns ticks.
+pub const WINDOWS_TO_UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
+
 /// Converts a Unix process start timestamp in whole seconds since the Unix epoch into the
-/// 100-nanosecond identity representation stored in `ProcessIdentity::create_time_100ns`.
+/// Windows `FILETIME`-epoch 100-nanosecond representation stored in `ProcessIdentity::create_time_100ns`.
+///
+/// Returns `0` when `start_time_secs == 0` so unknown start times remain distinguishable.
 pub const fn unix_start_time_secs_to_identity(start_time_secs: u64) -> u64 {
-    start_time_secs.saturating_mul(10_000_000)
+    if start_time_secs == 0 {
+        return 0;
+    }
+    WINDOWS_TO_UNIX_EPOCH_100NS.saturating_add(start_time_secs.saturating_mul(10_000_000))
+}
+
+/// Converts a Linux boot time (`btime` in seconds since 1970) plus per-process `/proc/<pid>/stat`
+/// `starttime` jiffies into a sub-second `FILETIME`-epoch 100ns identity.
+pub fn unix_linux_ticks_to_identity(btime_secs: u64, starttime_ticks: u64, clk_tck: u64) -> u64 {
+    if btime_secs == 0 || clk_tck == 0 {
+        return 0;
+    }
+    let ticks_100ns =
+        u64::try_from((u128::from(starttime_ticks) * 10_000_000) / u128::from(clk_tck))
+            .unwrap_or(u64::MAX);
+    WINDOWS_TO_UNIX_EPOCH_100NS
+        .saturating_add(btime_secs.saturating_mul(10_000_000))
+        .saturating_add(ticks_100ns)
+}
+
+/// Converts a macOS `proc_bsdinfo` `(pbi_start_tvsec, pbi_start_tvusec)` pair into a
+/// microsecond-precision `FILETIME`-epoch 100ns identity.
+pub const fn unix_timeval_to_identity(seconds: u64, micros: u64) -> u64 {
+    if seconds == 0 && micros == 0 {
+        return 0;
+    }
+    WINDOWS_TO_UNIX_EPOCH_100NS
+        .saturating_add(seconds.saturating_mul(10_000_000))
+        .saturating_add(micros.saturating_mul(10))
 }
 
 /// Linux `PF_KTHREAD` process flag from `<linux/sched.h>` (`0x0020_0000`).
 const LINUX_PF_KTHREAD: u64 = 0x0020_0000;
+
+/// XNU `PROC_FLAG_SYSTEM` bit in `proc_bsdinfo::pbi_flags` (`<sys/proc_info.h>` = `0x0000_0001`).
+const MACOS_PROC_FLAG_SYSTEM: u32 = 0x0000_0001;
 
 /// Returns `true` when Linux `/proc/<pid>/stat` metadata identifies a kernel thread (`kthreadd`
 /// PID 2, direct children of PID 2, or any task carrying `PF_KTHREAD`).
@@ -186,19 +222,67 @@ pub const fn is_linux_kernel_thread(pid: u32, parent_pid: u32, flags: u64) -> bo
     pid == 2 || parent_pid == 2 || (flags & LINUX_PF_KTHREAD) != 0
 }
 
-/// Parses `(parent_pid, flags, starttime_ticks)` from one Linux `/proc/<pid>/stat` line, locating
-/// the final `')'` delimiter so process names containing spaces or parentheses never shift fields.
-pub fn parse_linux_proc_stat_identity(stat_line: &str) -> Option<(u32, u64, u64)> {
-    let close_idx = stat_line.rfind(')')?;
-    let rest = stat_line.get(close_idx + 1..)?.trim_start();
-    let mut fields = rest.split_whitespace();
+/// Returns `true` when macOS `proc_bsdinfo::pbi_flags` carries `PROC_FLAG_SYSTEM` (`0x1`).
+pub const fn is_macos_system_process(pbi_flags: u32) -> bool {
+    (pbi_flags & MACOS_PROC_FLAG_SYSTEM) != 0
+}
+
+/// Parsed fields from one Linux `/proc/<pid>/stat` record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinuxProcStat {
+    pub parent_pid: u32,
+    pub flags: u64,
+    pub num_threads: u32,
+    pub starttime_ticks: u64,
+}
+
+/// Parses `(parent_pid, flags, num_threads, starttime_ticks)` from raw `/proc/<pid>/stat` bytes,
+/// locating the final `b')'` delimiter so arbitrary non-UTF-8 or parenthesized `comm` names never
+/// fail or shift numeric fields.
+pub fn parse_linux_proc_stat_bytes(stat_bytes: &[u8]) -> Option<LinuxProcStat> {
+    let close_idx = stat_bytes.iter().rposition(|&b| b == b')')?;
+    let tail = std::str::from_utf8(stat_bytes.get(close_idx + 1..)?).ok()?;
+    let mut fields = tail.split_whitespace();
     let _state = fields.next()?;
     let parent_pid = fields.next()?.parse::<u32>().ok()?;
-    // After `state` (0) and `parent_pid` (1): skip pgrp(2), session(3), tty_nr(4), tpgid(5) -> flags(6).
+    // After `state`(0) and `parent_pid`(1): skip pgrp(2), session(3), tty_nr(4), tpgid(5) -> flags(6).
     let flags = fields.nth(4)?.parse::<u64>().ok()?;
-    // After `flags` (6): skip 12 fields (7..=18) -> starttime(19).
-    let starttime_ticks = fields.nth(12)?.parse::<u64>().ok()?;
-    Some((parent_pid, flags, starttime_ticks))
+    // After `flags`(6): skip minflt..=nice (10 fields, 7..=16) -> num_threads(17).
+    let num_threads = fields.nth(10)?.parse::<u32>().ok()?.max(1);
+    // After `num_threads`(17): skip itrealvalue(18) -> starttime(19).
+    let starttime_ticks = fields.nth(1)?.parse::<u64>().ok()?;
+    Some(LinuxProcStat {
+        parent_pid,
+        flags,
+        num_threads,
+        starttime_ticks,
+    })
+}
+
+/// Parses `(parent_pid, flags, starttime_ticks)` from a UTF-8 `/proc/<pid>/stat` line.
+pub fn parse_linux_proc_stat_identity(stat_line: &str) -> Option<(u32, u64, u64)> {
+    let parsed = parse_linux_proc_stat_bytes(stat_line.as_bytes())?;
+    Some((parsed.parent_pid, parsed.flags, parsed.starttime_ticks))
+}
+
+/// Computes private resident bytes `(resident - shared) * page_size` from Linux `/proc/<pid>/statm`.
+pub fn parse_linux_proc_statm_private_bytes(statm: &str, page_size: u64) -> Option<u64> {
+    let mut fields = statm.split_whitespace();
+    let _size = fields.next()?.parse::<u64>().ok()?;
+    let resident = fields.next()?.parse::<u64>().ok()?;
+    let shared = fields.next()?.parse::<u64>().ok()?;
+    Some(resident.saturating_sub(shared).saturating_mul(page_size))
+}
+
+/// Live per-process metadata queried from the Unix kernel so telemetry collection and guarded
+/// signal delivery share identical sub-second start-time identities, thread counts, and private
+/// memory accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnixProcessMeta {
+    pub create_time_100ns: u64,
+    pub is_kernel_thread: bool,
+    pub num_threads: u32,
+    pub private_rss_bytes: Option<u64>,
 }
 
 /// Pure safety gate evaluated before sending `SIGTERM` or `SIGKILL` to a Unix PID.
@@ -564,7 +648,12 @@ mod unix {
     }
 
     #[cfg(target_os = "linux")]
-    fn read_linux_boot_time_secs() -> Result<u64, ProcActionError> {
+    fn cached_linux_boot_time_secs() -> Result<u64, ProcActionError> {
+        use std::sync::OnceLock;
+        static BOOT_TIME: OnceLock<u64> = OnceLock::new();
+        if let Some(&secs) = BOOT_TIME.get() {
+            return Ok(secs);
+        }
         let content = std::fs::read_to_string("/proc/stat").map_err(|err| {
             ProcActionError::Platform(format!("failed to read /proc/stat for btime: {err}"))
         })?;
@@ -572,7 +661,8 @@ mod unix {
             if let Some(rest) = line.strip_prefix("btime ")
                 && let Ok(secs) = rest.trim().parse::<u64>()
             {
-                return Ok(secs);
+                let _ = BOOT_TIME.set(secs);
+                return Ok(*BOOT_TIME.get().unwrap_or(&secs));
             }
         }
         Err(ProcActionError::Platform(
@@ -581,32 +671,59 @@ mod unix {
     }
 
     #[cfg(target_os = "linux")]
-    fn query_unix_process_meta(pid: u32) -> Result<(u64, bool), ProcActionError> {
+    fn cached_linux_clk_tck() -> u64 {
+        use std::sync::OnceLock;
+        static CLK_TCK: OnceLock<u64> = OnceLock::new();
+        *CLK_TCK.get_or_init(|| {
+            // SAFETY: Querying POSIX clock ticks per second.
+            let raw = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+            u64::try_from(raw).ok().filter(|&v| v > 0).unwrap_or(100)
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cached_linux_page_size() -> u64 {
+        use std::sync::OnceLock;
+        static PAGE_SIZE: OnceLock<u64> = OnceLock::new();
+        *PAGE_SIZE.get_or_init(|| {
+            // SAFETY: Querying OS page size.
+            let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            u64::try_from(raw).ok().filter(|&v| v > 0).unwrap_or(4096)
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn query_unix_process_meta(pid: u32) -> Result<super::UnixProcessMeta, ProcActionError> {
         let stat_path = format!("/proc/{pid}/stat");
-        let stat_line = std::fs::read_to_string(&stat_path).map_err(|err| match err.kind() {
+        // Read raw bytes so process names containing non-UTF-8 bytes never fail parsing.
+        let stat_bytes = std::fs::read(&stat_path).map_err(|err| match err.kind() {
             std::io::ErrorKind::NotFound => ProcActionError::NotFound(pid),
             std::io::ErrorKind::PermissionDenied => ProcActionError::AccessDenied(pid),
             _ => ProcActionError::Platform(format!("failed to read {stat_path}: {err}")),
         })?;
-        let (parent_pid, flags, starttime_ticks) =
-            super::parse_linux_proc_stat_identity(&stat_line).ok_or_else(|| {
-                ProcActionError::Platform(format!("malformed /proc/{pid}/stat record"))
-            })?;
-        let clk_tck = {
-            // SAFETY: Querying POSIX clock ticks per second.
-            let raw = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-            u64::try_from(raw).ok().filter(|&v| v > 0).unwrap_or(100)
-        };
-        let btime = read_linux_boot_time_secs()?;
-        let start_secs = btime.saturating_add(starttime_ticks / clk_tck);
-        let is_kthread = super::is_linux_kernel_thread(pid, parent_pid, flags);
-        Ok((unix_start_time_secs_to_identity(start_secs), is_kthread))
+        let parsed = super::parse_linux_proc_stat_bytes(&stat_bytes).ok_or_else(|| {
+            ProcActionError::Platform(format!("malformed /proc/{pid}/stat record"))
+        })?;
+        let clk_tck = cached_linux_clk_tck();
+        let btime = cached_linux_boot_time_secs()?;
+        let create_time_100ns =
+            super::unix_linux_ticks_to_identity(btime, parsed.starttime_ticks, clk_tck);
+        let is_kernel_thread = super::is_linux_kernel_thread(pid, parsed.parent_pid, parsed.flags);
+        let private_rss_bytes = std::fs::read_to_string(format!("/proc/{pid}/statm"))
+            .ok()
+            .and_then(|s| {
+                super::parse_linux_proc_statm_private_bytes(&s, cached_linux_page_size())
+            });
+        Ok(super::UnixProcessMeta {
+            create_time_100ns,
+            is_kernel_thread,
+            num_threads: parsed.num_threads,
+            private_rss_bytes,
+        })
     }
 
     #[cfg(target_os = "macos")]
-    fn query_unix_process_meta(pid: u32) -> Result<(u64, bool), ProcActionError> {
-        const P_SYSTEM: u32 = 0x0000_0200;
-
+    pub fn query_unix_process_meta(pid: u32) -> Result<super::UnixProcessMeta, ProcActionError> {
         let Ok(c_pid) = libc::c_int::try_from(pid) else {
             return Err(ProcActionError::NotFound(pid));
         };
@@ -629,15 +746,51 @@ mod unix {
             }
             return Err(map_errno(pid, err, "proc_pidinfo"));
         }
-        let is_kthread = (info.pbi_flags & P_SYSTEM) != 0;
-        Ok((
-            unix_start_time_secs_to_identity(info.pbi_start_tvsec),
-            is_kthread,
-        ))
+
+        let mut num_threads = 1u32;
+        let mut task_info: libc::proc_taskinfo = unsafe { core::mem::zeroed() };
+        let task_size = i32::try_from(size_of::<libc::proc_taskinfo>()).unwrap_or(0);
+        // SAFETY: Valid output buffer for `PROC_PIDTASKINFO` of exact size `task_size`.
+        let task_rc = unsafe {
+            libc::proc_pidinfo(
+                c_pid,
+                libc::PROC_PIDTASKINFO,
+                0,
+                (&raw mut task_info).cast::<libc::c_void>(),
+                task_size,
+            )
+        };
+        if task_rc > 0 && task_info.pti_threadnum > 0 {
+            num_threads = u32::try_from(task_info.pti_threadnum).unwrap_or(1);
+        }
+
+        let mut private_rss_bytes = None;
+        let mut rusage: libc::rusage_info_v4 = unsafe { core::mem::zeroed() };
+        // SAFETY: Valid `rusage_info_v4` buffer for `RUSAGE_INFO_V4` (`ri_phys_footprint`).
+        let rusage_rc = unsafe {
+            libc::proc_pid_rusage(
+                c_pid,
+                libc::RUSAGE_INFO_V4,
+                (&raw mut rusage).cast::<libc::rusage_info_t>(),
+            )
+        };
+        if rusage_rc == 0 {
+            private_rss_bytes = Some(rusage.ri_phys_footprint);
+        }
+
+        Ok(super::UnixProcessMeta {
+            create_time_100ns: super::unix_timeval_to_identity(
+                info.pbi_start_tvsec,
+                info.pbi_start_tvusec,
+            ),
+            is_kernel_thread: super::is_macos_system_process(info.pbi_flags),
+            num_threads,
+            private_rss_bytes,
+        })
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    fn query_unix_process_meta(_pid: u32) -> Result<(u64, bool), ProcActionError> {
+    pub fn query_unix_process_meta(_pid: u32) -> Result<super::UnixProcessMeta, ProcActionError> {
         Err(ProcActionError::Platform(
             "process start-time verification is only implemented on Linux and macOS".to_owned(),
         ))
@@ -662,54 +815,64 @@ mod unix {
             return Err(ProcActionError::NotFound(pid));
         };
 
-        // Hold a `pidfd` across `/proc/<pid>/stat` inspection and signal delivery so PID reuse
-        // cannot redirect the signal to a newly spawned process (falling back to `kill` only on
-        // kernels without `pidfd_open`).
+        // Fail closed when the kernel lacks `pidfd_open` instead of falling back to racy bare `kill`.
         // SAFETY: Invoking Linux `SYS_pidfd_open(pid, 0)`.
         let pidfd_rc = unsafe { libc::syscall(libc::SYS_pidfd_open, raw_pid, 0 as libc::c_uint) };
-        let pidfd = if pidfd_rc >= 0 {
-            Some(OwnedFd(i32::try_from(pidfd_rc).unwrap_or(-1)))
-        } else {
+        if pidfd_rc < 0 {
             let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
             if err == libc::ENOSYS {
-                None
-            } else {
-                return Err(map_errno(pid, err, "pidfd_open"));
+                return Err(ProcActionError::Platform(
+                    "kernel lacks pidfd_open required for PID-reuse-safe signaling".to_owned(),
+                ));
             }
-        };
+            return Err(map_errno(pid, err, "pidfd_open"));
+        }
+        let pidfd = OwnedFd(i32::try_from(pidfd_rc).unwrap_or(-1));
 
-        let (actual_create_time_100ns, is_kernel_thread) = query_unix_process_meta(pid)?;
+        let meta = query_unix_process_meta(pid)?;
         guard_unix_signal_decision(
             pid,
             expected_create_time_100ns,
-            actual_create_time_100ns,
-            is_kernel_thread,
+            meta.create_time_100ns,
+            meta.is_kernel_thread,
         )?;
 
-        if let Some(ref fd) = pidfd {
-            // SAFETY: Delivering `sig` through a verified, pinned `pidfd`.
-            let rc = unsafe {
-                libc::syscall(
-                    libc::SYS_pidfd_send_signal,
-                    fd.0,
-                    sig,
-                    core::ptr::null::<libc::c_void>(),
-                    0 as libc::c_uint,
-                )
-            };
-            if rc == 0 {
-                return Ok(());
-            }
+        // Confirm the pinned `pidfd` has not become readable (exited) before signaling; if it is
+        // still alive, `/proc/<pid>/stat` is guaranteed to belong to this exact `struct pid`.
+        let mut pfd = libc::pollfd {
+            fd: pidfd.0,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: Valid single-element `pollfd` slice with immediate timeout 0.
+        let poll_rc = unsafe { libc::poll(&raw mut pfd, 1, 0) };
+        if poll_rc < 0 {
             let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            if err != libc::ENOSYS {
-                return Err(map_errno(pid, err, "pidfd_send_signal"));
-            }
+            return Err(map_errno(pid, err, "poll(pidfd)"));
+        }
+        if poll_rc > 0 && (pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0 {
+            return Err(ProcActionError::NotFound(pid));
         }
 
-        // SAFETY: Verified non-critical target PID with matching start time.
-        if unsafe { libc::kill(raw_pid, sig) } != 0 {
+        // SAFETY: Delivering `sig` strictly through the verified, pinned `pidfd` (no bare `kill`).
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd.0,
+                sig,
+                core::ptr::null::<libc::c_void>(),
+                0 as libc::c_uint,
+            )
+        };
+        if rc != 0 {
             let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            return Err(map_errno(pid, err, "kill"));
+            if err == libc::ENOSYS {
+                return Err(ProcActionError::Platform(
+                    "kernel lacks pidfd_send_signal required for PID-reuse-safe signaling"
+                        .to_owned(),
+                ));
+            }
+            return Err(map_errno(pid, err, "pidfd_send_signal"));
         }
         Ok(())
     }
@@ -733,18 +896,50 @@ mod unix {
             return Err(ProcActionError::NotFound(pid));
         };
 
-        let (actual_create_time_100ns, is_kernel_thread) = query_unix_process_meta(pid)?;
+        // Pre-verify microsecond start time and `PROC_FLAG_SYSTEM` before touching the process.
+        let meta = query_unix_process_meta(pid)?;
         guard_unix_signal_decision(
             pid,
             expected_create_time_100ns,
-            actual_create_time_100ns,
-            is_kernel_thread,
+            meta.create_time_100ns,
+            meta.is_kernel_thread,
         )?;
 
-        // SAFETY: Verified non-critical target PID with matching start time.
+        // Darwin lacks a `pidfd` syscall; freeze the target with `SIGSTOP` so it cannot voluntarily
+        // exit and recycle its PID, then re-verify microsecond identity before delivering `sig`.
+        // SAFETY: Target already passed pre-verification; `SIGSTOP` is non-destructive and reversed
+        // with `SIGCONT` if re-verification detects any mismatch.
+        if unsafe { libc::kill(raw_pid, libc::SIGSTOP) } != 0 {
+            let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            return Err(map_errno(pid, err, "kill(SIGSTOP)"));
+        }
+
+        let recheck = query_unix_process_meta(pid).and_then(|verified| {
+            guard_unix_signal_decision(
+                pid,
+                expected_create_time_100ns,
+                verified.create_time_100ns,
+                verified.is_kernel_thread,
+            )
+        });
+        if let Err(err) = recheck {
+            // SAFETY: Resume the non-matching process untouched before returning the guard error.
+            let _ = unsafe { libc::kill(raw_pid, libc::SIGCONT) };
+            return Err(err);
+        }
+
+        // SAFETY: Target is stopped and re-verified with matching microsecond start time.
         if unsafe { libc::kill(raw_pid, sig) } != 0 {
             let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if sig != libc::SIGKILL {
+                let _ = unsafe { libc::kill(raw_pid, libc::SIGCONT) };
+            }
             return Err(map_errno(pid, err, "kill"));
+        }
+        if sig != libc::SIGKILL {
+            // Wake the stopped target so it immediately handles `SIGTERM`.
+            // SAFETY: Target is the verified process that just received `SIGTERM`.
+            let _ = unsafe { libc::kill(raw_pid, libc::SIGCONT) };
         }
         Ok(())
     }
@@ -752,7 +947,7 @@ mod unix {
     /// Queries the live start-time identity (`create_time_100ns`) for `pid` on Unix.
     #[cfg(test)]
     pub(crate) fn query_start_time_100ns(pid: u32) -> Result<u64, ProcActionError> {
-        query_unix_process_meta(pid).map(|(start, _)| start)
+        query_unix_process_meta(pid).map(|meta| meta.create_time_100ns)
     }
 
     pub fn query_process_priority(
@@ -795,7 +990,8 @@ mod unix {
 
 #[cfg(unix)]
 pub use unix::{
-    graceful_close_process, query_process_priority, set_process_priority, terminate_process,
+    graceful_close_process, query_process_priority, query_unix_process_meta, set_process_priority,
+    terminate_process,
 };
 
 #[cfg(not(any(windows, unix)))]
@@ -947,18 +1143,69 @@ mod tests {
     }
 
     #[test]
-    fn parses_linux_proc_stat_with_spaces_and_parentheses_in_comm() {
+    fn parses_linux_proc_stat_with_spaces_parentheses_and_non_utf8_bytes() {
         let stat =
-            "1234 (kworker/0:1 (events)) S 2 0 0 0 -1 69238880 0 0 0 0 0 0 0 0 20 0 1 0 98765 0 0";
-        let (parent_pid, flags, starttime) =
-            parse_linux_proc_stat_identity(stat).expect("parse /proc/stat line");
-        assert_eq!(parent_pid, 2);
-        assert_eq!(flags, 69_238_880);
-        assert_eq!(starttime, 98_765);
-        assert!(is_linux_kernel_thread(1234, parent_pid, flags));
+            "1234 (kworker/0:1 (events)) S 2 0 0 0 -1 69238880 0 0 0 0 0 0 0 0 20 0 7 0 98765 0 0";
+        let parsed = parse_linux_proc_stat_bytes(stat.as_bytes()).expect("parse /proc/stat line");
+        assert_eq!(parsed.parent_pid, 2);
+        assert_eq!(parsed.flags, 69_238_880);
+        assert_eq!(parsed.num_threads, 7);
+        assert_eq!(parsed.starttime_ticks, 98_765);
+        assert_eq!(
+            parse_linux_proc_stat_identity(stat),
+            Some((2, 69_238_880, 98_765))
+        );
+        assert!(is_linux_kernel_thread(
+            1234,
+            parsed.parent_pid,
+            parsed.flags
+        ));
         assert!(is_linux_kernel_thread(2, 0, 0));
         assert!(is_linux_kernel_thread(555, 1, 0x0020_0000));
         assert!(!is_linux_kernel_thread(555, 1, 0x0040_0000));
+
+        // Non-UTF-8 comm bytes must still parse cleanly because we locate the final `b')'`.
+        let mut raw = b"4242 (bad\xff\xfe)name) R 1 4242 4242 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 4 0 123456 0 0"
+            .to_vec();
+        let non_utf8 = parse_linux_proc_stat_bytes(&raw).expect("parse non-utf8 /proc/stat");
+        assert_eq!(non_utf8.parent_pid, 1);
+        assert_eq!(non_utf8.num_threads, 4);
+        assert_eq!(non_utf8.starttime_ticks, 123_456);
+        assert!(!is_linux_kernel_thread(
+            4242,
+            non_utf8.parent_pid,
+            non_utf8.flags
+        ));
+        raw.clear();
+
+        // Linux `/proc/<pid>/statm` private resident pages = (resident - shared) * page_size.
+        assert_eq!(
+            parse_linux_proc_statm_private_bytes("1000 500 200 10 0 300 0", 4096),
+            Some(300 * 4096)
+        );
+        assert_eq!(
+            parse_linux_proc_statm_private_bytes("1000 100 150 0 0 0 0", 4096),
+            Some(0)
+        );
+
+        // macOS `PROC_FLAG_SYSTEM` is bit 0 (`0x1`), NOT `PROC_FLAG_PC_THROTTLE` (`0x200`).
+        assert!(is_macos_system_process(0x0000_0001));
+        assert!(!is_macos_system_process(0x0000_0200));
+
+        // Sub-second FILETIME-epoch conversions distinguish same-second starts and align with 1601 epoch.
+        let t1 = unix_linux_ticks_to_identity(1_700_000_000, 1005, 100);
+        let t2 = unix_linux_ticks_to_identity(1_700_000_000, 1006, 100);
+        assert!(t1 > WINDOWS_TO_UNIX_EPOCH_100NS);
+        assert_eq!(t2 - t1, 100_000); // 10ms = 100,000 * 100ns
+
+        let m1 = unix_timeval_to_identity(1_700_000_000, 123_456);
+        let m2 = unix_timeval_to_identity(1_700_000_000, 123_457);
+        assert_eq!(m2 - m1, 10); // 1us = 10 * 100ns
+        assert_eq!(unix_start_time_secs_to_identity(0), 0);
+        assert_eq!(
+            unix_start_time_secs_to_identity(1_700_000_000),
+            WINDOWS_TO_UNIX_EPOCH_100NS + 1_700_000_000 * 10_000_000
+        );
     }
 
     #[cfg(unix)]
