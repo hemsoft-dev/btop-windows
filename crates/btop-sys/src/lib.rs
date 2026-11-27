@@ -1102,8 +1102,14 @@ mod stub {
         }
     }
 
+    /// Maximum bytes written per `libc::write` after `poll(POLLOUT)` on Unix so a pipe write
+    /// never exceeds POSIX `_POSIX_PIPE_BUF` (512) and cannot block after `POLLOUT` is reported.
+    #[cfg(unix)]
+    const MAX_NONBLOCK_PIPE_CHUNK: usize = 512;
+
     /// Unbuffered stdout writer bypassing `StdoutLock`'s internal `LineWriter` buffer on Unix
-    /// so `SIGINT` / `SIGTERM` interrupts blocked pipe writes immediately with `EINTR`.
+    /// and polling `STDOUT_FILENO` alongside the signal cancel pipe so `SIGINT` / `SIGTERM`
+    /// never races with a blocking pipe write.
     #[derive(Debug, Default)]
     pub struct UnbufferedStdout;
 
@@ -1111,15 +1117,50 @@ mod stub {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             #[cfg(unix)]
             {
+                use std::sync::atomic::Ordering;
+
                 if buf.is_empty() {
                     return Ok(0);
                 }
-                // SAFETY: `buf` is a valid readable slice for `buf.len()` bytes.
+                if headless_signal_received() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "stdout write interrupted by signal",
+                    ));
+                }
+                let cancel_rd = UNIX_CANCEL_PIPE_RD.load(Ordering::Acquire);
+                if cancel_rd >= 0 {
+                    let mut pfds = [
+                        libc::pollfd {
+                            fd: libc::STDOUT_FILENO,
+                            events: libc::POLLOUT,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: cancel_rd,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                    ];
+                    // SAFETY: `pfds` is a valid 2-element stack array of `pollfd`.
+                    let rc = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+                    if rc < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if (pfds[1].revents & libc::POLLIN) != 0 || headless_signal_received() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "stdout write interrupted by signal",
+                        ));
+                    }
+                }
+                let chunk_len = buf.len().min(MAX_NONBLOCK_PIPE_CHUNK);
+                // SAFETY: `buf` has at least `chunk_len` readable bytes.
                 let n = unsafe {
                     libc::write(
                         libc::STDOUT_FILENO,
                         buf.as_ptr().cast::<libc::c_void>(),
-                        buf.len(),
+                        chunk_len,
                     )
                 };
                 if n < 0 {
@@ -1165,6 +1206,12 @@ mod stub {
     static UNIX_SIGNAL_PIPE_WR: std::sync::atomic::AtomicI32 =
         std::sync::atomic::AtomicI32::new(-1);
     #[cfg(unix)]
+    static UNIX_CANCEL_PIPE_RD: std::sync::atomic::AtomicI32 =
+        std::sync::atomic::AtomicI32::new(-1);
+    #[cfg(unix)]
+    static UNIX_CANCEL_PIPE_WR: std::sync::atomic::AtomicI32 =
+        std::sync::atomic::AtomicI32::new(-1);
+    #[cfg(unix)]
     static UNIX_STOP_SLOT: Mutex<Option<(Arc<std::sync::atomic::AtomicBool>, TimerWaker)>> =
         Mutex::new(None);
 
@@ -1175,23 +1222,68 @@ mod stub {
         let already_signaled = UNIX_HEADLESS_SIGNAL.swap(true, Ordering::SeqCst);
         if already_signaled {
             // Second signal terminates immediately via default OS disposition.
-            // SAFETY: Resetting signal disposition and re-raising are POSIX async-signal-safe.
+            // SAFETY: Resetting signal disposition, unmasking `sig`, and re-raising are POSIX
+            // async-signal-safe.
             unsafe {
                 let mut sa: libc::sigaction = core::mem::zeroed();
                 sa.sa_sigaction = libc::SIG_DFL;
                 sa.sa_flags = 0;
                 libc::sigemptyset(&raw mut sa.sa_mask);
                 let _ = libc::sigaction(sig, &raw const sa, core::ptr::null_mut());
+                let mut unblock: libc::sigset_t = core::mem::zeroed();
+                libc::sigemptyset(&raw mut unblock);
+                libc::sigaddset(&raw mut unblock, sig);
+                let _ = libc::pthread_sigmask(
+                    libc::SIG_UNBLOCK,
+                    &raw const unblock,
+                    core::ptr::null_mut(),
+                );
                 let _ = libc::raise(sig);
             }
             return;
         }
+        let byte = 1u8;
+        let cancel_fd = UNIX_CANCEL_PIPE_WR.load(Ordering::Acquire);
+        if cancel_fd >= 0 {
+            // SAFETY: `write` on a non-blocking pipe fd is async-signal-safe per POSIX.
+            unsafe {
+                let _ = libc::write(cancel_fd, (&raw const byte).cast::<libc::c_void>(), 1);
+            }
+        }
         let fd = UNIX_SIGNAL_PIPE_WR.load(Ordering::Acquire);
         if fd >= 0 {
-            let byte = 1u8;
             // SAFETY: `write` on a non-blocking pipe fd is async-signal-safe per POSIX.
             unsafe {
                 let _ = libc::write(fd, (&raw const byte).cast::<libc::c_void>(), 1);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn configure_pipe_fd(fd: libc::c_int, nonblocking: bool) {
+        // SAFETY: Setting `FD_CLOEXEC` and optional `O_NONBLOCK` on a newly opened pipe fd.
+        unsafe {
+            let _ = libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            if nonblocking {
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                if flags >= 0 {
+                    let _ = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn drain_nonblocking_fd(fd: libc::c_int) {
+        if fd < 0 {
+            return;
+        }
+        let mut buf = [0u8; 32];
+        loop {
+            // SAFETY: Non-blocking read into stack buffer to clear stale wake bytes.
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+            if n <= 0 {
+                break;
             }
         }
     }
@@ -1267,6 +1359,7 @@ mod stub {
         static INSTALLED: Once = Once::new();
 
         UNIX_HEADLESS_SIGNAL.store(false, Ordering::SeqCst);
+        drain_nonblocking_fd(UNIX_CANCEL_PIPE_RD.load(Ordering::Acquire));
         let flag = Arc::new(AtomicBool::new(false));
         match UNIX_STOP_SLOT.lock() {
             Ok(mut guard) => *guard = Some((Arc::clone(&flag), waker)),
@@ -1274,43 +1367,59 @@ mod stub {
         }
 
         INSTALLED.call_once(|| {
-            let mut fds = [-1 as libc::c_int; 2];
-            // SAFETY: Creating a local self-pipe and configuring non-blocking write.
-            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            let mut sig_fds = [-1 as libc::c_int; 2];
+            // SAFETY: Creating local self-pipe for watcher thread wakeups.
+            if unsafe { libc::pipe(sig_fds.as_mut_ptr()) } != 0 {
                 return;
             }
-            let (rd, wr) = (fds[0], fds[1]);
-            // SAFETY: Setting `O_NONBLOCK` on write end so signal handler can never block.
-            unsafe {
-                let flags = libc::fcntl(wr, libc::F_GETFL);
-                if flags >= 0 {
-                    let _ = libc::fcntl(wr, libc::F_SETFL, flags | libc::O_NONBLOCK);
-                }
-                let _ = libc::fcntl(rd, libc::F_SETFD, libc::FD_CLOEXEC);
-                let _ = libc::fcntl(wr, libc::F_SETFD, libc::FD_CLOEXEC);
-            }
-            UNIX_SIGNAL_PIPE_WR.store(wr, Ordering::Release);
+            let (sig_rd, sig_wr) = (sig_fds[0], sig_fds[1]);
+            configure_pipe_fd(sig_rd, false);
+            configure_pipe_fd(sig_wr, true);
 
-            if spawn_unix_signal_watcher(rd).is_err() {
+            let mut cancel_fds = [-1 as libc::c_int; 2];
+            // SAFETY: Creating level-triggered cancel pipe polled alongside `STDOUT_FILENO`.
+            if unsafe { libc::pipe(cancel_fds.as_mut_ptr()) } != 0 {
+                // SAFETY: Closing descriptors owned solely by this failed init path.
+                unsafe {
+                    let _ = libc::close(sig_rd);
+                    let _ = libc::close(sig_wr);
+                }
+                return;
+            }
+            let (cancel_rd, cancel_wr) = (cancel_fds[0], cancel_fds[1]);
+            configure_pipe_fd(cancel_rd, true);
+            configure_pipe_fd(cancel_wr, true);
+
+            UNIX_SIGNAL_PIPE_WR.store(sig_wr, Ordering::Release);
+            UNIX_CANCEL_PIPE_RD.store(cancel_rd, Ordering::Release);
+            UNIX_CANCEL_PIPE_WR.store(cancel_wr, Ordering::Release);
+
+            if spawn_unix_signal_watcher(sig_rd).is_err() {
                 // Leave default OS signal termination intact if the watcher thread could not start.
                 UNIX_SIGNAL_PIPE_WR.store(-1, Ordering::Release);
+                UNIX_CANCEL_PIPE_RD.store(-1, Ordering::Release);
+                UNIX_CANCEL_PIPE_WR.store(-1, Ordering::Release);
                 // SAFETY: Closing pipe descriptors owned solely by this failed init path.
                 unsafe {
-                    let _ = libc::close(rd);
-                    let _ = libc::close(wr);
+                    let _ = libc::close(sig_rd);
+                    let _ = libc::close(sig_wr);
+                    let _ = libc::close(cancel_rd);
+                    let _ = libc::close(cancel_wr);
                 }
                 return;
             }
 
             for sig in [libc::SIGINT, libc::SIGTERM] {
                 // SAFETY: Installing async-signal-safe `unix_headless_signal_handler` without
-                // `SA_RESTART` so blocked stdout writes observe `EINTR` and exit promptly.
+                // `SA_RESTART` and masking both `SIGINT` and `SIGTERM` during handler execution.
                 unsafe {
                     let mut sa: libc::sigaction = core::mem::zeroed();
                     sa.sa_sigaction =
                         unix_headless_signal_handler as *const () as libc::sighandler_t;
                     sa.sa_flags = 0;
                     libc::sigemptyset(&raw mut sa.sa_mask);
+                    libc::sigaddset(&raw mut sa.sa_mask, libc::SIGINT);
+                    libc::sigaddset(&raw mut sa.sa_mask, libc::SIGTERM);
                     let _ = libc::sigaction(sig, &raw const sa, core::ptr::null_mut());
                 }
             }

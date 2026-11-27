@@ -12,7 +12,7 @@ use btop_collect::{FreqMode, LiveCollector, ReplaySource, SnapshotSource};
 use btop_config::Config;
 use btop_model::{
     HeadlessQuery, JsonSections, JsonSnapshotEnvelope, ProcSortField, QueryFilter, SchemaMode,
-    ServiceStateFilter, SnapshotRecorder, build_json_schema,
+    ServiceStateFilter, build_json_schema,
 };
 use btop_sys::{TimerWake, UnbufferedStdout, WaitableWakeTimer, install_headless_ctrl_c_handler};
 use btop_term::CrosstermInput;
@@ -24,7 +24,7 @@ use crate::headless::{
     HeadlessStreamOptions, HeadlessSummaryOptions, MAX_INTERVAL_MS, MAX_SAMPLE_MS,
     MAX_SUMMARY_WINDOW_MS, MIN_INTERVAL_MS, collect_headless_snapshot, collect_headless_summary,
     raw_args_request_json, raw_args_request_pretty, stream_headless_snapshots, write_json_envelope,
-    write_json_error, write_json_summary_interruptible,
+    write_json_error, write_json_summary, write_json_summary_interruptible,
 };
 use crate::{AppError, ConfigOverrides, load_config, run_tui_loop};
 
@@ -347,9 +347,20 @@ fn build_snapshot_source(cli: &Cli, config: &Config) -> Result<Box<dyn SnapshotS
     }
 }
 
-/// Runs the CLI application under the given binary name (`"btop"` on Windows,
-/// `"btop-fleet"` on Unix).
+/// Runs the CLI application under the given binary name (`"btop"` on Windows) with live
+/// process/service actions enabled when compiled with the `live-actions` feature.
 pub fn run_cli(bin_name: &'static str) -> ExitCode {
+    run_cli_with_actions(bin_name, cfg!(feature = "live-actions"))
+}
+
+/// Runs the CLI application in permanently read-only mode (`"btop-fleet"`), disabling all live
+/// process termination, priority changes, and service start/stop actions even if workspace
+/// feature unification compiles the `live-actions` feature into `btop-windows`.
+pub fn run_cli_read_only(bin_name: &'static str) -> ExitCode {
+    run_cli_with_actions(bin_name, false)
+}
+
+fn run_cli_with_actions(bin_name: &'static str, enable_live_actions: bool) -> ExitCode {
     btop_sys::harden_process_startup();
 
     let raw_args: Vec<OsString> = std::env::args_os().collect();
@@ -415,29 +426,15 @@ pub fn run_cli(bin_name: &'static str) -> ExitCode {
         );
     }
 
-    let recorder = if let Some(record_path) = cli.record.as_deref() {
-        match SnapshotRecorder::open(record_path) {
-            Ok(rec) => Some(rec),
-            Err(err) => {
-                eprintln!(
-                    "error: failed to open --record '{}': {err}",
-                    record_path.display()
-                );
-                return ExitCode::FAILURE;
-            }
-        }
-    } else {
-        None
-    };
-
     let mut input = CrosstermInput;
     match run_tui_loop(
         source,
-        recorder,
+        cli.record.as_deref(),
         &mut input,
         config,
         cli.config_file.as_deref(),
         &overrides,
+        enable_live_actions,
     ) {
         Ok(_) => ExitCode::SUCCESS,
         Err(err) => {
@@ -653,18 +650,25 @@ fn run_headless_summary(
         }
     };
 
-    if summary.sample_count == 0
-        && (stop_flag.load(Ordering::SeqCst) || btop_sys::headless_signal_received())
-    {
+    let stopped_during_collection =
+        stop_flag.load(Ordering::SeqCst) || btop_sys::headless_signal_received();
+    if summary.sample_count == 0 && stopped_during_collection {
         return ExitCode::SUCCESS;
     }
 
-    let mut stdout = UnbufferedStdout;
-    if let Err(err) =
+    // When a termination signal interrupted collection after at least one sample was captured,
+    // emit the partial summary directly instead of aborting on the already-raised stop flag.
+    // Otherwise use the interruptible writer so a blocked stdout pipe stops promptly on signal.
+    let write_res = if stopped_during_collection {
+        write_json_summary(&mut io::stdout().lock(), &summary, options.pretty)
+    } else {
+        let mut stdout = UnbufferedStdout;
         write_json_summary_interruptible(&mut stdout, &summary, options.pretty, &stop_flag)
-    {
+    };
+    if let Err(err) = write_res {
         if err.kind() == io::ErrorKind::BrokenPipe
-            || (err.kind() == io::ErrorKind::Interrupted
+            || (!stopped_during_collection
+                && err.kind() == io::ErrorKind::Interrupted
                 && (stop_flag.load(Ordering::SeqCst) || btop_sys::headless_signal_received()))
         {
             return ExitCode::SUCCESS;

@@ -333,8 +333,8 @@ fn write_all_interruptible<W: Write>(
     stop_flag: Option<&AtomicBool>,
 ) -> Result<(), std::io::Error> {
     let is_stopped = || {
-        stop_flag.is_some_and(|flag| flag.load(Ordering::SeqCst))
-            || btop_sys::headless_signal_received()
+        stop_flag
+            .is_some_and(|flag| flag.load(Ordering::SeqCst) || btop_sys::headless_signal_received())
     };
     while !buf.is_empty() {
         if is_stopped() {
@@ -1007,5 +1007,42 @@ mod tests {
         )
         .expect("stopped replay summary");
         assert_eq!(summary.sample_count, 0);
+
+        // Partial summary collected before Ctrl+C must still serialize via `write_json_summary`
+        // without being discarded by the already-set stop flag.
+        let mut partial_src = RecordingSource {
+            snapshots: win11_16core_dual_gpu_desktop(),
+            ..RecordingSource::default()
+        };
+        let stop_after_first = AtomicBool::new(false);
+        let partial = collect_headless_summary(
+            &mut partial_src,
+            HeadlessSummaryOptions {
+                sections: JsonSections::parse_csv("cpu,mem").expect("sections"),
+                explicit_sample_ms: Some(0),
+                count: Some(5),
+                window_ms: None,
+                interval_ms: 500,
+                include_series: false,
+                pretty: false,
+                is_replay: false,
+                diagnose: false,
+            },
+            ctx,
+            &stop_after_first,
+            |_| {
+                stop_after_first.store(true, Ordering::SeqCst);
+                false
+            },
+        )
+        .expect("partial live summary");
+        assert_eq!(partial.sample_count, 1);
+        assert!(stop_after_first.load(Ordering::SeqCst));
+        let mut out = Vec::new();
+        write_json_summary(&mut out, &partial, false)
+            .expect("partial summary must serialize cleanly even after stop_flag is set");
+        let parsed: JsonSummaryEnvelope =
+            serde_json::from_slice(&out).expect("parse partial summary");
+        assert_eq!(parsed.sample_count, 1);
     }
 }

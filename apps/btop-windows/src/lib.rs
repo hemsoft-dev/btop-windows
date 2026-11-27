@@ -6,7 +6,9 @@ mod menu_input;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+#[cfg(feature = "live-actions")]
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -18,19 +20,22 @@ const FULL_REDRAW_INTERVAL: Duration = Duration::from_secs(5);
 use btop_collect::{CollectError, FreqMode, Sampler, SnapshotSource};
 use btop_config::{Config, ConfigError, ConfigLocation, ThemeSearchPaths, resolve_config_location};
 use btop_model::{DataState, RecordStats, SnapshotRecorder};
+#[cfg(feature = "live-actions")]
 use btop_sys::{
-    PriorityClass, ServiceActionError, graceful_close_process, is_process_elevated,
-    query_process_priority, set_process_priority, start_windows_service, stop_windows_service,
-    terminate_process,
+    PriorityClass, graceful_close_process, query_process_priority, set_process_priority,
+    start_windows_service, stop_windows_service, terminate_process,
 };
+use btop_sys::{ServiceActionError, is_process_elevated};
 use btop_term::{
     DiffEncoder, Grid, HitAction, InputSource, KeyCode, MouseButton, MouseKind, Size, TermError,
     TermEvent, TerminalGuard,
 };
+#[cfg(feature = "live-actions")]
+use btop_ui::UiPriorityClass;
 use btop_ui::{
-    BoxId, OverlayMenu, ProcActionModal, ProcSort, ServiceSort, UiHistory, UiPriorityClass,
-    UiState, build_visible_rows, build_visible_service_rows, compute_layout, is_modal_visible,
-    modal_rect, theme::ThemePalette, visible_proc_rows, visible_service_rows,
+    BoxId, OverlayMenu, ProcActionModal, ProcSort, ServiceSort, UiHistory, UiState,
+    build_visible_rows, build_visible_service_rows, compute_layout, is_modal_visible, modal_rect,
+    theme::ThemePalette, visible_proc_rows, visible_service_rows,
 };
 use menu_input::{
     LoopAction, handle_menu_key, handle_menu_mouse, sync_config_from_ui_state,
@@ -54,6 +59,12 @@ pub enum AppError {
         "recording incomplete: wrote {written} snapshots and dropped {dropped} due to slow disk I/O"
     )]
     IncompleteRecording { written: u64, dropped: u64 },
+    #[error("failed to open --record '{}': {source}", path.display())]
+    RecordOpen {
+        path: PathBuf,
+        #[source]
+        source: btop_model::JsonlError,
+    },
 }
 
 /// CLI overrides applied on top of loaded `btop.conf` at startup and on `Ctrl+R` reload.
@@ -209,13 +220,16 @@ struct ServiceActionOutcome {
     result: Result<(), ServiceActionError>,
 }
 
+#[cfg_attr(not(feature = "live-actions"), allow(dead_code))]
 struct ServiceDispatch<'a> {
     tx: &'a Sender<ServiceActionOutcome>,
     in_flight: &'a Arc<AtomicBool>,
 }
 
+#[cfg(feature = "live-actions")]
 struct ResetBoolOnDrop(Arc<AtomicBool>);
 
+#[cfg(feature = "live-actions")]
 impl Drop for ResetBoolOnDrop {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
@@ -242,21 +256,43 @@ fn build_ui_state(config: &Config, overrides: &ConfigOverrides) -> UiState {
     ui_state
 }
 
-/// Runs the live Windows Terminal TUI loop backed by a waitable-timer [`Sampler`] and
+const fn effective_allow_live_actions(source_allows: bool, enable_live_actions: bool) -> bool {
+    cfg!(feature = "live-actions") && enable_live_actions && source_allows
+}
+
+fn open_optional_recorder(
+    record_path: Option<&Path>,
+) -> Result<Option<SnapshotRecorder>, AppError> {
+    record_path
+        .map(|path| {
+            SnapshotRecorder::open(path).map_err(|source| AppError::RecordOpen {
+                path: path.to_path_buf(),
+                source,
+            })
+        })
+        .transpose()
+}
+
+/// Runs the live terminal TUI loop backed by a waitable-timer [`Sampler`] and
 /// `ArcSwap<Snapshot>`, supporting `+`/`-` cadence control, `Ctrl+R` config reload, and
 /// clean exit on `q`/`Ctrl+C`.
+#[allow(clippy::too_many_arguments)]
 pub fn run_tui_loop(
     source: Box<dyn SnapshotSource>,
-    recorder: Option<SnapshotRecorder>,
+    record_path: Option<&Path>,
     input: &mut dyn InputSource,
     mut config: Config,
     config_path: Option<&Path>,
     overrides: &ConfigOverrides,
+    enable_live_actions: bool,
 ) -> Result<u64, AppError> {
-    let allow_live_actions = source.allows_live_actions();
-    // Enter the terminal before spawning the background sampler thread so no sibling thread can
-    // receive `SIGINT` / `SIGTERM` while `TerminalGuard::enter()` is mutating terminal modes.
+    let allow_live_actions =
+        effective_allow_live_actions(source.allows_live_actions(), enable_live_actions);
+    // Enter the terminal before spawning any background threads (`SnapshotRecorder` or `Sampler`)
+    // so no sibling thread can receive `SIGINT` / `SIGTERM` while `TerminalGuard::enter()` mutates
+    // terminal modes.
     let mut guard = TerminalGuard::enter()?;
+    let recorder = open_optional_recorder(record_path)?;
     let sampler = Sampler::spawn(source, config.update_ms, recorder)?;
     config.update_ms = sampler.update_ms();
     let mut size = guard.size().unwrap_or(Size {
@@ -272,10 +308,8 @@ pub fn run_tui_loop(
 
     let (svc_tx, svc_rx) = mpsc::channel::<ServiceActionOutcome>();
     let svc_in_flight = Arc::new(AtomicBool::new(false));
-    let mut prev_grid: Option<Grid> = None;
-    let mut last_full_redraw = Instant::now();
-    let mut dirty = true;
-    let mut frames_rendered = 0u64;
+    let (mut prev_grid, mut last_full_redraw, mut dirty, mut frames_rendered) =
+        (None::<Grid>, Instant::now(), true, 0u64);
 
     let run_result: Result<(), AppError> = (|| {
         loop {
@@ -1177,10 +1211,11 @@ fn handle_modal_key(
                 if !allow_live_actions {
                     ui_state.modal = None;
                     ui_state.proc.action_status =
-                        Some("Process actions are disabled in replay mode".to_owned());
+                        Some("Process actions are disabled in replay/read-only mode".to_owned());
                     *prev_grid = None;
                     return true;
                 }
+                #[cfg(feature = "live-actions")]
                 match terminate_process(target.pid, target.create_time_100ns) {
                     Ok(()) => {
                         ui_state.modal = None;
@@ -1194,6 +1229,13 @@ fn handle_modal_key(
                             is_error: true,
                         });
                     }
+                }
+                #[cfg(not(feature = "live-actions"))]
+                {
+                    let _ = (&target, &name);
+                    ui_state.modal = None;
+                    ui_state.proc.action_status =
+                        Some("Process actions are disabled in this build".to_owned());
                 }
                 *prev_grid = None;
                 true
@@ -1302,63 +1344,73 @@ fn handle_service_confirm_modal(
             *prev_grid = None;
             if !allow_live_actions {
                 ui_state.services.action_status =
-                    Some("Service actions are disabled in replay mode".to_owned());
+                    Some("Service actions are disabled in replay/read-only mode".to_owned());
                 return true;
             }
-            let Some(dispatch) = service_dispatch else {
+            #[cfg(not(feature = "live-actions"))]
+            {
+                let _ = (service_name, display_name, start, size, service_dispatch);
                 ui_state.services.action_status =
-                    Some("Service action dispatcher unavailable".to_owned());
-                return true;
-            };
-            if dispatch.in_flight.swap(true, Ordering::AcqRel) {
-                ui_state.services.action_status =
-                    Some("Another service Start/Stop request is still in progress".to_owned());
-                return true;
+                    Some("Service actions are disabled in this build".to_owned());
+                true
             }
-            let svc_name = service_name.to_owned();
-            let disp_name = display_name.to_owned();
-            let tx = dispatch.tx.clone();
-            let in_flight = Arc::clone(dispatch.in_flight);
-            let verb = if start { "start" } else { "stop" };
-            ui_state.services.action_status = Some(format!(
-                "Sending {verb} request to '{svc_name}' ({disp_name})..."
-            ));
-
-            // Dispatch SCM `StartServiceW` / `ControlService` off the UI thread because Windows
-            // `ControlService` may block for up to 30 seconds while another control is pending.
-            let spawn_res = std::thread::Builder::new()
-                .name("btop-svc-action".to_owned())
-                .spawn(move || {
-                    let _guard = ResetBoolOnDrop(in_flight);
-                    let result = if start {
-                        start_windows_service(&svc_name)
-                    } else {
-                        stop_windows_service(&svc_name)
-                    };
-                    let _ = tx.send(ServiceActionOutcome {
-                        service_name: svc_name,
-                        display_name: disp_name,
-                        start,
-                        result,
-                    });
-                });
-            if let Err(err) = spawn_res {
-                dispatch.in_flight.store(false, Ordering::Release);
-                let notice = ProcActionModal::ActionNotice {
-                    title: if start {
-                        "Service Start Failed".to_owned()
-                    } else {
-                        "Service Stop Failed".to_owned()
-                    },
-                    message: format!("Failed to spawn service control worker: {err}"),
-                    is_error: true,
-                };
-                if !try_open_modal(size, ui_state, notice) {
+            #[cfg(feature = "live-actions")]
+            {
+                let Some(dispatch) = service_dispatch else {
                     ui_state.services.action_status =
-                        Some(format!("Failed to spawn service control worker: {err}"));
+                        Some("Service action dispatcher unavailable".to_owned());
+                    return true;
+                };
+                if dispatch.in_flight.swap(true, Ordering::AcqRel) {
+                    ui_state.services.action_status =
+                        Some("Another service Start/Stop request is still in progress".to_owned());
+                    return true;
                 }
+                let svc_name = service_name.to_owned();
+                let disp_name = display_name.to_owned();
+                let tx = dispatch.tx.clone();
+                let in_flight = Arc::clone(dispatch.in_flight);
+                let verb = if start { "start" } else { "stop" };
+                ui_state.services.action_status = Some(format!(
+                    "Sending {verb} request to '{svc_name}' ({disp_name})..."
+                ));
+
+                // Dispatch SCM `StartServiceW` / `ControlService` off the UI thread because Windows
+                // `ControlService` may block for up to 30 seconds while another control is pending.
+                let spawn_res = std::thread::Builder::new()
+                    .name("btop-svc-action".to_owned())
+                    .spawn(move || {
+                        let _guard = ResetBoolOnDrop(in_flight);
+                        let result = if start {
+                            start_windows_service(&svc_name)
+                        } else {
+                            stop_windows_service(&svc_name)
+                        };
+                        let _ = tx.send(ServiceActionOutcome {
+                            service_name: svc_name,
+                            display_name: disp_name,
+                            start,
+                            result,
+                        });
+                    });
+                if let Err(err) = spawn_res {
+                    dispatch.in_flight.store(false, Ordering::Release);
+                    let notice = ProcActionModal::ActionNotice {
+                        title: if start {
+                            "Service Start Failed".to_owned()
+                        } else {
+                            "Service Stop Failed".to_owned()
+                        },
+                        message: format!("Failed to spawn service control worker: {err}"),
+                        is_error: true,
+                    };
+                    if !try_open_modal(size, ui_state, notice) {
+                        ui_state.services.action_status =
+                            Some(format!("Failed to spawn service control worker: {err}"));
+                    }
+                }
+                true
             }
-            true
         }
         KeyCode::Esc | KeyCode::Char('n' | 'N') => {
             ui_state.modal = None;
@@ -1425,45 +1477,57 @@ fn apply_priority_modal_selection(
     if !allow_live_actions {
         ui_state.modal = None;
         ui_state.proc.action_status =
-            Some("Process actions are disabled in replay mode".to_owned());
+            Some("Process actions are disabled in replay/read-only mode".to_owned());
         *prev_grid = None;
         return true;
     }
-    let Some((target, name, ui_class)) = modal.selected_priority() else {
-        return false;
-    };
-    let sys_class = ui_to_sys_priority(ui_class);
-    match set_process_priority(target.pid, target.create_time_100ns, sys_class) {
-        Ok(outcome) => {
-            ui_state.modal = None;
-            let status = if outcome.applied == outcome.requested {
-                format!(
-                    "Set priority for {name} (PID {}) to {}",
-                    target.pid,
-                    outcome.applied.label()
-                )
-            } else {
-                format!(
-                    "Priority for {name} (PID {}) clamped to {} ({} requires Administrator)",
-                    target.pid,
-                    outcome.applied.label(),
-                    outcome.requested.label()
-                )
-            };
-            ui_state.proc.action_status = Some(status);
-        }
-        Err(err) => {
-            ui_state.modal = Some(ProcActionModal::ActionNotice {
-                title: "Priority Change Refused".to_owned(),
-                message: err.to_string(),
-                is_error: true,
-            });
-        }
+    #[cfg(not(feature = "live-actions"))]
+    {
+        let _ = modal;
+        ui_state.modal = None;
+        ui_state.proc.action_status = Some("Process actions are disabled in this build".to_owned());
+        *prev_grid = None;
+        true
     }
-    *prev_grid = None;
-    true
+    #[cfg(feature = "live-actions")]
+    {
+        let Some((target, name, ui_class)) = modal.selected_priority() else {
+            return false;
+        };
+        let sys_class = ui_to_sys_priority(ui_class);
+        match set_process_priority(target.pid, target.create_time_100ns, sys_class) {
+            Ok(outcome) => {
+                ui_state.modal = None;
+                let status = if outcome.applied == outcome.requested {
+                    format!(
+                        "Set priority for {name} (PID {}) to {}",
+                        target.pid,
+                        outcome.applied.label()
+                    )
+                } else {
+                    format!(
+                        "Priority for {name} (PID {}) clamped to {} ({} requires Administrator)",
+                        target.pid,
+                        outcome.applied.label(),
+                        outcome.requested.label()
+                    )
+                };
+                ui_state.proc.action_status = Some(status);
+            }
+            Err(err) => {
+                ui_state.modal = Some(ProcActionModal::ActionNotice {
+                    title: "Priority Change Refused".to_owned(),
+                    message: err.to_string(),
+                    is_error: true,
+                });
+            }
+        }
+        *prev_grid = None;
+        true
+    }
 }
 
+#[cfg(feature = "live-actions")]
 const fn ui_to_sys_priority(class: UiPriorityClass) -> PriorityClass {
     match class {
         UiPriorityClass::Idle => PriorityClass::Idle,
@@ -1475,6 +1539,7 @@ const fn ui_to_sys_priority(class: UiPriorityClass) -> PriorityClass {
     }
 }
 
+#[cfg(feature = "live-actions")]
 const fn sys_to_ui_priority(class: PriorityClass) -> UiPriorityClass {
     match class {
         PriorityClass::Idle => UiPriorityClass::Idle,
@@ -1946,68 +2011,78 @@ fn handle_proc_action_shortcut(
         }
         return true;
     }
-    let Some(row) = rows_built.and_then(|rows| rows.get(selected)) else {
-        return false;
-    };
-    let id = row.entry.identity;
-    let name = row.entry.name.clone();
-    match code {
-        KeyCode::Char('t') => match graceful_close_process(id.pid, id.create_time_100ns) {
-            Ok(count) => {
-                let plural = if count == 1 { "" } else { "s" };
-                state.proc.action_status = Some(format!(
-                    "Sent WM_CLOSE to {name} (PID {}, {count} window{plural})",
-                    id.pid
-                ));
-            }
-            Err(err) => {
-                let notice = ProcActionModal::ActionNotice {
-                    title: "Graceful Close Refused".to_owned(),
-                    message: err.to_string(),
-                    is_error: true,
-                };
-                if !try_open_modal(size, state, notice) {
-                    state.proc.action_status = Some(err.to_string());
+    #[cfg(not(feature = "live-actions"))]
+    {
+        let _ = (code, rows_built, size);
+        state.proc.action_status =
+            Some("Process actions (t, k, N) are disabled in this build".to_owned());
+        true
+    }
+    #[cfg(feature = "live-actions")]
+    {
+        let Some(row) = rows_built.and_then(|rows| rows.get(selected)) else {
+            return false;
+        };
+        let id = row.entry.identity;
+        let name = row.entry.name.clone();
+        match code {
+            KeyCode::Char('t') => match graceful_close_process(id.pid, id.create_time_100ns) {
+                Ok(count) => {
+                    let plural = if count == 1 { "" } else { "s" };
+                    state.proc.action_status = Some(format!(
+                        "Sent WM_CLOSE to {name} (PID {}, {count} window{plural})",
+                        id.pid
+                    ));
                 }
-            }
-        },
-        KeyCode::Char('k') => {
-            let _ = try_open_modal(
-                size,
-                state,
-                ProcActionModal::ConfirmTerminate { target: id, name },
-            );
-            return true;
-        }
-        KeyCode::Char('N') => match query_process_priority(id.pid, id.create_time_100ns) {
-            Ok(current) => {
-                let ui_cur = sys_to_ui_priority(current);
+                Err(err) => {
+                    let notice = ProcActionModal::ActionNotice {
+                        title: "Graceful Close Refused".to_owned(),
+                        message: err.to_string(),
+                        is_error: true,
+                    };
+                    if !try_open_modal(size, state, notice) {
+                        state.proc.action_status = Some(err.to_string());
+                    }
+                }
+            },
+            KeyCode::Char('k') => {
                 let _ = try_open_modal(
                     size,
                     state,
-                    ProcActionModal::PrioritySelector {
-                        target: id,
-                        name,
-                        current: Some(ui_cur),
-                        selected: ui_cur.index(),
-                    },
+                    ProcActionModal::ConfirmTerminate { target: id, name },
                 );
                 return true;
             }
-            Err(err) => {
-                let notice = ProcActionModal::ActionNotice {
-                    title: "Priority Change Refused".to_owned(),
-                    message: err.to_string(),
-                    is_error: true,
-                };
-                if !try_open_modal(size, state, notice) {
-                    state.proc.action_status = Some(err.to_string());
+            KeyCode::Char('N') => match query_process_priority(id.pid, id.create_time_100ns) {
+                Ok(current) => {
+                    let ui_cur = sys_to_ui_priority(current);
+                    let _ = try_open_modal(
+                        size,
+                        state,
+                        ProcActionModal::PrioritySelector {
+                            target: id,
+                            name,
+                            current: Some(ui_cur),
+                            selected: ui_cur.index(),
+                        },
+                    );
+                    return true;
                 }
-            }
-        },
-        _ => return false,
+                Err(err) => {
+                    let notice = ProcActionModal::ActionNotice {
+                        title: "Priority Change Refused".to_owned(),
+                        message: err.to_string(),
+                        is_error: true,
+                    };
+                    if !try_open_modal(size, state, notice) {
+                        state.proc.action_status = Some(err.to_string());
+                    }
+                }
+            },
+            _ => return false,
+        }
+        true
     }
-    true
 }
 
 #[cfg(test)]
@@ -2087,6 +2162,7 @@ mod tests {
         assert!(state.proc.action_status.is_none());
     }
 
+    #[cfg(feature = "live-actions")]
     #[test]
     fn confirm_terminate_refuses_to_arm_or_fire_when_viewport_hides_modal() {
         let snap = sample_snapshot_with_proc();
@@ -2419,6 +2495,7 @@ mod tests {
         assert_eq!(state.proc.filter, "");
     }
 
+    #[cfg(feature = "live-actions")]
     #[test]
     fn service_control_outcomes_apply_asynchronously_and_guard_overlap() {
         let size = Size {
@@ -3232,7 +3309,7 @@ mod tests {
         ));
         assert_eq!(state.proc.sort, orig_sort);
 
-        // `K` triggers Terminate confirmation when vim_keys = true.
+        // `K` triggers Terminate confirmation when vim_keys = true (or refuses in read-only builds).
         assert!(handle_proc_key(
             KeyCode::Char('K'),
             true,
@@ -3243,10 +3320,13 @@ mod tests {
             proc_rows,
             true,
         ));
+        #[cfg(feature = "live-actions")]
         assert!(matches!(
             state.modal,
             Some(ProcActionModal::ConfirmTerminate { .. })
         ));
+        #[cfg(not(feature = "live-actions"))]
+        assert!(state.modal.is_none());
         state.modal = None;
 
         // `h` / `l` / `g` / `G` also work in Options and Help menus under vim_keys.
@@ -3455,5 +3535,16 @@ mod tests {
             &mut prev_grid,
         ));
         assert!(prev_grid.is_none());
+    }
+
+    #[test]
+    fn read_only_cli_mode_disables_live_actions_even_when_source_allows_them() {
+        assert!(!effective_allow_live_actions(true, false));
+        assert!(!effective_allow_live_actions(false, true));
+        assert!(!effective_allow_live_actions(false, false));
+        assert_eq!(
+            effective_allow_live_actions(true, true),
+            cfg!(feature = "live-actions")
+        );
     }
 }

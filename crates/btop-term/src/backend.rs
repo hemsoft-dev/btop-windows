@@ -368,6 +368,59 @@ mod unix {
             .map_err(|err| TermError::Console(format!("stdout write failed: {err}")))
     }
 
+    /// Writes `LEAVE_SEQUENCE` directly to `STDOUT_FILENO` using a bounded `poll` so neither
+    /// signal teardown nor normal/panic teardown can hang on a stalled PTY output queue or
+    /// deadlock on `io::stdout().lock()`.
+    ///
+    /// SAFETY: Uses only POSIX async-signal-safe functions (`tcflush`, `poll`, `write`).
+    unsafe fn write_leave_sequence_bounded(flush_first: bool) {
+        // SAFETY: Stack-allocated `pollfd` and static `LEAVE_SEQUENCE` byte slice.
+        unsafe {
+            if flush_first {
+                let _ = libc::tcflush(libc::STDOUT_FILENO, libc::TCOFLUSH);
+            }
+            let mut pfd = libc::pollfd {
+                fd: libc::STDOUT_FILENO,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let mut ready =
+                libc::poll(&raw mut pfd, 1, 100) > 0 && (pfd.revents & libc::POLLOUT) != 0;
+            if !ready && !flush_first {
+                // Output queue appears stalled; flush stale frame bytes so `LEAVE_SEQUENCE` fits.
+                let _ = libc::tcflush(libc::STDOUT_FILENO, libc::TCOFLUSH);
+                pfd.revents = 0;
+                ready = libc::poll(&raw mut pfd, 1, 50) > 0 && (pfd.revents & libc::POLLOUT) != 0;
+            }
+            if ready {
+                let bytes = LEAVE_SEQUENCE.as_bytes();
+                let mut written = 0usize;
+                for _ in 0..8 {
+                    if written >= bytes.len() {
+                        break;
+                    }
+                    let n = libc::write(
+                        libc::STDOUT_FILENO,
+                        bytes[written..].as_ptr().cast::<libc::c_void>(),
+                        bytes.len() - written,
+                    );
+                    if n > 0 {
+                        written += usize::try_from(n).unwrap_or(0);
+                    } else if n < 0 {
+                        pfd.revents = 0;
+                        if libc::poll(&raw mut pfd, 1, 20) <= 0
+                            || (pfd.revents & libc::POLLOUT) == 0
+                        {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     /// Restores saved `termios` first (never blocks on a stalled PTY output queue), flushes any
     /// queued unsent frame bytes (`TCOFLUSH`) so `LEAVE_SEQUENCE` fits in the PTY buffer, then
     /// writes `LEAVE_SEQUENCE` if stdout becomes writable within a short bounded timeout.
@@ -382,27 +435,12 @@ mod unix {
                 let saved = (&*SAVED_TERMIOS.0.get()).assume_init_ref();
                 let _ = libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, saved);
             }
-            // Discard stale frame output buffered in the PTY queue so the short `LEAVE_SEQUENCE`
-            // can be written immediately without losing alt-screen / cursor restoration.
-            let _ = libc::tcflush(libc::STDOUT_FILENO, libc::TCOFLUSH);
-            let mut pfd = libc::pollfd {
-                fd: libc::STDOUT_FILENO,
-                events: libc::POLLOUT,
-                revents: 0,
-            };
-            if libc::poll(&raw mut pfd, 1, 100) > 0 && (pfd.revents & libc::POLLOUT) != 0 {
-                let bytes = LEAVE_SEQUENCE.as_bytes();
-                let _ = libc::write(
-                    libc::STDOUT_FILENO,
-                    bytes.as_ptr().cast::<libc::c_void>(),
-                    bytes.len(),
-                );
-            }
+            write_leave_sequence_bounded(true);
         }
     }
 
     /// RAII guard masking `SIGINT` and `SIGTERM` on the current thread across terminal setup so
-    /// signals cannot race with `tcgetattr` / `enable_raw_mode` / `ENTER_SEQUENCE`.
+    /// signals cannot race with `tcgetattr` / `enable_raw_mode`.
     struct SigMaskGuard {
         prev: libc::sigset_t,
         active: bool,
@@ -449,13 +487,19 @@ mod unix {
                 restore_terminal_async_signal_safe();
             }
         }
-        // SAFETY: Reset signal to default disposition and re-raise so exit status reflects signal.
+        // SAFETY: Reset `sig` to default disposition, unmask `sig` (keeping the sibling
+        // termination signal masked until termination), and re-raise so exit status reflects `sig`.
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = libc::SIG_DFL;
             sa.sa_flags = 0;
             libc::sigemptyset(&raw mut sa.sa_mask);
             let _ = libc::sigaction(sig, &raw const sa, std::ptr::null_mut());
+            let mut unblock: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&raw mut unblock);
+            libc::sigaddset(&raw mut unblock, sig);
+            let _ =
+                libc::pthread_sigmask(libc::SIG_UNBLOCK, &raw const unblock, std::ptr::null_mut());
             let _ = libc::raise(sig);
         }
     }
@@ -469,12 +513,16 @@ mod unix {
             }));
 
             for sig in [libc::SIGINT, libc::SIGTERM] {
-                // SAFETY: `unix_signal_handler` uses only async-signal-safe POSIX calls.
+                // SAFETY: `unix_signal_handler` uses only async-signal-safe POSIX calls, and
+                // masking both `SIGINT` and `SIGTERM` in `sa_mask` prevents overlapping signals
+                // from cutting terminal restoration short.
                 unsafe {
                     let mut sa: libc::sigaction = std::mem::zeroed();
                     sa.sa_sigaction = unix_signal_handler as *const () as libc::sighandler_t;
                     sa.sa_flags = 0;
                     libc::sigemptyset(&raw mut sa.sa_mask);
+                    libc::sigaddset(&raw mut sa.sa_mask, libc::SIGINT);
+                    libc::sigaddset(&raw mut sa.sa_mask, libc::SIGTERM);
                     let _ = libc::sigaction(sig, &raw const sa, std::ptr::null_mut());
                 }
             }
@@ -482,6 +530,9 @@ mod unix {
     }
 
     /// Restores the POSIX terminal if a `TerminalGuard` is currently active. Idempotent.
+    ///
+    /// Restores input mode (`termios`) first before writing `LEAVE_SEQUENCE` through a bounded
+    /// non-hanging stdout path so a stalled PTY reader cannot leave raw mode enabled.
     pub fn restore_terminal_now() {
         if STATE
             .compare_exchange(
@@ -494,7 +545,6 @@ mod unix {
         {
             return;
         }
-        let _ = write_all_stdout(LEAVE_SEQUENCE);
         if crossterm::terminal::disable_raw_mode().is_err() && TERMIOS_SAVED.load(Ordering::Acquire)
         {
             // SAFETY: `SAVED_TERMIOS` is immutable while in `STATE_RESTORING` or `STATE_TERMINATED`.
@@ -502,6 +552,11 @@ mod unix {
                 let saved = (&*SAVED_TERMIOS.0.get()).assume_init_ref();
                 let _ = libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, saved);
             }
+        }
+        // SAFETY: Uses bounded `poll` + direct `STDOUT_FILENO` writes so neither normal quit nor
+        // a panic hook can hang on a stalled PTY or deadlock on `io::stdout().lock()`.
+        unsafe {
+            write_leave_sequence_bounded(false);
         }
         // Transition back to `STATE_INACTIVE` only if a signal did not latch `STATE_TERMINATED`.
         let _ = STATE.compare_exchange(
@@ -544,9 +599,9 @@ mod unix {
             }
 
             // Mask `SIGINT` and `SIGTERM` across the non-blocking ioctl setup (`tcgetattr`,
-            // signal hook registration, and `enable_raw_mode`) so signals cannot race with mode
-            // mutation, then unmask before writing `ENTER_SEQUENCE` so a full PTY never hangs
-            // with termination signals blocked.
+            // signal hook registration, `enable_raw_mode`, and publishing `STATE_ACTIVE`) so
+            // signals cannot race with mode mutation, then unmask before writing `ENTER_SEQUENCE`
+            // so a full PTY never hangs with termination signals blocked.
             {
                 let _sig_mask = SigMaskGuard::block_term_signals();
 
@@ -563,9 +618,28 @@ mod unix {
                     TERMIOS_SAVED.store(true, Ordering::Release);
                 }
 
-                // Install panic and signal restore hooks and publish `STATE_ACTIVE` before
-                // mutating raw mode so any signal after unmasking restores `termios`.
+                // Install panic and signal restore hooks before mutating raw mode.
                 install_global_restore_hooks();
+
+                if let Err(err) = crossterm::terminal::enable_raw_mode() {
+                    if TERMIOS_SAVED.load(Ordering::Acquire) {
+                        // SAFETY: Still in `STATE_ENTERING` (or `STATE_TERMINATED`); `SAVED_TERMIOS` is initialized.
+                        unsafe {
+                            let saved = (&*SAVED_TERMIOS.0.get()).assume_init_ref();
+                            let _ = libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, saved);
+                        }
+                    }
+                    let _ = STATE.compare_exchange(
+                        STATE_ENTERING,
+                        STATE_INACTIVE,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                    return Err(TermError::Console(format!(
+                        "failed to enable raw terminal mode: {err}"
+                    )));
+                }
+
                 if STATE
                     .compare_exchange(
                         STATE_ENTERING,
@@ -575,21 +649,13 @@ mod unix {
                     )
                     .is_err()
                 {
-                    return Err(TermError::AlreadyActive);
-                }
-
-                if let Err(err) = crossterm::terminal::enable_raw_mode() {
-                    restore_terminal_now();
-                    return Err(TermError::Console(format!(
-                        "failed to enable raw terminal mode: {err}"
-                    )));
-                }
-
-                // Guard against a signal delivered to another thread while raw mode was applied.
-                if STATE.load(Ordering::Acquire) == STATE_TERMINATED {
-                    // SAFETY: `STATE_TERMINATED` guarantees `SAVED_TERMIOS` is immutable.
-                    unsafe {
-                        restore_terminal_async_signal_safe();
+                    // A signal already transitioned `STATE` to `STATE_TERMINATED`; ensure raw mode
+                    // we just enabled is restored immediately.
+                    if TERMIOS_SAVED.load(Ordering::Acquire) {
+                        // SAFETY: `STATE_TERMINATED` guarantees `SAVED_TERMIOS` is immutable.
+                        unsafe {
+                            restore_terminal_async_signal_safe();
+                        }
                     }
                     return Err(TermError::AlreadyActive);
                 }
