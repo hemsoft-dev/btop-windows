@@ -404,17 +404,19 @@ mod unix {
                         bytes[written..].as_ptr().cast::<libc::c_void>(),
                         bytes.len() - written,
                     );
-                    if n > 0 {
-                        written += usize::try_from(n).unwrap_or(0);
-                    } else if n < 0 {
-                        pfd.revents = 0;
-                        if libc::poll(&raw mut pfd, 1, 20) <= 0
-                            || (pfd.revents & libc::POLLOUT) == 0
-                        {
-                            break;
+                    match n.cmp(&0) {
+                        std::cmp::Ordering::Greater => {
+                            written += usize::try_from(n).unwrap_or(0);
                         }
-                    } else {
-                        break;
+                        std::cmp::Ordering::Less => {
+                            pfd.revents = 0;
+                            if libc::poll(&raw mut pfd, 1, 20) <= 0
+                                || (pfd.revents & libc::POLLOUT) == 0
+                            {
+                                break;
+                            }
+                        }
+                        std::cmp::Ordering::Equal => break,
                     }
                 }
             }
