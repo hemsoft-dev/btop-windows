@@ -13,7 +13,7 @@
 
 ## Runtime profile
 
-- Executable: `btop.exe` (single 3.0 MiB static-CRT x64 binary, zero `vc_redist`, zero kernel drivers)
+- Executable: `btop.exe` (single 4.0 MiB static-CRT x64 binary, zero `vc_redist`, zero kernel drivers)
 - Target environment: English Windows 11 (23H2+) x64 in Windows Terminal (24-bit TrueColor, UTF-8, Braille/Block graphs)
 - Privileges: Runs non-elevated for all telemetry (including DXGI/WDDM GPU and optional `System32\nvml.dll` NVIDIA sensors); Administrator is required only to Start/Stop Windows Services
 - Config file: Portable `btop.conf` next to `btop.exe` if present, otherwise `%APPDATA%\btop\btop.conf` (override with `-c <file>`, generate starter with `btop --default-config`)
