@@ -165,7 +165,16 @@ pub fn deduplicate_unix_disks(raw: Vec<RawUnixDisk>) -> Vec<DiskSnapshot> {
         }
         let dedup_key =
             if let Some(container) = apfs_container_key(&disk.fs_type, &disk.device_name) {
-                format!("apfs:{container}:{}", disk.total_bytes)
+                format!("apfs:dev:{container}:{}", disk.total_bytes)
+            } else if disk.fs_type.eq_ignore_ascii_case("apfs") {
+                // On macOS, `sysinfo::Disk::name()` returns the volume label (e.g. `"Macintosh HD"`)
+                // rather than `/dev/diskNsM`. Collapse the root OS volume (`/`) and its paired APFS
+                // data volume (`/System/Volumes/Data`) sharing the same container capacity into `/`.
+                if disk.mount_point == "/" || disk.mount_point == "/System/Volumes/Data" {
+                    format!("apfs:root:{}", disk.total_bytes)
+                } else {
+                    format!("apfs:vol:{}:{}", disk.device_name, disk.total_bytes)
+                }
             } else if disk.device_name.starts_with("/dev/") {
                 format!("dev:{}:{}", disk.device_name, disk.total_bytes)
             } else {
@@ -904,6 +913,41 @@ mod tests {
         assert_eq!(mac_disks[0].used_bytes, 600_000_000_000);
         assert_eq!(mac_disks[0].read_bytes_per_sec, Some(1024));
         assert_eq!(mac_disks[1].mount, "/Volumes/External");
+
+        // macOS `sysinfo` reports volume labels (e.g. `"Macintosh HD"`) rather than `/dev/diskNsM`.
+        let mac_sysinfo_disks = deduplicate_unix_disks(vec![
+            RawUnixDisk {
+                device_name: "Macintosh HD".to_owned(),
+                mount_point: "/".to_owned(),
+                fs_type: "apfs".to_owned(),
+                total_bytes: 994_610_155_520,
+                available_bytes: 396_826_159_103,
+                read_bytes_per_sec: Some(25_206),
+                write_bytes_per_sec: Some(4_096),
+            },
+            RawUnixDisk {
+                device_name: "Macintosh HD".to_owned(),
+                mount_point: "/System/Volumes/Data".to_owned(),
+                fs_type: "apfs".to_owned(),
+                total_bytes: 994_610_155_520,
+                available_bytes: 396_826_155_007,
+                read_bytes_per_sec: Some(25_206),
+                write_bytes_per_sec: Some(4_096),
+            },
+            RawUnixDisk {
+                device_name: "External SSD".to_owned(),
+                mount_point: "/Volumes/External SSD".to_owned(),
+                fs_type: "apfs".to_owned(),
+                total_bytes: 2_000_000_000_000,
+                available_bytes: 1_200_000_000_000,
+                read_bytes_per_sec: None,
+                write_bytes_per_sec: None,
+            },
+        ]);
+        assert_eq!(mac_sysinfo_disks.len(), 2);
+        assert_eq!(mac_sysinfo_disks[0].mount, "/");
+        assert_eq!(mac_sysinfo_disks[0].total_bytes, 994_610_155_520);
+        assert_eq!(mac_sysinfo_disks[1].mount, "/Volumes/External SSD");
 
         // Linux Btrfs subvolumes on one block device collapse to `/`.
         let linux_disks = deduplicate_unix_disks(vec![
