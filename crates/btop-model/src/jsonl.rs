@@ -291,9 +291,15 @@ mod tests {
         let path = std::env::temp_dir().join(unique);
         let fixtures = win11_8core_single_gpu_desktop();
 
-        // Write tick 0 without a trailing newline.
+        // Write tick 0 without a trailing newline (owner-only mode on Unix so append is permitted).
         let first_line = serde_json::to_string(&fixtures[0]).expect("serialize tick 0");
         std::fs::write(&path, first_line.as_bytes()).expect("seed file without trailing newline");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("set owner-only permissions on seeded recording");
+        }
 
         let recorder = SnapshotRecorder::open(&path).expect("open recorder on existing file");
         recorder.record(fixtures[1].clone());
