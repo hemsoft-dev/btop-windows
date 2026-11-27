@@ -338,6 +338,7 @@ fn build_snapshot_source(cli: &Cli, config: &Config) -> Result<Box<dyn SnapshotS
     } else {
         #[cfg(unix)]
         {
+            let _ = config;
             match btop_collect::UnixLiveCollector::new() {
                 Ok(live) => Ok(Box::new(live)),
                 Err(err) => {

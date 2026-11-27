@@ -1008,12 +1008,12 @@ mod tests {
         thread::sleep(Duration::from_millis(250));
         let snap = collector.next_snapshot().expect("measured tick");
 
-        assert!(!snap.hostname.is_empty());
+        assert_ne!(snap.hostname, "");
         assert!(snap.total_phys_mem_bytes.is_some_and(|b| b > 0));
 
         match &snap.cpu {
             DataState::Available(cpu) => {
-                assert!(!cpu.cores.is_empty());
+                assert_ne!(cpu.cores.len(), 0);
                 assert!(cpu.total_busy_pct.is_finite());
                 assert!(cpu.package_temp_celsius.is_none());
                 assert!(cpu.package_watts.is_none());
@@ -1044,7 +1044,7 @@ mod tests {
 
         assert!(matches!(snap.services, DataState::Unavailable(_)));
         assert!(matches!(snap.battery, DataState::Unavailable(_)));
-        assert!(!snap.gpus.is_empty());
+        assert_ne!(snap.gpus.len(), 0);
         assert!(
             snap.gpus
                 .iter()
