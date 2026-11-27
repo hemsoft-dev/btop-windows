@@ -17,3 +17,6 @@ thiserror.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 sysinfo.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

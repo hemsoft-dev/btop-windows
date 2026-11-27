@@ -90,11 +90,9 @@ fn btop_fleet_live_unix_json_diagnose_conforms_to_schema() {
     let raw_val: serde_json::Value =
         serde_json::from_slice(&live_out.stdout).expect("parse live json value");
     let schema = build_json_schema(SchemaMode::Snapshot);
-    let errors = validate_against_schema(&schema, &raw_val);
-    assert!(
-        errors.is_empty(),
-        "live Unix --json output violated schema: {errors:?}"
-    );
+    if let Err(errors) = validate_against_schema(&schema, &raw_val) {
+        panic!("live Unix --json output violated schema: {errors:?}");
+    }
 
     let env: JsonSnapshotEnvelope =
         serde_json::from_value(raw_val).expect("deserialize live snapshot envelope");

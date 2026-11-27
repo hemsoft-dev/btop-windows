@@ -83,6 +83,7 @@ dependencies = [
  "arc-swap",
  "btop-model",
  "btop-sys",
+ "serde_json",
  "sysinfo",
  "thiserror",
 ]

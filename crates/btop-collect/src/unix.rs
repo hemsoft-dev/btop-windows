@@ -519,11 +519,9 @@ mod live {
                 })
                 .collect();
 
-            let freq_mhz = if freq_count > 0 {
-                u32::try_from(freq_sum / freq_count).ok()
-            } else {
-                None
-            };
+            let freq_mhz = freq_sum
+                .checked_div(freq_count)
+                .and_then(|v| u32::try_from(v).ok());
 
             let load_avg = System::load_average().ok().map_or([0.0; 3], |la| {
                 #[allow(clippy::cast_possible_truncation)]
@@ -565,7 +563,7 @@ mod live {
             let mut next_totals = HashMap::with_capacity(self.disks.len());
             let mut raw = Vec::with_capacity(self.disks.len());
 
-            for disk in self.disks.iter() {
+            for disk in &self.disks {
                 let mount = disk.mount_point().to_string_lossy().into_owned();
                 let fs_type = disk.file_system().to_string_lossy().into_owned();
                 let device = disk.name().to_string_lossy().into_owned();
@@ -601,7 +599,7 @@ mod live {
             let mut next_totals = HashMap::with_capacity(self.networks.iter().count());
             let mut out = Vec::new();
 
-            for (raw_name, data) in self.networks.iter() {
+            for (raw_name, data) in &self.networks {
                 let name = raw_name.to_string_lossy().into_owned();
                 let rx_total = data.total_received();
                 let tx_total = data.total_transmitted();
@@ -1064,10 +1062,8 @@ mod tests {
         );
         let value = serde_json::to_value(&envelope).expect("serialize envelope");
         let schema = build_json_schema(SchemaMode::Snapshot);
-        let errors = validate_against_schema(&schema, &value);
-        assert!(
-            errors.is_empty(),
-            "Unix live snapshot failed JSON schema validation: {errors:?}"
-        );
+        if let Err(errors) = validate_against_schema(&schema, &value) {
+            panic!("Unix live snapshot failed JSON schema validation: {errors:?}");
+        }
     }
 }
