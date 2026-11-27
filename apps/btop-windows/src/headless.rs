@@ -224,6 +224,9 @@ where
     if options.is_replay {
         let mut first_ts: Option<u64> = None;
         loop {
+            if stop_flag.load(Ordering::SeqCst) || btop_sys::headless_signal_received() {
+                break;
+            }
             if let Some(max_count) = options.count
                 && snapshots.len() >= max_count
             {
@@ -944,5 +947,40 @@ mod tests {
         let err = write_all_interruptible(&mut w_stop, b"hello\n", Some(&stop2))
             .expect_err("must stop promptly on EINTR when stop_flag is raised");
         assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn collect_headless_summary_replay_honors_stop_flag() {
+        let fixtures = win11_16core_dual_gpu_desktop();
+        let mut src = RecordingSource {
+            snapshots: fixtures,
+            ..RecordingSource::default()
+        };
+        let query = HeadlessQuery::default();
+        let ctx = HeadlessContext {
+            query: &query,
+            filter: &QueryFilter::None,
+            btop_version: "0.2.0",
+        };
+        let stop = AtomicBool::new(true);
+        let summary = collect_headless_summary(
+            &mut src,
+            HeadlessSummaryOptions {
+                sections: JsonSections::all(),
+                explicit_sample_ms: None,
+                count: None,
+                window_ms: None,
+                interval_ms: 500,
+                include_series: false,
+                pretty: false,
+                is_replay: true,
+                diagnose: false,
+            },
+            ctx,
+            &stop,
+            |_| true,
+        )
+        .expect("stopped replay summary");
+        assert_eq!(summary.sample_count, 0);
     }
 }

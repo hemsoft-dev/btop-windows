@@ -254,9 +254,11 @@ pub fn run_tui_loop(
     overrides: &ConfigOverrides,
 ) -> Result<u64, AppError> {
     let allow_live_actions = source.allows_live_actions();
+    // Enter the terminal before spawning the background sampler thread so no sibling thread can
+    // receive `SIGINT` / `SIGTERM` while `TerminalGuard::enter()` is mutating terminal modes.
+    let mut guard = TerminalGuard::enter()?;
     let sampler = Sampler::spawn(source, config.update_ms, recorder)?;
     config.update_ms = sampler.update_ms();
-    let mut guard = TerminalGuard::enter()?;
     let mut size = guard.size().unwrap_or(Size {
         width: 80,
         height: 24,

@@ -596,8 +596,9 @@ fn apply_theme_key(spec: &mut ThemeSpec, grads: &mut RawGradients, key: &str, co
     }
 }
 
-/// Ordered theme search directories: `--themes-dir`, exe-adjacent `themes\`, and
-/// `%APPDATA%\btop\themes`.
+/// Ordered theme search directories: `--themes-dir`, exe-adjacent `themes/`, and the
+/// per-user theme directory (`%APPDATA%\btop\themes` on Windows; `$XDG_CONFIG_HOME/btop-fleet/themes`
+/// or `$HOME/.config/btop-fleet/themes` on Unix).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ThemeSearchPaths {
     pub cli_dir: Option<PathBuf>,
@@ -633,7 +634,9 @@ impl ThemeSearchPaths {
         }
     }
 
-    /// Returns the ordered list of search directories (`--themes-dir`, exe `themes\`, `%APPDATA%`).
+    /// Returns the ordered list of search directories (`--themes-dir`, exe `themes/`, and
+    /// `%APPDATA%\btop\themes` on Windows or `$XDG_CONFIG_HOME/btop-fleet/themes` /
+    /// `$HOME/.config/btop-fleet/themes` on Unix).
     pub fn ordered_dirs(&self) -> Vec<&Path> {
         let mut dirs = Vec::with_capacity(3);
         if let Some(ref d) = self.cli_dir {
@@ -690,8 +693,9 @@ impl ThemeSearchPaths {
     /// 1. `"Default"` -> built-in default palette
     /// 2. Explicit `.theme` file path on disk (when it contains a path separator or ends in `.theme`)
     /// 3. `--themes-dir`
-    /// 4. Exe-adjacent `themes\`
-    /// 5. `%APPDATA%\btop\themes`
+    /// 4. Exe-adjacent `themes/`
+    /// 5. Per-user theme directory (`%APPDATA%\btop\themes` on Windows; `$XDG_CONFIG_HOME/btop-fleet/themes`
+    ///    or `$HOME/.config/btop-fleet/themes` on Unix)
     /// 6. Embedded curated Apache-2.0 bundle
     pub fn load_theme(&self, name_or_path: &str) -> Result<ThemeSpec, ThemeError> {
         let trimmed = name_or_path.trim();

@@ -368,24 +368,81 @@ mod unix {
             .map_err(|err| TermError::Console(format!("stdout write failed: {err}")))
     }
 
-    /// Async-signal-safe terminal restore for `SIGINT` / `SIGTERM`, then re-raises default action.
-    unsafe extern "C" fn unix_signal_handler(sig: libc::c_int) {
-        let prev = STATE.swap(STATE_TERMINATED, Ordering::AcqRel);
-        if prev == STATE_ACTIVE || prev == STATE_RESTORING {
-            let bytes = LEAVE_SEQUENCE.as_bytes();
-            // SAFETY: `libc::write` and `libc::tcsetattr` are POSIX async-signal-safe.
-            // `STATE_TERMINATED` permanently blocks `enter()` from ever writing `SAVED_TERMIOS`,
-            // and `SAVED_TERMIOS` was fully initialized before `STATE_ACTIVE` was published.
-            unsafe {
+    /// Restores saved `termios` first (never blocks on a stalled PTY output queue), then writes
+    /// `LEAVE_SEQUENCE` only if stdout is immediately writable (`poll(..., 0)` reports `POLLOUT`).
+    ///
+    /// SAFETY: Uses only POSIX async-signal-safe functions (`tcsetattr`, `poll`, `write`).
+    /// Caller must ensure `SAVED_TERMIOS` is immutable (i.e. `STATE` is `ACTIVE`, `RESTORING`,
+    /// or `TERMINATED`).
+    unsafe fn restore_terminal_async_signal_safe() {
+        // SAFETY: Caller guarantees `SAVED_TERMIOS` is immutable once `TERMIOS_SAVED` is true.
+        unsafe {
+            if TERMIOS_SAVED.load(Ordering::Acquire) {
+                let saved = (&*SAVED_TERMIOS.0.get()).assume_init_ref();
+                let _ = libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, saved);
+            }
+            let mut pfd = libc::pollfd {
+                fd: libc::STDOUT_FILENO,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            if libc::poll(&raw mut pfd, 1, 0) > 0 && (pfd.revents & libc::POLLOUT) != 0 {
+                let bytes = LEAVE_SEQUENCE.as_bytes();
                 let _ = libc::write(
                     libc::STDOUT_FILENO,
                     bytes.as_ptr().cast::<libc::c_void>(),
                     bytes.len(),
                 );
-                if TERMIOS_SAVED.load(Ordering::Acquire) {
-                    let saved = (&*SAVED_TERMIOS.0.get()).assume_init_ref();
-                    let _ = libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, saved);
+            }
+        }
+    }
+
+    /// RAII guard masking `SIGINT` and `SIGTERM` on the current thread across terminal setup so
+    /// signals cannot race with `tcgetattr` / `enable_raw_mode` / `ENTER_SEQUENCE`.
+    struct SigMaskGuard {
+        prev: libc::sigset_t,
+        active: bool,
+    }
+
+    impl SigMaskGuard {
+        fn block_term_signals() -> Self {
+            // SAFETY: Stack-allocated `sigset_t` structs initialized with `sigemptyset`.
+            unsafe {
+                let mut block: libc::sigset_t = std::mem::zeroed();
+                let mut prev: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&raw mut block);
+                libc::sigaddset(&raw mut block, libc::SIGINT);
+                libc::sigaddset(&raw mut block, libc::SIGTERM);
+                let ok =
+                    libc::pthread_sigmask(libc::SIG_BLOCK, &raw const block, &raw mut prev) == 0;
+                Self { prev, active: ok }
+            }
+        }
+    }
+
+    impl Drop for SigMaskGuard {
+        fn drop(&mut self) {
+            if self.active {
+                // SAFETY: Restoring saved signal mask for the current thread.
+                unsafe {
+                    let _ = libc::pthread_sigmask(
+                        libc::SIG_SETMASK,
+                        &raw const self.prev,
+                        std::ptr::null_mut(),
+                    );
                 }
+            }
+        }
+    }
+
+    /// Async-signal-safe terminal restore for `SIGINT` / `SIGTERM`, then re-raises default action.
+    unsafe extern "C" fn unix_signal_handler(sig: libc::c_int) {
+        let prev = STATE.swap(STATE_TERMINATED, Ordering::AcqRel);
+        if prev == STATE_ACTIVE || prev == STATE_RESTORING {
+            // SAFETY: `STATE_TERMINATED` permanently blocks `enter()` from ever writing
+            // `SAVED_TERMIOS`, and `SAVED_TERMIOS` was fully initialized before `STATE_ACTIVE`.
+            unsafe {
+                restore_terminal_async_signal_safe();
             }
         }
         // SAFETY: Reset signal to default disposition and re-raise so exit status reflects signal.
@@ -482,6 +539,10 @@ mod unix {
                 return Err(TermError::VtUnsupported);
             }
 
+            // Mask `SIGINT` and `SIGTERM` on this thread across terminal setup so a signal
+            // cannot race with `enable_raw_mode()` or `ENTER_SEQUENCE`.
+            let _sig_mask = SigMaskGuard::block_term_signals();
+
             // Capture original termios while holding exclusive `STATE_ENTERING` before installing
             // signal hooks or mutating terminal modes.
             TERMIOS_SAVED.store(false, Ordering::Release);
@@ -517,9 +578,26 @@ mod unix {
                 )));
             }
 
+            // Guard against a signal delivered to another thread while raw mode was being applied.
+            if STATE.load(Ordering::Acquire) == STATE_TERMINATED {
+                // SAFETY: `STATE_TERMINATED` guarantees `SAVED_TERMIOS` is immutable.
+                unsafe {
+                    restore_terminal_async_signal_safe();
+                }
+                return Err(TermError::AlreadyActive);
+            }
+
             if let Err(err) = write_all_stdout(ENTER_SEQUENCE) {
                 restore_terminal_now();
                 return Err(err);
+            }
+
+            if STATE.load(Ordering::Acquire) == STATE_TERMINATED {
+                // SAFETY: `STATE_TERMINATED` guarantees `SAVED_TERMIOS` is immutable.
+                unsafe {
+                    restore_terminal_async_signal_safe();
+                }
+                return Err(TermError::AlreadyActive);
             }
 
             Ok(Self { _private: () })

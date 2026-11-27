@@ -14,7 +14,7 @@ use btop_model::{
     HeadlessQuery, JsonSections, JsonSnapshotEnvelope, ProcSortField, QueryFilter, SchemaMode,
     ServiceStateFilter, SnapshotRecorder, build_json_schema,
 };
-use btop_sys::{TimerWake, WaitableWakeTimer, install_headless_ctrl_c_handler};
+use btop_sys::{TimerWake, UnbufferedStdout, WaitableWakeTimer, install_headless_ctrl_c_handler};
 use btop_term::CrosstermInput;
 use clap::error::ErrorKind;
 use clap::{CommandFactory as _, FromArgMatches as _, Parser};
@@ -610,7 +610,7 @@ fn run_headless_stream(
     ctx: HeadlessContext<'_>,
 ) -> ExitCode {
     let (stop_flag, mut waiter) = setup_interruptible_wait();
-    let mut stdout = io::stdout().lock();
+    let mut stdout = UnbufferedStdout;
     match stream_headless_snapshots(source, options, ctx, &stop_flag, &mut stdout, &mut waiter) {
         Ok(_) => ExitCode::SUCCESS,
         Err(AppError::Io(err)) => {
@@ -653,12 +653,16 @@ fn run_headless_summary(
         }
     };
 
-    if let Err(err) = write_json_summary_interruptible(
-        &mut io::stdout().lock(),
-        &summary,
-        options.pretty,
-        &stop_flag,
-    ) {
+    if summary.sample_count == 0
+        && (stop_flag.load(Ordering::SeqCst) || btop_sys::headless_signal_received())
+    {
+        return ExitCode::SUCCESS;
+    }
+
+    let mut stdout = UnbufferedStdout;
+    if let Err(err) =
+        write_json_summary_interruptible(&mut stdout, &summary, options.pretty, &stop_flag)
+    {
         if err.kind() == io::ErrorKind::BrokenPipe
             || (err.kind() == io::ErrorKind::Interrupted
                 && (stop_flag.load(Ordering::SeqCst) || btop_sys::headless_signal_received()))

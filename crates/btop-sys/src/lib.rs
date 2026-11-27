@@ -966,6 +966,21 @@ mod win {
         flag
     }
 
+    /// Unbuffered stdout writer (`WriteFile`/`stdout` on Windows) matching the Unix
+    /// `UnbufferedStdout` API used by headless `--json` streaming and summary output.
+    #[derive(Debug, Default)]
+    pub struct UnbufferedStdout;
+
+    impl std::io::Write for UnbufferedStdout {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            std::io::stdout().lock().write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            std::io::stdout().lock().flush()
+        }
+    }
+
     /// Returns `true` if a headless `Ctrl+C` / `Ctrl+Break` event was received.
     pub fn headless_signal_received() -> bool {
         if let Ok(guard) = HEADLESS_STOP_SLOT.lock()
@@ -1087,6 +1102,50 @@ mod stub {
         }
     }
 
+    /// Unbuffered stdout writer bypassing `StdoutLock`'s internal `LineWriter` buffer on Unix
+    /// so `SIGINT` / `SIGTERM` interrupts blocked pipe writes immediately with `EINTR`.
+    #[derive(Debug, Default)]
+    pub struct UnbufferedStdout;
+
+    impl std::io::Write for UnbufferedStdout {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            #[cfg(unix)]
+            {
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                // SAFETY: `buf` is a valid readable slice for `buf.len()` bytes.
+                let n = unsafe {
+                    libc::write(
+                        libc::STDOUT_FILENO,
+                        buf.as_ptr().cast::<libc::c_void>(),
+                        buf.len(),
+                    )
+                };
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(usize::try_from(n).unwrap_or(0))
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                std::io::stdout().lock().write(buf)
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            #[cfg(unix)]
+            {
+                Ok(())
+            }
+            #[cfg(not(unix))]
+            {
+                std::io::stdout().lock().flush()
+            }
+        }
+    }
+
     #[cfg(unix)]
     static UNIX_HEADLESS_SIGNAL: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
@@ -1170,6 +1229,19 @@ mod stub {
             }
             SIGNAL_PIPE_WR.store(wr, Ordering::Release);
 
+            // Mask `SIGINT` and `SIGTERM` across thread creation so the watcher thread inherits
+            // a blocked mask and never steals process-directed termination signals from the main
+            // CLI thread (which may be blocked in stdout write).
+            let mut block_set: libc::sigset_t = unsafe { core::mem::zeroed() };
+            let mut prev_set: libc::sigset_t = unsafe { core::mem::zeroed() };
+            // SAFETY: Valid stack-allocated `sigset_t` structs.
+            let masked = unsafe {
+                libc::sigemptyset(&raw mut block_set);
+                libc::sigaddset(&raw mut block_set, libc::SIGINT);
+                libc::sigaddset(&raw mut block_set, libc::SIGTERM);
+                libc::pthread_sigmask(libc::SIG_BLOCK, &raw const block_set, &raw mut prev_set) == 0
+            };
+
             let spawned = std::thread::Builder::new()
                 .name("btop-sigwait".to_owned())
                 .spawn(move || {
@@ -1193,6 +1265,17 @@ mod stub {
                         }
                     }
                 });
+
+            if masked {
+                // SAFETY: Restoring this thread's saved signal mask after thread spawn.
+                unsafe {
+                    let _ = libc::pthread_sigmask(
+                        libc::SIG_SETMASK,
+                        &raw const prev_set,
+                        core::ptr::null_mut(),
+                    );
+                }
+            }
 
             if spawned.is_err() {
                 // Leave default OS signal termination intact if the watcher thread could not start.
@@ -1232,14 +1315,14 @@ mod stub {
 
 #[cfg(not(windows))]
 pub use stub::{
-    TimerWake, TimerWaker, WaitableWakeTimer, headless_signal_received,
+    TimerWake, TimerWaker, UnbufferedStdout, WaitableWakeTimer, headless_signal_received,
     install_headless_ctrl_c_handler, query_core_efficiency_classes, query_process_information,
     query_processor_performance, query_self_cpu_time_100ns, query_self_private_working_set_bytes,
     read_cpu_model_name, read_cpu_nominal_mhz, system_uptime_secs, total_physical_memory_bytes,
 };
 #[cfg(windows)]
 pub use win::{
-    TimerWake, TimerWaker, WaitableWakeTimer, headless_signal_received,
+    TimerWake, TimerWaker, UnbufferedStdout, WaitableWakeTimer, headless_signal_received,
     install_headless_ctrl_c_handler, query_core_efficiency_classes, query_process_information,
     query_processor_performance, query_self_cpu_time_100ns, query_self_private_working_set_bytes,
     read_cpu_model_name, read_cpu_nominal_mhz, system_uptime_secs, total_physical_memory_bytes,
