@@ -14,10 +14,10 @@ use btop_sys::{NvmlLibrary, RawGpuAdapter, RawNvmlDevice};
 const NVIDIA_VENDOR_ID: u32 = 0x10DE;
 
 /// Background NVML polling cadence.
-pub const NVML_POLL_INTERVAL: Duration = Duration::from_millis(1000);
+pub const NVML_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Age threshold after which an unrefreshed NVML sample degrades to `DataState::Stale`.
-pub const NVML_STALE_TIMEOUT: Duration = Duration::from_millis(5000);
+pub const NVML_STALE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Non-blocking snapshot of the latest NVML enrichment state.
 #[derive(Debug, Clone, PartialEq)]

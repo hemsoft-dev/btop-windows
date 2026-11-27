@@ -965,6 +965,51 @@ mod win {
         });
         flag
     }
+
+    /// Unbuffered stdout writer (`WriteFile`/`stdout` on Windows) matching the Unix
+    /// `UnbufferedStdout` API used by headless `--json` streaming and summary output.
+    #[derive(Debug, Default)]
+    pub struct UnbufferedStdout;
+
+    impl std::io::Write for UnbufferedStdout {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            std::io::stdout().lock().write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            std::io::stdout().lock().flush()
+        }
+    }
+
+    /// Bounded stdout writer (delegates directly to `io::stdout().lock()` on Windows).
+    #[derive(Debug)]
+    pub struct BoundedStdout;
+
+    impl BoundedStdout {
+        pub fn new(_timeout: Duration) -> Self {
+            Self
+        }
+    }
+
+    impl std::io::Write for BoundedStdout {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            std::io::stdout().lock().write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            std::io::stdout().lock().flush()
+        }
+    }
+
+    /// Returns `true` if a headless `Ctrl+C` / `Ctrl+Break` event was received.
+    pub fn headless_signal_received() -> bool {
+        if let Ok(guard) = HEADLESS_STOP_SLOT.lock()
+            && let Some((ref flag, _)) = *guard
+        {
+            return flag.load(std::sync::atomic::Ordering::SeqCst);
+        }
+        false
+    }
 }
 
 #[cfg(not(windows))]
@@ -1077,7 +1122,421 @@ mod stub {
         }
     }
 
-    /// Portable no-op Ctrl+C handler stub for non-Windows builds.
+    /// Maximum bytes written per `libc::write` after `poll(POLLOUT)` on Unix so a pipe write
+    /// never exceeds POSIX `_POSIX_PIPE_BUF` (512) and cannot block after `POLLOUT` is reported.
+    #[cfg(unix)]
+    const MAX_NONBLOCK_PIPE_CHUNK: usize = 512;
+
+    /// Unbuffered stdout writer bypassing `StdoutLock`'s internal `LineWriter` buffer on Unix
+    /// and polling `STDOUT_FILENO` alongside the signal cancel pipe so `SIGINT` / `SIGTERM`
+    /// never races with a blocking pipe write.
+    #[derive(Debug, Default)]
+    pub struct UnbufferedStdout;
+
+    impl std::io::Write for UnbufferedStdout {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            #[cfg(unix)]
+            {
+                use std::sync::atomic::Ordering;
+
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                if headless_signal_received() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "stdout write interrupted by signal",
+                    ));
+                }
+                let cancel_rd = UNIX_CANCEL_PIPE_RD.load(Ordering::Acquire);
+                if cancel_rd >= 0 {
+                    let mut pfds = [
+                        libc::pollfd {
+                            fd: libc::STDOUT_FILENO,
+                            events: libc::POLLOUT,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: cancel_rd,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                    ];
+                    // SAFETY: `pfds` is a valid 2-element stack array of `pollfd`.
+                    let rc = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+                    if rc < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if (pfds[1].revents & libc::POLLIN) != 0 || headless_signal_received() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "stdout write interrupted by signal",
+                        ));
+                    }
+                }
+                let chunk_len = buf.len().min(MAX_NONBLOCK_PIPE_CHUNK);
+                // SAFETY: `buf` has at least `chunk_len` readable bytes.
+                let n = unsafe {
+                    libc::write(
+                        libc::STDOUT_FILENO,
+                        buf.as_ptr().cast::<libc::c_void>(),
+                        chunk_len,
+                    )
+                };
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(usize::try_from(n).unwrap_or(0))
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                std::io::stdout().lock().write(buf)
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            #[cfg(unix)]
+            {
+                Ok(())
+            }
+            #[cfg(not(unix))]
+            {
+                std::io::stdout().lock().flush()
+            }
+        }
+    }
+
+    /// Stdout writer with a bounded wait deadline on Unix so writing a partial summary after an
+    /// interrupting `SIGINT` / `SIGTERM` completes immediately on normal output but never hangs
+    /// indefinitely on a full, unread stdout pipe.
+    #[derive(Debug)]
+    pub struct BoundedStdout {
+        #[cfg(unix)]
+        deadline: std::time::Instant,
+    }
+
+    impl BoundedStdout {
+        /// Creates a bounded stdout writer that allows up to `timeout` waiting for stdout
+        /// writability on Unix (delegating directly to `io::stdout().lock()` on non-Unix).
+        pub fn new(timeout: Duration) -> Self {
+            #[cfg(unix)]
+            {
+                Self {
+                    deadline: std::time::Instant::now() + timeout,
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = timeout;
+                Self {}
+            }
+        }
+    }
+
+    impl std::io::Write for BoundedStdout {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            #[cfg(unix)]
+            {
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                let remaining = self
+                    .deadline
+                    .saturating_duration_since(std::time::Instant::now());
+                let timeout_ms = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
+                let mut pfd = libc::pollfd {
+                    fd: libc::STDOUT_FILENO,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                // SAFETY: `pfd` is a valid stack-allocated `pollfd`.
+                let rc = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
+                if rc < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if rc == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "timed out waiting for stdout pipe to drain",
+                    ));
+                }
+                let chunk_len = buf.len().min(MAX_NONBLOCK_PIPE_CHUNK);
+                // SAFETY: `buf` has at least `chunk_len` readable bytes.
+                let n = unsafe {
+                    libc::write(
+                        libc::STDOUT_FILENO,
+                        buf.as_ptr().cast::<libc::c_void>(),
+                        chunk_len,
+                    )
+                };
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(usize::try_from(n).unwrap_or(0))
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                std::io::stdout().lock().write(buf)
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            #[cfg(unix)]
+            {
+                Ok(())
+            }
+            #[cfg(not(unix))]
+            {
+                std::io::stdout().lock().flush()
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    static UNIX_HEADLESS_SIGNAL: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Returns `true` if a headless `SIGINT` / `SIGTERM` signal has been received on Unix.
+    #[cfg(unix)]
+    pub fn headless_signal_received() -> bool {
+        UNIX_HEADLESS_SIGNAL.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(not(unix))]
+    pub fn headless_signal_received() -> bool {
+        false
+    }
+
+    #[cfg(unix)]
+    static UNIX_SIGNAL_PIPE_WR: std::sync::atomic::AtomicI32 =
+        std::sync::atomic::AtomicI32::new(-1);
+    #[cfg(unix)]
+    static UNIX_CANCEL_PIPE_RD: std::sync::atomic::AtomicI32 =
+        std::sync::atomic::AtomicI32::new(-1);
+    #[cfg(unix)]
+    static UNIX_CANCEL_PIPE_WR: std::sync::atomic::AtomicI32 =
+        std::sync::atomic::AtomicI32::new(-1);
+    #[cfg(unix)]
+    static UNIX_STOP_SLOT: Mutex<Option<(Arc<std::sync::atomic::AtomicBool>, TimerWaker)>> =
+        Mutex::new(None);
+
+    #[cfg(unix)]
+    unsafe extern "C" fn unix_headless_signal_handler(sig: libc::c_int) {
+        use std::sync::atomic::Ordering;
+
+        let already_signaled = UNIX_HEADLESS_SIGNAL.swap(true, Ordering::SeqCst);
+        if already_signaled {
+            // Second signal terminates immediately via default OS disposition.
+            // SAFETY: Resetting signal disposition, unmasking `sig`, and re-raising are POSIX
+            // async-signal-safe.
+            unsafe {
+                let mut sa: libc::sigaction = core::mem::zeroed();
+                sa.sa_sigaction = libc::SIG_DFL;
+                sa.sa_flags = 0;
+                libc::sigemptyset(&raw mut sa.sa_mask);
+                let _ = libc::sigaction(sig, &raw const sa, core::ptr::null_mut());
+                let mut unblock: libc::sigset_t = core::mem::zeroed();
+                libc::sigemptyset(&raw mut unblock);
+                libc::sigaddset(&raw mut unblock, sig);
+                let _ = libc::pthread_sigmask(
+                    libc::SIG_UNBLOCK,
+                    &raw const unblock,
+                    core::ptr::null_mut(),
+                );
+                let _ = libc::raise(sig);
+            }
+            return;
+        }
+        let byte = 1u8;
+        let cancel_fd = UNIX_CANCEL_PIPE_WR.load(Ordering::Acquire);
+        if cancel_fd >= 0 {
+            // SAFETY: `write` on a non-blocking pipe fd is async-signal-safe per POSIX.
+            unsafe {
+                let _ = libc::write(cancel_fd, (&raw const byte).cast::<libc::c_void>(), 1);
+            }
+        }
+        let fd = UNIX_SIGNAL_PIPE_WR.load(Ordering::Acquire);
+        if fd >= 0 {
+            // SAFETY: `write` on a non-blocking pipe fd is async-signal-safe per POSIX.
+            unsafe {
+                let _ = libc::write(fd, (&raw const byte).cast::<libc::c_void>(), 1);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn configure_pipe_fd(fd: libc::c_int, nonblocking: bool) {
+        // SAFETY: Setting `FD_CLOEXEC` and optional `O_NONBLOCK` on a newly opened pipe fd.
+        unsafe {
+            let _ = libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            if nonblocking {
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                if flags >= 0 {
+                    let _ = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn drain_nonblocking_fd(fd: libc::c_int) {
+        if fd < 0 {
+            return;
+        }
+        let mut buf = [0u8; 32];
+        loop {
+            // SAFETY: Non-blocking read into stack buffer to clear stale wake bytes.
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+            if n <= 0 {
+                break;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn spawn_unix_signal_watcher(rd: libc::c_int) -> std::io::Result<std::thread::JoinHandle<()>> {
+        use std::sync::atomic::Ordering;
+
+        // Mask `SIGINT` and `SIGTERM` across thread creation so the watcher thread inherits
+        // a blocked mask and never steals process-directed termination signals from the main
+        // CLI thread (which may be blocked in stdout write).
+        let mut block_set: libc::sigset_t = unsafe { core::mem::zeroed() };
+        let mut prev_set: libc::sigset_t = unsafe { core::mem::zeroed() };
+        // SAFETY: Valid stack-allocated `sigset_t` structs.
+        let masked = unsafe {
+            libc::sigemptyset(&raw mut block_set);
+            libc::sigaddset(&raw mut block_set, libc::SIGINT);
+            libc::sigaddset(&raw mut block_set, libc::SIGTERM);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &raw const block_set, &raw mut prev_set) == 0
+        };
+
+        let spawned = std::thread::Builder::new()
+            .name("btop-sigwait".to_owned())
+            .spawn(move || {
+                let mut buf = [0u8; 16];
+                loop {
+                    // SAFETY: Blocking read on dedicated pipe read end.
+                    let n = unsafe {
+                        libc::read(rd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len())
+                    };
+                    if n > 0 {
+                        let guard = match UNIX_STOP_SLOT.lock() {
+                            Ok(g) => g,
+                            Err(p) => p.into_inner(),
+                        };
+                        if let Some((ref stop_flag, ref waker)) = *guard {
+                            stop_flag.store(true, Ordering::SeqCst);
+                            waker.wake();
+                        }
+                    } else if n == 0 {
+                        break;
+                    }
+                }
+            });
+
+        if masked {
+            // SAFETY: Restoring this thread's saved signal mask after thread spawn.
+            unsafe {
+                let _ = libc::pthread_sigmask(
+                    libc::SIG_SETMASK,
+                    &raw const prev_set,
+                    core::ptr::null_mut(),
+                );
+            }
+        }
+
+        spawned
+    }
+
+    /// Installs a `SIGINT` / `SIGTERM` handler for headless streaming/summary mode on Unix that
+    /// sets the returned flag and immediately wakes `waker` via an async-signal-safe self-pipe.
+    ///
+    /// Signal handlers are installed only after the pipe and watcher thread both start cleanly,
+    /// without `SA_RESTART` so blocked stdout writes return `EINTR` immediately; a second signal
+    /// falls back to the OS default termination disposition.
+    #[cfg(unix)]
+    pub fn install_headless_ctrl_c_handler(
+        waker: TimerWaker,
+    ) -> Arc<std::sync::atomic::AtomicBool> {
+        use std::sync::Once;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static INSTALLED: Once = Once::new();
+
+        UNIX_HEADLESS_SIGNAL.store(false, Ordering::SeqCst);
+        drain_nonblocking_fd(UNIX_CANCEL_PIPE_RD.load(Ordering::Acquire));
+        let flag = Arc::new(AtomicBool::new(false));
+        match UNIX_STOP_SLOT.lock() {
+            Ok(mut guard) => *guard = Some((Arc::clone(&flag), waker)),
+            Err(poisoned) => *poisoned.into_inner() = Some((Arc::clone(&flag), waker)),
+        }
+
+        INSTALLED.call_once(|| {
+            let mut sig_fds = [-1 as libc::c_int; 2];
+            // SAFETY: Creating local self-pipe for watcher thread wakeups.
+            if unsafe { libc::pipe(sig_fds.as_mut_ptr()) } != 0 {
+                return;
+            }
+            let (sig_rd, sig_wr) = (sig_fds[0], sig_fds[1]);
+            configure_pipe_fd(sig_rd, false);
+            configure_pipe_fd(sig_wr, true);
+
+            let mut cancel_fds = [-1 as libc::c_int; 2];
+            // SAFETY: Creating level-triggered cancel pipe polled alongside `STDOUT_FILENO`.
+            if unsafe { libc::pipe(cancel_fds.as_mut_ptr()) } != 0 {
+                // SAFETY: Closing descriptors owned solely by this failed init path.
+                unsafe {
+                    let _ = libc::close(sig_rd);
+                    let _ = libc::close(sig_wr);
+                }
+                return;
+            }
+            let (cancel_rd, cancel_wr) = (cancel_fds[0], cancel_fds[1]);
+            configure_pipe_fd(cancel_rd, true);
+            configure_pipe_fd(cancel_wr, true);
+
+            UNIX_SIGNAL_PIPE_WR.store(sig_wr, Ordering::Release);
+            UNIX_CANCEL_PIPE_RD.store(cancel_rd, Ordering::Release);
+            UNIX_CANCEL_PIPE_WR.store(cancel_wr, Ordering::Release);
+
+            if spawn_unix_signal_watcher(sig_rd).is_err() {
+                // Leave default OS signal termination intact if the watcher thread could not start.
+                UNIX_SIGNAL_PIPE_WR.store(-1, Ordering::Release);
+                UNIX_CANCEL_PIPE_RD.store(-1, Ordering::Release);
+                UNIX_CANCEL_PIPE_WR.store(-1, Ordering::Release);
+                // SAFETY: Closing pipe descriptors owned solely by this failed init path.
+                unsafe {
+                    let _ = libc::close(sig_rd);
+                    let _ = libc::close(sig_wr);
+                    let _ = libc::close(cancel_rd);
+                    let _ = libc::close(cancel_wr);
+                }
+                return;
+            }
+
+            for sig in [libc::SIGINT, libc::SIGTERM] {
+                // SAFETY: Installing async-signal-safe `unix_headless_signal_handler` without
+                // `SA_RESTART` and masking both `SIGINT` and `SIGTERM` during handler execution.
+                unsafe {
+                    let mut sa: libc::sigaction = core::mem::zeroed();
+                    sa.sa_sigaction =
+                        unix_headless_signal_handler as *const () as libc::sighandler_t;
+                    sa.sa_flags = 0;
+                    libc::sigemptyset(&raw mut sa.sa_mask);
+                    libc::sigaddset(&raw mut sa.sa_mask, libc::SIGINT);
+                    libc::sigaddset(&raw mut sa.sa_mask, libc::SIGTERM);
+                    let _ = libc::sigaction(sig, &raw const sa, core::ptr::null_mut());
+                }
+            }
+        });
+
+        flag
+    }
+
+    /// Portable no-op Ctrl+C handler stub for non-Windows, non-Unix targets.
+    #[cfg(not(unix))]
     pub fn install_headless_ctrl_c_handler(
         _waker: TimerWaker,
     ) -> Arc<std::sync::atomic::AtomicBool> {
@@ -1087,17 +1546,19 @@ mod stub {
 
 #[cfg(not(windows))]
 pub use stub::{
-    TimerWake, TimerWaker, WaitableWakeTimer, install_headless_ctrl_c_handler,
-    query_core_efficiency_classes, query_process_information, query_processor_performance,
-    query_self_cpu_time_100ns, query_self_private_working_set_bytes, read_cpu_model_name,
-    read_cpu_nominal_mhz, system_uptime_secs, total_physical_memory_bytes,
+    BoundedStdout, TimerWake, TimerWaker, UnbufferedStdout, WaitableWakeTimer,
+    headless_signal_received, install_headless_ctrl_c_handler, query_core_efficiency_classes,
+    query_process_information, query_processor_performance, query_self_cpu_time_100ns,
+    query_self_private_working_set_bytes, read_cpu_model_name, read_cpu_nominal_mhz,
+    system_uptime_secs, total_physical_memory_bytes,
 };
 #[cfg(windows)]
 pub use win::{
-    TimerWake, TimerWaker, WaitableWakeTimer, install_headless_ctrl_c_handler,
-    query_core_efficiency_classes, query_process_information, query_processor_performance,
-    query_self_cpu_time_100ns, query_self_private_working_set_bytes, read_cpu_model_name,
-    read_cpu_nominal_mhz, system_uptime_secs, total_physical_memory_bytes,
+    BoundedStdout, TimerWake, TimerWaker, UnbufferedStdout, WaitableWakeTimer,
+    headless_signal_received, install_headless_ctrl_c_handler, query_core_efficiency_classes,
+    query_process_information, query_processor_performance, query_self_cpu_time_100ns,
+    query_self_private_working_set_bytes, read_cpu_model_name, read_cpu_nominal_mhz,
+    system_uptime_secs, total_physical_memory_bytes,
 };
 
 #[cfg(test)]

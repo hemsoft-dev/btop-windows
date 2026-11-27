@@ -8,7 +8,10 @@ use std::fmt::Write as _;
 
 use unicode_width::UnicodeWidthChar;
 
-pub use backend::{ENTER_SEQUENCE, LEAVE_SEQUENCE, TermError, TerminalGuard, restore_terminal_now};
+pub use backend::{
+    ENTER_SEQUENCE, LEAVE_SEQUENCE, TermError, TerminalGuard, restore_terminal_now,
+    with_term_signals_masked,
+};
 pub use input::{
     CrosstermInput, InputSource, KeyCode, KeyEvent, MouseButton, MouseEvent, MouseKind, TermEvent,
     VecInputSource,

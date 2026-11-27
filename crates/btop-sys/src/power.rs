@@ -68,7 +68,23 @@ pub fn query_system_power_status() -> Result<RawPowerStatus, String> {
     Err("GetSystemPowerStatus is only available on Windows".to_owned())
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+pub fn local_utc_offset_secs() -> i32 {
+    // SAFETY: `libc::time` and `libc::localtime_r` operate on stack-allocated POD structs.
+    unsafe {
+        let now = libc::time(core::ptr::null_mut());
+        if now == -1 {
+            return 0;
+        }
+        let mut tm: libc::tm = core::mem::zeroed();
+        if libc::localtime_r(&raw const now, &raw mut tm).is_null() {
+            return 0;
+        }
+        i32::try_from(tm.tm_gmtoff).unwrap_or(0)
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
 pub fn local_utc_offset_secs() -> i32 {
     0
 }

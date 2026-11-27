@@ -6,7 +6,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum TermError {
     #[error(
-        "virtual terminal mode is not supported by this console; run btop-windows in Windows Terminal on Windows 11"
+        "virtual terminal mode is not supported by this console; run inside a modern UTF-8 terminal"
     )]
     VtUnsupported,
     #[error("console handle error: {0}")]
@@ -15,7 +15,7 @@ pub enum TermError {
     Input(String),
     #[error("a terminal guard is already active")]
     AlreadyActive,
-    #[error("live terminal backend is only supported on Windows")]
+    #[error("live terminal backend is not supported on this platform")]
     UnsupportedPlatform,
 }
 
@@ -277,6 +277,11 @@ mod win {
         }
     }
 
+    /// No-op on Windows where POSIX thread signal masks do not apply.
+    pub fn with_term_signals_masked<T>(f: impl FnOnce() -> T) -> T {
+        f()
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -328,12 +333,449 @@ mod win {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+mod unix {
+    use std::cell::UnsafeCell;
+    use std::io::{self, IsTerminal, Write as _};
+    use std::mem::MaybeUninit;
+    use std::sync::Once;
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+    use super::{ENTER_SEQUENCE, LEAVE_SEQUENCE, TermError};
+    use crate::Size;
+
+    const STATE_INACTIVE: u8 = 0;
+    const STATE_ENTERING: u8 = 1;
+    const STATE_ACTIVE: u8 = 2;
+    const STATE_RESTORING: u8 = 3;
+    const STATE_TERMINATED: u8 = 4;
+
+    /// Sync wrapper for saved POSIX `termios`, written only while holding exclusive
+    /// `STATE_ENTERING` and read only in `STATE_ACTIVE`, `STATE_RESTORING`, or
+    /// `STATE_TERMINATED` (which permanently prevents any future `enter()` write).
+    struct SavedTermiosSlot(UnsafeCell<MaybeUninit<libc::termios>>);
+
+    // SAFETY: `STATE` enforces strict single-writer ownership during `STATE_ENTERING`
+    // and immutable read-only access in `STATE_ACTIVE`, `STATE_RESTORING`, and
+    // `STATE_TERMINATED` (which never transitions back to `STATE_INACTIVE`).
+    unsafe impl Sync for SavedTermiosSlot {}
+
+    static STATE: AtomicU8 = AtomicU8::new(STATE_INACTIVE);
+    static TERMIOS_SAVED: AtomicBool = AtomicBool::new(false);
+    static RESTORE_DONE: AtomicBool = AtomicBool::new(true);
+    static SAVED_TERMIOS: SavedTermiosSlot =
+        SavedTermiosSlot(UnsafeCell::new(MaybeUninit::uninit()));
+    static HOOKS_INSTALLED: Once = Once::new();
+
+    /// Executes `f` with `SIGINT` and `SIGTERM` masked on the current thread so background TUI
+    /// threads spawned inside `f` inherit a blocked termination-signal mask.
+    pub fn with_term_signals_masked<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = SigMaskGuard::block_term_signals();
+        f()
+    }
+
+    fn write_all_stdout(text: &str) -> Result<(), TermError> {
+        let mut out = io::stdout().lock();
+        out.write_all(text.as_bytes())
+            .and_then(|()| out.flush())
+            .map_err(|err| TermError::Console(format!("stdout write failed: {err}")))
+    }
+
+    /// Writes `LEAVE_SEQUENCE` directly to `STDOUT_FILENO` using a bounded `poll` so neither
+    /// signal teardown nor normal/panic teardown can hang on a stalled PTY output queue or
+    /// deadlock on `io::stdout().lock()`.
+    ///
+    /// SAFETY: Uses only POSIX async-signal-safe functions (`tcflush`, `poll`, `write`).
+    unsafe fn write_leave_sequence_bounded(flush_first: bool) {
+        // SAFETY: Stack-allocated `pollfd` and static `LEAVE_SEQUENCE` byte slice.
+        unsafe {
+            if flush_first {
+                let _ = libc::tcflush(libc::STDOUT_FILENO, libc::TCOFLUSH);
+            }
+            let mut pfd = libc::pollfd {
+                fd: libc::STDOUT_FILENO,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let mut ready =
+                libc::poll(&raw mut pfd, 1, 100) > 0 && (pfd.revents & libc::POLLOUT) != 0;
+            if !ready && !flush_first {
+                // Output queue appears stalled; flush stale frame bytes so `LEAVE_SEQUENCE` fits.
+                let _ = libc::tcflush(libc::STDOUT_FILENO, libc::TCOFLUSH);
+                pfd.revents = 0;
+                ready = libc::poll(&raw mut pfd, 1, 50) > 0 && (pfd.revents & libc::POLLOUT) != 0;
+            }
+            if ready {
+                let bytes = LEAVE_SEQUENCE.as_bytes();
+                let mut written = 0usize;
+                for _ in 0..8 {
+                    if written >= bytes.len() {
+                        break;
+                    }
+                    let n = libc::write(
+                        libc::STDOUT_FILENO,
+                        bytes[written..].as_ptr().cast::<libc::c_void>(),
+                        bytes.len() - written,
+                    );
+                    match n.cmp(&0) {
+                        std::cmp::Ordering::Greater => {
+                            written += usize::try_from(n).unwrap_or(0);
+                        }
+                        std::cmp::Ordering::Less => {
+                            pfd.revents = 0;
+                            if libc::poll(&raw mut pfd, 1, 20) <= 0
+                                || (pfd.revents & libc::POLLOUT) == 0
+                            {
+                                break;
+                            }
+                        }
+                        std::cmp::Ordering::Equal => break,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Restores saved `termios` first (never blocks on a stalled PTY output queue), flushes any
+    /// queued unsent frame bytes (`TCOFLUSH`) so `LEAVE_SEQUENCE` fits in the PTY buffer, then
+    /// writes `LEAVE_SEQUENCE` if stdout becomes writable within a short bounded timeout.
+    ///
+    /// SAFETY: Uses only POSIX async-signal-safe functions (`tcsetattr`, `tcflush`, `poll`,
+    /// `write`). Caller must ensure `SAVED_TERMIOS` is immutable (i.e. `STATE` is `ACTIVE`,
+    /// `RESTORING`, or `TERMINATED`).
+    unsafe fn restore_terminal_async_signal_safe() {
+        // SAFETY: Caller guarantees `SAVED_TERMIOS` is immutable once `TERMIOS_SAVED` is true.
+        unsafe {
+            if TERMIOS_SAVED.load(Ordering::Acquire) {
+                let saved = (&*SAVED_TERMIOS.0.get()).assume_init_ref();
+                let _ = libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, saved);
+            }
+            write_leave_sequence_bounded(true);
+        }
+    }
+
+    /// RAII guard masking `SIGINT` and `SIGTERM` on the current thread across terminal setup so
+    /// signals cannot race with `tcgetattr` / `enable_raw_mode`.
+    struct SigMaskGuard {
+        prev: libc::sigset_t,
+        active: bool,
+    }
+
+    impl SigMaskGuard {
+        fn block_term_signals() -> Self {
+            // SAFETY: Stack-allocated `sigset_t` structs initialized with `sigemptyset`.
+            unsafe {
+                let mut block: libc::sigset_t = std::mem::zeroed();
+                let mut prev: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&raw mut block);
+                libc::sigaddset(&raw mut block, libc::SIGINT);
+                libc::sigaddset(&raw mut block, libc::SIGTERM);
+                let ok =
+                    libc::pthread_sigmask(libc::SIG_BLOCK, &raw const block, &raw mut prev) == 0;
+                Self { prev, active: ok }
+            }
+        }
+    }
+
+    impl Drop for SigMaskGuard {
+        fn drop(&mut self) {
+            if self.active {
+                // SAFETY: Restoring saved signal mask for the current thread.
+                unsafe {
+                    let _ = libc::pthread_sigmask(
+                        libc::SIG_SETMASK,
+                        &raw const self.prev,
+                        std::ptr::null_mut(),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Async-signal-safe terminal restore for `SIGINT` / `SIGTERM`, then re-raises default action.
+    unsafe extern "C" fn unix_signal_handler(sig: libc::c_int) {
+        let prev = STATE.swap(STATE_TERMINATED, Ordering::AcqRel);
+        if prev == STATE_ACTIVE || prev == STATE_RESTORING {
+            // SAFETY: `STATE_TERMINATED` permanently blocks `enter()` from ever writing
+            // `SAVED_TERMIOS`, and `SAVED_TERMIOS` was fully initialized before `STATE_ACTIVE`.
+            unsafe {
+                restore_terminal_async_signal_safe();
+            }
+            RESTORE_DONE.store(true, Ordering::Release);
+        } else if prev == STATE_TERMINATED {
+            // Another thread already won the transition to `STATE_TERMINATED` and is actively
+            // running `restore_terminal_async_signal_safe()`. Wait briefly using async-signal-safe
+            // `poll(null, 0, 5)` so re-raising our signal cannot terminate the process mid-restore.
+            for _ in 0..60 {
+                if RESTORE_DONE.load(Ordering::Acquire) {
+                    break;
+                }
+                // SAFETY: POSIX `poll` with 0 fds is async-signal-safe and sleeps 5ms.
+                unsafe {
+                    let _ = libc::poll(std::ptr::null_mut(), 0, 5);
+                }
+            }
+        } else {
+            RESTORE_DONE.store(true, Ordering::Release);
+        }
+        // SAFETY: Reset `sig` to default disposition, unmask `sig` (keeping the sibling
+        // termination signal masked until termination), and re-raise so exit status reflects `sig`.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = libc::SIG_DFL;
+            sa.sa_flags = 0;
+            libc::sigemptyset(&raw mut sa.sa_mask);
+            let _ = libc::sigaction(sig, &raw const sa, std::ptr::null_mut());
+            let mut unblock: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&raw mut unblock);
+            libc::sigaddset(&raw mut unblock, sig);
+            let _ =
+                libc::pthread_sigmask(libc::SIG_UNBLOCK, &raw const unblock, std::ptr::null_mut());
+            let _ = libc::raise(sig);
+        }
+    }
+
+    fn install_global_restore_hooks() {
+        HOOKS_INSTALLED.call_once(|| {
+            let previous_hook = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                restore_terminal_now();
+                previous_hook(info);
+            }));
+
+            for sig in [libc::SIGINT, libc::SIGTERM] {
+                // SAFETY: `unix_signal_handler` uses only async-signal-safe POSIX calls, and
+                // masking both `SIGINT` and `SIGTERM` in `sa_mask` prevents overlapping signals
+                // from cutting terminal restoration short.
+                unsafe {
+                    let mut sa: libc::sigaction = std::mem::zeroed();
+                    sa.sa_sigaction = unix_signal_handler as *const () as libc::sighandler_t;
+                    sa.sa_flags = 0;
+                    libc::sigemptyset(&raw mut sa.sa_mask);
+                    libc::sigaddset(&raw mut sa.sa_mask, libc::SIGINT);
+                    libc::sigaddset(&raw mut sa.sa_mask, libc::SIGTERM);
+                    let _ = libc::sigaction(sig, &raw const sa, std::ptr::null_mut());
+                }
+            }
+        });
+    }
+
+    /// Restores the POSIX terminal if a `TerminalGuard` is currently active. Idempotent.
+    ///
+    /// Restores input mode (`termios`) first before writing `LEAVE_SEQUENCE` through a bounded
+    /// non-hanging stdout path so a stalled PTY reader cannot leave raw mode enabled.
+    pub fn restore_terminal_now() {
+        if STATE
+            .compare_exchange(
+                STATE_ACTIVE,
+                STATE_RESTORING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        if crossterm::terminal::disable_raw_mode().is_err() && TERMIOS_SAVED.load(Ordering::Acquire)
+        {
+            // SAFETY: `SAVED_TERMIOS` is immutable while in `STATE_RESTORING` or `STATE_TERMINATED`.
+            unsafe {
+                let saved = (&*SAVED_TERMIOS.0.get()).assume_init_ref();
+                let _ = libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, saved);
+            }
+        }
+        // SAFETY: Uses bounded `poll` + direct `STDOUT_FILENO` writes so neither normal quit nor
+        // a panic hook can hang on a stalled PTY or deadlock on `io::stdout().lock()`.
+        unsafe {
+            write_leave_sequence_bounded(false);
+        }
+        // Transition back to `STATE_INACTIVE` only if a signal did not latch `STATE_TERMINATED`.
+        let _ = STATE.compare_exchange(
+            STATE_RESTORING,
+            STATE_INACTIVE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// RAII guard owning POSIX raw input mode, alternate screen, SGR mouse, and focus tracking.
+    #[derive(Debug)]
+    pub struct TerminalGuard {
+        _private: (),
+    }
+
+    impl TerminalGuard {
+        /// Enters POSIX raw mode and alternate screen, installing panic and signal restore hooks.
+        pub fn enter() -> Result<Self, TermError> {
+            if STATE
+                .compare_exchange(
+                    STATE_INACTIVE,
+                    STATE_ENTERING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                return Err(TermError::AlreadyActive);
+            }
+
+            if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+                let _ = STATE.compare_exchange(
+                    STATE_ENTERING,
+                    STATE_INACTIVE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                return Err(TermError::VtUnsupported);
+            }
+
+            // Mask `SIGINT` and `SIGTERM` across the non-blocking ioctl setup (`tcgetattr`,
+            // signal hook registration, `enable_raw_mode`, and publishing `STATE_ACTIVE`) so
+            // signals cannot race with mode mutation, then unmask before writing `ENTER_SEQUENCE`
+            // so a full PTY never hangs with termination signals blocked.
+            {
+                let _sig_mask = SigMaskGuard::block_term_signals();
+
+                // Capture original termios while holding exclusive `STATE_ENTERING` before
+                // installing signal hooks or mutating terminal modes.
+                TERMIOS_SAVED.store(false, Ordering::Release);
+                let mut orig: libc::termios = unsafe { std::mem::zeroed() };
+                // SAFETY: `STDIN_FILENO` was just verified to be a terminal.
+                if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &raw mut orig) } == 0 {
+                    // SAFETY: `STATE_ENTERING` guarantees exclusive write access to `SAVED_TERMIOS`.
+                    unsafe {
+                        (*SAVED_TERMIOS.0.get()).write(orig);
+                    }
+                    TERMIOS_SAVED.store(true, Ordering::Release);
+                }
+
+                // Install panic and signal restore hooks before mutating raw mode.
+                RESTORE_DONE.store(false, Ordering::Release);
+                install_global_restore_hooks();
+
+                if let Err(err) = crossterm::terminal::enable_raw_mode() {
+                    if TERMIOS_SAVED.load(Ordering::Acquire) {
+                        // SAFETY: Still in `STATE_ENTERING` (or `STATE_TERMINATED`); `SAVED_TERMIOS` is initialized.
+                        unsafe {
+                            let saved = (&*SAVED_TERMIOS.0.get()).assume_init_ref();
+                            let _ = libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, saved);
+                        }
+                    }
+                    let _ = STATE.compare_exchange(
+                        STATE_ENTERING,
+                        STATE_INACTIVE,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                    return Err(TermError::Console(format!(
+                        "failed to enable raw terminal mode: {err}"
+                    )));
+                }
+
+                if STATE
+                    .compare_exchange(
+                        STATE_ENTERING,
+                        STATE_ACTIVE,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    // A signal already transitioned `STATE` to `STATE_TERMINATED`; ensure raw mode
+                    // we just enabled is restored immediately.
+                    if TERMIOS_SAVED.load(Ordering::Acquire) {
+                        // SAFETY: `STATE_TERMINATED` guarantees `SAVED_TERMIOS` is immutable.
+                        unsafe {
+                            restore_terminal_async_signal_safe();
+                        }
+                    }
+                    return Err(TermError::AlreadyActive);
+                }
+            }
+
+            if let Err(err) = write_all_stdout(ENTER_SEQUENCE) {
+                restore_terminal_now();
+                return Err(err);
+            }
+
+            if STATE.load(Ordering::Acquire) == STATE_TERMINATED {
+                // SAFETY: `STATE_TERMINATED` guarantees `SAVED_TERMIOS` is immutable.
+                unsafe {
+                    restore_terminal_async_signal_safe();
+                }
+                return Err(TermError::AlreadyActive);
+            }
+
+            Ok(Self { _private: () })
+        }
+
+        /// Queries current visible viewport dimensions from the POSIX terminal.
+        pub fn size(&self) -> Result<Size, TermError> {
+            let (width, height) = crossterm::terminal::size()
+                .map_err(|err| TermError::Console(format!("terminal size query failed: {err}")))?;
+            Ok(Size { width, height })
+        }
+
+        /// Writes an encoded ANSI/VT frame in a single stdout write + flush pass.
+        pub fn write_frame(&mut self, frame: &str) -> Result<(), TermError> {
+            write_all_stdout(frame)
+        }
+    }
+
+    impl Drop for TerminalGuard {
+        fn drop(&mut self) {
+            restore_terminal_now();
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::sync::Mutex;
+
+        use super::*;
+
+        static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+        #[test]
+        fn second_enter_is_rejected_when_active_or_terminated() {
+            let _guard = TEST_LOCK.lock().expect("lock unix backend tests");
+            STATE.store(STATE_ACTIVE, Ordering::SeqCst);
+            assert!(matches!(
+                TerminalGuard::enter(),
+                Err(TermError::AlreadyActive)
+            ));
+
+            STATE.store(STATE_TERMINATED, Ordering::SeqCst);
+            assert!(matches!(
+                TerminalGuard::enter(),
+                Err(TermError::AlreadyActive)
+            ));
+
+            STATE.store(STATE_INACTIVE, Ordering::SeqCst);
+        }
+
+        #[test]
+        fn restore_when_inactive_or_terminated_is_a_safe_noop() {
+            let _guard = TEST_LOCK.lock().expect("lock unix backend tests");
+            STATE.store(STATE_INACTIVE, Ordering::SeqCst);
+            restore_terminal_now();
+            assert_eq!(STATE.load(Ordering::Acquire), STATE_INACTIVE);
+
+            STATE.store(STATE_TERMINATED, Ordering::SeqCst);
+            restore_terminal_now();
+            assert_eq!(STATE.load(Ordering::Acquire), STATE_TERMINATED);
+
+            STATE.store(STATE_INACTIVE, Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
 mod stub {
     use super::TermError;
     use crate::Size;
 
-    /// Non-Windows stub allowing portable crates and tests to compile on Linux.
+    /// Fallback stub for unsupported non-Windows, non-Unix targets.
     #[derive(Debug)]
     pub struct TerminalGuard;
 
@@ -356,12 +798,18 @@ mod stub {
     }
 
     pub fn restore_terminal_now() {}
+
+    pub fn with_term_signals_masked<T>(f: impl FnOnce() -> T) -> T {
+        f()
+    }
 }
 
-#[cfg(not(windows))]
-pub use stub::{TerminalGuard, restore_terminal_now};
+#[cfg(not(any(windows, unix)))]
+pub use stub::{TerminalGuard, restore_terminal_now, with_term_signals_masked};
+#[cfg(unix)]
+pub use unix::{TerminalGuard, restore_terminal_now, with_term_signals_masked};
 #[cfg(windows)]
-pub use win::{TerminalGuard, restore_terminal_now};
+pub use win::{TerminalGuard, restore_terminal_now, with_term_signals_masked};
 
 #[cfg(test)]
 mod sequence_tests {

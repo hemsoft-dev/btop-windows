@@ -39,23 +39,78 @@ impl ConfigLocation {
 /// Resolves the active `btop.conf` location using strict precedence:
 /// 1. Explicit `-c` / `--config <file>`
 /// 2. Portable mode: exe-adjacent `btop.conf` when that file already exists
-/// 3. Standard Windows path: `%APPDATA%\btop\btop.conf`
-/// 4. Fallback to exe-adjacent `btop.conf` when `%APPDATA%` is unavailable
+/// 3. User config directory: `%APPDATA%\btop\btop.conf` on Windows, or
+///    `$XDG_CONFIG_HOME/btop-fleet/btop.conf` (`$HOME/.config/btop-fleet/btop.conf`) on Unix
+/// 4. Fallback to exe-adjacent `btop.conf` when no user config directory is available
 pub fn resolve_config_location(explicit_path: Option<&Path>) -> Option<ConfigLocation> {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf));
-    let appdata = std::env::var_os("APPDATA")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from);
-    resolve_config_location_with(explicit_path, exe_dir.as_deref(), appdata.as_deref())
+    #[cfg(windows)]
+    {
+        let appdata = std::env::var_os("APPDATA")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+        resolve_config_location_with(explicit_path, exe_dir.as_deref(), appdata.as_deref())
+    }
+    #[cfg(not(windows))]
+    {
+        let xdg = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+        let home = std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+        resolve_unix_config_location_with(
+            explicit_path,
+            exe_dir.as_deref(),
+            xdg.as_deref(),
+            home.as_deref(),
+        )
+    }
 }
 
-/// Pure, testable variant of [`resolve_config_location`] accepting injected directories.
+/// Pure, testable variant of [`resolve_config_location`] accepting injected Windows directories.
 pub fn resolve_config_location_with(
     explicit_path: Option<&Path>,
     exe_dir: Option<&Path>,
     appdata: Option<&Path>,
+) -> Option<ConfigLocation> {
+    resolve_config_location_in_subdir(explicit_path, exe_dir, appdata, "btop")
+}
+
+/// Pure, testable Unix config location resolver using `XDG_CONFIG_HOME` / `$HOME/.config`
+/// and the `btop-fleet` subdir so it never collides with upstream `~/.config/btop`.
+pub fn resolve_unix_config_location_with(
+    explicit_path: Option<&Path>,
+    exe_dir: Option<&Path>,
+    xdg_config_home: Option<&Path>,
+    home_dir: Option<&Path>,
+) -> Option<ConfigLocation> {
+    let config_root = unix_config_root(xdg_config_home, home_dir);
+    resolve_config_location_in_subdir(explicit_path, exe_dir, config_root.as_deref(), "btop-fleet")
+}
+
+pub(crate) fn unix_config_root(
+    xdg_config_home: Option<&Path>,
+    home_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(xdg) = xdg_config_home
+        && !xdg.as_os_str().is_empty()
+        && xdg.is_absolute()
+    {
+        return Some(xdg.to_path_buf());
+    }
+    home_dir
+        .filter(|h| !h.as_os_str().is_empty())
+        .map(|h| h.join(".config"))
+}
+
+fn resolve_config_location_in_subdir(
+    explicit_path: Option<&Path>,
+    exe_dir: Option<&Path>,
+    user_config_root: Option<&Path>,
+    subdir: &str,
 ) -> Option<ConfigLocation> {
     if let Some(path) = explicit_path {
         return Some(ConfigLocation::Explicit(path.to_path_buf()));
@@ -66,10 +121,10 @@ pub fn resolve_config_location_with(
             return Some(ConfigLocation::Portable(portable));
         }
     }
-    if let Some(ad) = appdata
-        && !ad.as_os_str().is_empty()
+    if let Some(root) = user_config_root
+        && !root.as_os_str().is_empty()
     {
-        return Some(ConfigLocation::AppData(ad.join("btop").join("btop.conf")));
+        return Some(ConfigLocation::AppData(root.join(subdir).join("btop.conf")));
     }
     exe_dir.map(|dir| ConfigLocation::Portable(dir.join("btop.conf")))
 }
@@ -895,6 +950,48 @@ mod tests {
         assert_eq!(
             resolve_config_location_with(Some(&explicit), Some(&exe_dir), Some(&appdata)),
             Some(ConfigLocation::Explicit(explicit))
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolves_unix_xdg_and_home_config_locations_without_btop_collision() {
+        let root = std::env::temp_dir().join(format!(
+            "btop-unix-cfg-loc-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let exe_dir = root.join("bin");
+        let xdg = root.join("xdg");
+        let home = root.join("home");
+        std::fs::create_dir_all(&exe_dir).expect("mkdir exe_dir");
+
+        assert_eq!(
+            resolve_unix_config_location_with(None, Some(&exe_dir), Some(&xdg), Some(&home)),
+            Some(ConfigLocation::AppData(
+                xdg.join("btop-fleet").join("btop.conf")
+            ))
+        );
+        assert_eq!(
+            resolve_unix_config_location_with(None, Some(&exe_dir), None, Some(&home)),
+            Some(ConfigLocation::AppData(
+                home.join(".config").join("btop-fleet").join("btop.conf")
+            ))
+        );
+        // Per the XDG Base Directory Specification, relative XDG_CONFIG_HOME values are ignored.
+        assert_eq!(
+            resolve_unix_config_location_with(
+                None,
+                Some(&exe_dir),
+                Some(Path::new("relative/xdg")),
+                Some(&home)
+            ),
+            Some(ConfigLocation::AppData(
+                home.join(".config").join("btop-fleet").join("btop.conf")
+            ))
         );
 
         let _ = std::fs::remove_dir_all(&root);
