@@ -189,15 +189,13 @@ where
 
         match write_json_envelope_interruptible(writer, &envelope, false, stop_flag) {
             Ok(()) => emitted += 1,
-            Err(err)
-                if err.kind() == std::io::ErrorKind::BrokenPipe
-                    || (err.kind() == std::io::ErrorKind::Interrupted
-                        && (stop_flag.load(Ordering::SeqCst)
-                            || btop_sys::headless_signal_received())) =>
+            Err(InterruptibleWriteError::InterruptedBeforeWrite) => break,
+            Err(InterruptibleWriteError::Io(err))
+                if err.kind() == std::io::ErrorKind::BrokenPipe =>
             {
                 break;
             }
-            Err(err) => return Err(AppError::Io(err)),
+            Err(InterruptibleWriteError::Io(err)) => return Err(AppError::Io(err)),
         }
     }
 
@@ -327,53 +325,87 @@ where
     Ok(summary)
 }
 
+/// Outcome of an interruptible JSON record write, distinguishing clean cancellation before
+/// any bytes of the current record were emitted from mid-record truncation or I/O failures.
+#[derive(Debug)]
+pub enum InterruptibleWriteError {
+    /// Signal or stop flag triggered before a single byte of the current record was written.
+    InterruptedBeforeWrite,
+    /// Underlying I/O error, including mid-record `Interrupted` truncation where stdout already
+    /// received partial JSON bytes and must not report exit code 0.
+    Io(std::io::Error),
+}
+
 fn write_all_interruptible<W: Write>(
     writer: &mut W,
     mut buf: &[u8],
     stop_flag: Option<&AtomicBool>,
-) -> Result<(), std::io::Error> {
+) -> Result<(), InterruptibleWriteError> {
     let is_stopped = || {
         stop_flag
             .is_some_and(|flag| flag.load(Ordering::SeqCst) || btop_sys::headless_signal_received())
     };
+    let mut bytes_written = 0usize;
     while !buf.is_empty() {
         if is_stopped() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "headless output interrupted by signal",
-            ));
+            return if bytes_written == 0 {
+                Err(InterruptibleWriteError::InterruptedBeforeWrite)
+            } else {
+                Err(InterruptibleWriteError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "headless JSON output interrupted mid-record",
+                )))
+            };
         }
         match writer.write(buf) {
             Ok(0) => {
-                return Err(std::io::Error::new(
+                return Err(InterruptibleWriteError::Io(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
                     "failed to write whole JSON buffer",
-                ));
+                )));
             }
-            Ok(n) => buf = &buf[n..],
+            Ok(n) => {
+                bytes_written += n;
+                buf = &buf[n..];
+            }
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
                 if is_stopped() {
-                    return Err(err);
+                    return if bytes_written == 0 {
+                        Err(InterruptibleWriteError::InterruptedBeforeWrite)
+                    } else {
+                        Err(InterruptibleWriteError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "headless JSON output interrupted mid-record",
+                        )))
+                    };
                 }
             }
-            Err(err) => return Err(err),
+            Err(err) => return Err(InterruptibleWriteError::Io(err)),
         }
     }
     loop {
         if is_stopped() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "headless flush interrupted by signal",
-            ));
+            return if bytes_written == 0 {
+                Err(InterruptibleWriteError::InterruptedBeforeWrite)
+            } else {
+                Err(InterruptibleWriteError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "headless JSON flush interrupted after partial write",
+                )))
+            };
         }
         match writer.flush() {
             Ok(()) => return Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
                 if is_stopped() {
-                    return Err(err);
+                    return if bytes_written == 0 {
+                        Err(InterruptibleWriteError::InterruptedBeforeWrite)
+                    } else {
+                        Err(InterruptibleWriteError::Io(err))
+                    };
                 }
             }
-            Err(err) => return Err(err),
+            Err(err) => return Err(InterruptibleWriteError::Io(err)),
         }
     }
 }
@@ -382,10 +414,22 @@ fn write_serialized_json<W: Write>(
     writer: &mut W,
     serialized: serde_json::Result<String>,
     stop_flag: Option<&AtomicBool>,
-) -> Result<(), std::io::Error> {
-    let mut text = serialized.map_err(std::io::Error::other)?;
+) -> Result<(), InterruptibleWriteError> {
+    let mut text = serialized
+        .map_err(std::io::Error::other)
+        .map_err(InterruptibleWriteError::Io)?;
     text.push('\n');
     write_all_interruptible(writer, text.as_bytes(), stop_flag)
+}
+
+fn unwrap_blocking_write_error(err: InterruptibleWriteError) -> std::io::Error {
+    match err {
+        InterruptibleWriteError::InterruptedBeforeWrite => std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "headless JSON output interrupted",
+        ),
+        InterruptibleWriteError::Io(io_err) => io_err,
+    }
 }
 
 /// Serializes `envelope` as compact or pretty JSON followed by a trailing newline.
@@ -399,7 +443,7 @@ pub fn write_json_envelope<W: Write>(
     } else {
         serde_json::to_string(envelope)
     };
-    write_serialized_json(writer, serialized, None)
+    write_serialized_json(writer, serialized, None).map_err(unwrap_blocking_write_error)
 }
 
 /// Like [`write_json_envelope`], but stops promptly on `EINTR` when `stop_flag` or a
@@ -409,7 +453,7 @@ pub fn write_json_envelope_interruptible<W: Write>(
     envelope: &JsonSnapshotEnvelope,
     pretty: bool,
     stop_flag: &AtomicBool,
-) -> Result<(), std::io::Error> {
+) -> Result<(), InterruptibleWriteError> {
     let serialized = if pretty {
         serde_json::to_string_pretty(envelope)
     } else {
@@ -429,7 +473,7 @@ pub fn write_json_summary<W: Write>(
     } else {
         serde_json::to_string(summary)
     };
-    write_serialized_json(writer, serialized, None)
+    write_serialized_json(writer, serialized, None).map_err(unwrap_blocking_write_error)
 }
 
 /// Like [`write_json_summary`], stopping promptly on `EINTR` once `stop_flag` is set.
@@ -438,7 +482,7 @@ pub fn write_json_summary_interruptible<W: Write>(
     summary: &JsonSummaryEnvelope,
     pretty: bool,
     stop_flag: &AtomicBool,
-) -> Result<(), std::io::Error> {
+) -> Result<(), InterruptibleWriteError> {
     let serialized = if pretty {
         serde_json::to_string_pretty(summary)
     } else {
@@ -948,7 +992,7 @@ mod tests {
             .expect("spurious EINTR must retry");
         assert_eq!(w_retry.written, b"hello\n");
 
-        // 2. EINTR accompanied by stop_flag returns Interrupted promptly instead of hanging.
+        // 2. EINTR before any bytes written accompanied by stop_flag returns InterruptedBeforeWrite.
         let stop2 = AtomicBool::new(false);
         let mut w_stop = InterruptingWriter {
             stop_flag: &stop2,
@@ -958,7 +1002,10 @@ mod tests {
         };
         let err = write_all_interruptible(&mut w_stop, b"hello\n", Some(&stop2))
             .expect_err("must stop promptly on EINTR when stop_flag is raised");
-        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+        assert!(matches!(
+            err,
+            InterruptibleWriteError::InterruptedBeforeWrite
+        ));
 
         // 3. Pre-flagged stop_flag aborts before issuing any write().
         let stop3 = AtomicBool::new(true);
@@ -970,8 +1017,85 @@ mod tests {
         };
         let err3 = write_all_interruptible(&mut w_pre, b"hello\n", Some(&stop3))
             .expect_err("must abort before write when stop_flag is already raised");
-        assert_eq!(err3.kind(), std::io::ErrorKind::Interrupted);
+        assert!(matches!(
+            err3,
+            InterruptibleWriteError::InterruptedBeforeWrite
+        ));
         assert_eq!(w_pre.written.len(), 0);
+    }
+
+    #[test]
+    fn stream_headless_snapshots_fails_on_mid_record_interruption() {
+        struct PartialThenStopWriter<'a> {
+            stop_flag: &'a AtomicBool,
+            wrote_first: bool,
+        }
+        impl Write for PartialThenStopWriter<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if !self.wrote_first {
+                    self.wrote_first = true;
+                    self.stop_flag.store(true, Ordering::SeqCst);
+                    return Ok(buf.len().min(4));
+                }
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "mid-record EINTR",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // Signal raised mid-record (after partial bytes) returns an I/O error so callers do
+        // not report exit code 0 after emitting truncated NDJSON.
+        let stop4 = AtomicBool::new(false);
+        let mut w_partial = PartialThenStopWriter {
+            stop_flag: &stop4,
+            wrote_first: false,
+        };
+        let err4 = write_all_interruptible(&mut w_partial, b"{\"partial\":true}\n", Some(&stop4))
+            .expect_err("mid-record interruption must return Io error");
+        assert!(matches!(
+            err4,
+            InterruptibleWriteError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::Interrupted
+        ));
+
+        // Verify `stream_headless_snapshots` propagates mid-record truncation as an error.
+        let mut replay = ReplaySource::from_snapshots(win11_16core_dual_gpu_desktop())
+            .expect("replay")
+            .with_looping(false);
+        let stop5 = AtomicBool::new(false);
+        let mut w_stream_partial = PartialThenStopWriter {
+            stop_flag: &stop5,
+            wrote_first: false,
+        };
+        let query = HeadlessQuery::default();
+        let ctx = HeadlessContext {
+            query: &query,
+            filter: &QueryFilter::None,
+            btop_version: "0.2.0",
+        };
+        let stream_err = stream_headless_snapshots(
+            &mut replay,
+            HeadlessStreamOptions {
+                sections: JsonSections::parse_csv("cpu").expect("cpu"),
+                sample_ms: 0,
+                count: 2,
+                interval_ms: 100,
+                is_replay: true,
+                diagnose: false,
+            },
+            ctx,
+            &stop5,
+            &mut w_stream_partial,
+            |_| true,
+        )
+        .expect_err("mid-record interrupted NDJSON stream must not exit cleanly");
+        assert!(matches!(
+            stream_err,
+            AppError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::Interrupted
+        ));
     }
 
     #[test]

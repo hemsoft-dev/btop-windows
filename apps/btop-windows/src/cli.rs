@@ -14,19 +14,22 @@ use btop_model::{
     HeadlessQuery, JsonSections, JsonSnapshotEnvelope, ProcSortField, QueryFilter, SchemaMode,
     ServiceStateFilter, build_json_schema,
 };
-use btop_sys::{TimerWake, UnbufferedStdout, WaitableWakeTimer, install_headless_ctrl_c_handler};
+use btop_sys::{
+    BoundedStdout, TimerWake, UnbufferedStdout, WaitableWakeTimer, install_headless_ctrl_c_handler,
+};
 use btop_term::CrosstermInput;
 use clap::error::ErrorKind;
 use clap::{CommandFactory as _, FromArgMatches as _, Parser};
 
 use crate::headless::{
     DEFAULT_INTERVAL_MS, DEFAULT_LIVE_SAMPLE_MS, HeadlessContext, HeadlessJsonOptions,
-    HeadlessStreamOptions, HeadlessSummaryOptions, MAX_INTERVAL_MS, MAX_SAMPLE_MS,
-    MAX_SUMMARY_WINDOW_MS, MIN_INTERVAL_MS, collect_headless_snapshot, collect_headless_summary,
-    raw_args_request_json, raw_args_request_pretty, stream_headless_snapshots, write_json_envelope,
-    write_json_error, write_json_summary, write_json_summary_interruptible,
+    HeadlessStreamOptions, HeadlessSummaryOptions, InterruptibleWriteError, MAX_INTERVAL_MS,
+    MAX_SAMPLE_MS, MAX_SUMMARY_WINDOW_MS, MIN_INTERVAL_MS, collect_headless_snapshot,
+    collect_headless_summary, raw_args_request_json, raw_args_request_pretty,
+    stream_headless_snapshots, write_json_envelope, write_json_error, write_json_summary,
+    write_json_summary_interruptible,
 };
-use crate::{AppError, ConfigOverrides, load_config, run_tui_loop};
+use crate::{AppError, ConfigOverrides, LiveActionHooks, load_config, run_tui_loop};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -347,20 +350,19 @@ fn build_snapshot_source(cli: &Cli, config: &Config) -> Result<Box<dyn SnapshotS
     }
 }
 
-/// Runs the CLI application under the given binary name (`"btop"` on Windows) with live
-/// process/service actions enabled when compiled with the `live-actions` feature.
-pub fn run_cli(bin_name: &'static str) -> ExitCode {
-    run_cli_with_actions(bin_name, cfg!(feature = "live-actions"))
+/// Runs the CLI application under the given binary name (`"btop"` on Windows) with optional
+/// link-isolated live process and service action hooks provided by the binary entry point.
+pub fn run_cli(bin_name: &'static str, live_actions: Option<LiveActionHooks>) -> ExitCode {
+    run_cli_with_actions(bin_name, live_actions)
 }
 
-/// Runs the CLI application in permanently read-only mode (`"btop-fleet"`), disabling all live
-/// process termination, priority changes, and service start/stop actions even if workspace
-/// feature unification compiles the `live-actions` feature into `btop-windows`.
+/// Runs the CLI application in permanently read-only mode (`"btop-fleet"`), never linking or
+/// invoking process termination, priority changes, or service control code.
 pub fn run_cli_read_only(bin_name: &'static str) -> ExitCode {
-    run_cli_with_actions(bin_name, false)
+    run_cli_with_actions(bin_name, None)
 }
 
-fn run_cli_with_actions(bin_name: &'static str, enable_live_actions: bool) -> ExitCode {
+fn run_cli_with_actions(bin_name: &'static str, live_actions: Option<LiveActionHooks>) -> ExitCode {
     btop_sys::harden_process_startup();
 
     let raw_args: Vec<OsString> = std::env::args_os().collect();
@@ -434,7 +436,7 @@ fn run_cli_with_actions(bin_name: &'static str, enable_live_actions: bool) -> Ex
         config,
         cli.config_file.as_deref(),
         &overrides,
-        enable_live_actions,
+        live_actions,
     ) {
         Ok(_) => ExitCode::SUCCESS,
         Err(err) => {
@@ -657,30 +659,31 @@ fn run_headless_summary(
     }
 
     // When a termination signal interrupted collection after at least one sample was captured,
-    // emit the partial summary directly instead of aborting on the already-raised stop flag.
-    // Otherwise use the interruptible writer so a blocked stdout pipe stops promptly on signal.
-    let write_res = if stopped_during_collection {
-        write_json_summary(&mut io::stdout().lock(), &summary, options.pretty)
+    // emit the partial summary via `BoundedStdout` (completes immediately on normal stdout, but
+    // bounds wait time on a stalled full Unix pipe so the CLI never hangs). Otherwise use the
+    // interruptible writer so a blocked stdout pipe stops promptly on signal while refusing to
+    // exit 0 if partial JSON bytes were already emitted.
+    let write_res: Result<(), InterruptibleWriteError> = if stopped_during_collection {
+        let mut bounded = BoundedStdout::new(Duration::from_millis(250));
+        write_json_summary(&mut bounded, &summary, options.pretty)
+            .map_err(InterruptibleWriteError::Io)
     } else {
         let mut stdout = UnbufferedStdout;
         write_json_summary_interruptible(&mut stdout, &summary, options.pretty, &stop_flag)
     };
-    if let Err(err) = write_res {
-        if err.kind() == io::ErrorKind::BrokenPipe
-            || (!stopped_during_collection
-                && err.kind() == io::ErrorKind::Interrupted
-                && (stop_flag.load(Ordering::SeqCst) || btop_sys::headless_signal_received()))
-        {
-            return ExitCode::SUCCESS;
+    match write_res {
+        Ok(()) | Err(InterruptibleWriteError::InterruptedBeforeWrite) => ExitCode::SUCCESS,
+        Err(InterruptibleWriteError::Io(err)) if err.kind() == io::ErrorKind::BrokenPipe => {
+            ExitCode::SUCCESS
         }
-        emit_error(
-            true,
-            options.pretty,
-            "io_error",
-            &format!("failed to write JSON summary output: {err}"),
-        );
-        return ExitCode::FAILURE;
+        Err(InterruptibleWriteError::Io(err)) => {
+            emit_error(
+                true,
+                options.pretty,
+                "io_error",
+                &format!("failed to write JSON summary output: {err}"),
+            );
+            ExitCode::FAILURE
+        }
     }
-
-    ExitCode::SUCCESS
 }

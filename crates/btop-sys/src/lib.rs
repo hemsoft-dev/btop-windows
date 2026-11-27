@@ -981,6 +981,26 @@ mod win {
         }
     }
 
+    /// Bounded stdout writer (delegates directly to `io::stdout().lock()` on Windows).
+    #[derive(Debug)]
+    pub struct BoundedStdout;
+
+    impl BoundedStdout {
+        pub fn new(_timeout: Duration) -> Self {
+            Self
+        }
+    }
+
+    impl std::io::Write for BoundedStdout {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            std::io::stdout().lock().write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            std::io::stdout().lock().flush()
+        }
+    }
+
     /// Returns `true` if a headless `Ctrl+C` / `Ctrl+Break` event was received.
     pub fn headless_signal_received() -> bool {
         if let Ok(guard) = HEADLESS_STOP_SLOT.lock()
@@ -1153,6 +1173,93 @@ mod stub {
                             "stdout write interrupted by signal",
                         ));
                     }
+                }
+                let chunk_len = buf.len().min(MAX_NONBLOCK_PIPE_CHUNK);
+                // SAFETY: `buf` has at least `chunk_len` readable bytes.
+                let n = unsafe {
+                    libc::write(
+                        libc::STDOUT_FILENO,
+                        buf.as_ptr().cast::<libc::c_void>(),
+                        chunk_len,
+                    )
+                };
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(usize::try_from(n).unwrap_or(0))
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                std::io::stdout().lock().write(buf)
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            #[cfg(unix)]
+            {
+                Ok(())
+            }
+            #[cfg(not(unix))]
+            {
+                std::io::stdout().lock().flush()
+            }
+        }
+    }
+
+    /// Stdout writer with a bounded wait deadline on Unix so writing a partial summary after an
+    /// interrupting `SIGINT` / `SIGTERM` completes immediately on normal output but never hangs
+    /// indefinitely on a full, unread stdout pipe.
+    #[derive(Debug)]
+    pub struct BoundedStdout {
+        #[cfg(unix)]
+        deadline: std::time::Instant,
+    }
+
+    impl BoundedStdout {
+        /// Creates a bounded stdout writer that allows up to `timeout` waiting for stdout
+        /// writability on Unix (delegating directly to `io::stdout().lock()` on non-Unix).
+        pub fn new(timeout: Duration) -> Self {
+            #[cfg(unix)]
+            {
+                Self {
+                    deadline: std::time::Instant::now() + timeout,
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = timeout;
+                Self {}
+            }
+        }
+    }
+
+    impl std::io::Write for BoundedStdout {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            #[cfg(unix)]
+            {
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                let remaining = self
+                    .deadline
+                    .saturating_duration_since(std::time::Instant::now());
+                let timeout_ms = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
+                let mut pfd = libc::pollfd {
+                    fd: libc::STDOUT_FILENO,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                // SAFETY: `pfd` is a valid stack-allocated `pollfd`.
+                let rc = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
+                if rc < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if rc == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "timed out waiting for stdout pipe to drain",
+                    ));
                 }
                 let chunk_len = buf.len().min(MAX_NONBLOCK_PIPE_CHUNK);
                 // SAFETY: `buf` has at least `chunk_len` readable bytes.
@@ -1439,17 +1546,19 @@ mod stub {
 
 #[cfg(not(windows))]
 pub use stub::{
-    TimerWake, TimerWaker, UnbufferedStdout, WaitableWakeTimer, headless_signal_received,
-    install_headless_ctrl_c_handler, query_core_efficiency_classes, query_process_information,
-    query_processor_performance, query_self_cpu_time_100ns, query_self_private_working_set_bytes,
-    read_cpu_model_name, read_cpu_nominal_mhz, system_uptime_secs, total_physical_memory_bytes,
+    BoundedStdout, TimerWake, TimerWaker, UnbufferedStdout, WaitableWakeTimer,
+    headless_signal_received, install_headless_ctrl_c_handler, query_core_efficiency_classes,
+    query_process_information, query_processor_performance, query_self_cpu_time_100ns,
+    query_self_private_working_set_bytes, read_cpu_model_name, read_cpu_nominal_mhz,
+    system_uptime_secs, total_physical_memory_bytes,
 };
 #[cfg(windows)]
 pub use win::{
-    TimerWake, TimerWaker, UnbufferedStdout, WaitableWakeTimer, headless_signal_received,
-    install_headless_ctrl_c_handler, query_core_efficiency_classes, query_process_information,
-    query_processor_performance, query_self_cpu_time_100ns, query_self_private_working_set_bytes,
-    read_cpu_model_name, read_cpu_nominal_mhz, system_uptime_secs, total_physical_memory_bytes,
+    BoundedStdout, TimerWake, TimerWaker, UnbufferedStdout, WaitableWakeTimer,
+    headless_signal_received, install_headless_ctrl_c_handler, query_core_efficiency_classes,
+    query_process_information, query_processor_performance, query_self_cpu_time_100ns,
+    query_self_private_working_set_bytes, read_cpu_model_name, read_cpu_nominal_mhz,
+    system_uptime_secs, total_physical_memory_bytes,
 };
 
 #[cfg(test)]

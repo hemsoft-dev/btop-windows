@@ -13,10 +13,6 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
-[features]
-default = ["live-actions"]
-live-actions = []
-
 [dependencies]
 btop-collect.workspace = true
 btop-config.workspace = true

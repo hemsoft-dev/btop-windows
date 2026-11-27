@@ -277,6 +277,11 @@ mod win {
         }
     }
 
+    /// No-op on Windows where POSIX thread signal masks do not apply.
+    pub fn with_term_signals_masked<T>(f: impl FnOnce() -> T) -> T {
+        f()
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -357,9 +362,17 @@ mod unix {
 
     static STATE: AtomicU8 = AtomicU8::new(STATE_INACTIVE);
     static TERMIOS_SAVED: AtomicBool = AtomicBool::new(false);
+    static RESTORE_DONE: AtomicBool = AtomicBool::new(true);
     static SAVED_TERMIOS: SavedTermiosSlot =
         SavedTermiosSlot(UnsafeCell::new(MaybeUninit::uninit()));
     static HOOKS_INSTALLED: Once = Once::new();
+
+    /// Executes `f` with `SIGINT` and `SIGTERM` masked on the current thread so background TUI
+    /// threads spawned inside `f` inherit a blocked termination-signal mask.
+    pub fn with_term_signals_masked<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = SigMaskGuard::block_term_signals();
+        f()
+    }
 
     fn write_all_stdout(text: &str) -> Result<(), TermError> {
         let mut out = io::stdout().lock();
@@ -488,6 +501,22 @@ mod unix {
             unsafe {
                 restore_terminal_async_signal_safe();
             }
+            RESTORE_DONE.store(true, Ordering::Release);
+        } else if prev == STATE_TERMINATED {
+            // Another thread already won the transition to `STATE_TERMINATED` and is actively
+            // running `restore_terminal_async_signal_safe()`. Wait briefly using async-signal-safe
+            // `poll(null, 0, 5)` so re-raising our signal cannot terminate the process mid-restore.
+            for _ in 0..60 {
+                if RESTORE_DONE.load(Ordering::Acquire) {
+                    break;
+                }
+                // SAFETY: POSIX `poll` with 0 fds is async-signal-safe and sleeps 5ms.
+                unsafe {
+                    let _ = libc::poll(std::ptr::null_mut(), 0, 5);
+                }
+            }
+        } else {
+            RESTORE_DONE.store(true, Ordering::Release);
         }
         // SAFETY: Reset `sig` to default disposition, unmask `sig` (keeping the sibling
         // termination signal masked until termination), and re-raise so exit status reflects `sig`.
@@ -621,6 +650,7 @@ mod unix {
                 }
 
                 // Install panic and signal restore hooks before mutating raw mode.
+                RESTORE_DONE.store(false, Ordering::Release);
                 install_global_restore_hooks();
 
                 if let Err(err) = crossterm::terminal::enable_raw_mode() {
@@ -768,14 +798,18 @@ mod stub {
     }
 
     pub fn restore_terminal_now() {}
+
+    pub fn with_term_signals_masked<T>(f: impl FnOnce() -> T) -> T {
+        f()
+    }
 }
 
 #[cfg(not(any(windows, unix)))]
-pub use stub::{TerminalGuard, restore_terminal_now};
+pub use stub::{TerminalGuard, restore_terminal_now, with_term_signals_masked};
 #[cfg(unix)]
-pub use unix::{TerminalGuard, restore_terminal_now};
+pub use unix::{TerminalGuard, restore_terminal_now, with_term_signals_masked};
 #[cfg(windows)]
-pub use win::{TerminalGuard, restore_terminal_now};
+pub use win::{TerminalGuard, restore_terminal_now, with_term_signals_masked};
 
 #[cfg(test)]
 mod sequence_tests {

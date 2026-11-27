@@ -23,8 +23,6 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy workspace
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Clippy read-only btop-fleet-cli (no live-actions)
-        run: cargo clippy -p btop-fleet-cli --all-targets -- -D warnings
       - name: Test workspace
         run: cargo test --workspace
       - name: Run 200x60 render+diff performance budget (release)
@@ -50,8 +48,6 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy workspace
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Clippy read-only btop-fleet-cli (no live-actions)
-        run: cargo clippy -p btop-fleet-cli --all-targets -- -D warnings
       - name: Test workspace
         run: cargo test --workspace
       - name: Build btop-fleet and run CLI smoke checks
@@ -76,8 +72,6 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy workspace
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Clippy read-only btop-fleet-cli (no live-actions)
-        run: cargo clippy -p btop-fleet-cli --all-targets -- -D warnings
       - name: Test workspace (including live Windows 11 telemetry invariants)
         run: cargo test --workspace
       - name: Run 200x60 render+diff performance budget (release)
