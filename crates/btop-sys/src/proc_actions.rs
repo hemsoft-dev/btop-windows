@@ -623,7 +623,6 @@ pub use win::{
 mod unix {
     use super::{
         PriorityClass, PriorityUpdateOutcome, ProcActionError, guard_unix_signal_decision,
-        unix_start_time_secs_to_identity,
     };
 
     #[cfg(target_os = "linux")]
