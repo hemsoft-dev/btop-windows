@@ -339,8 +339,8 @@ mod tests {
             delta.iter().map(|s| s.timestamp_ms).collect::<Vec<_>>(),
             vec![75_000, 90_000]
         );
-        assert!(ring.samples_since(90_000).is_empty());
-        assert!(ring.samples_since(999_999).is_empty());
+        assert_eq!(ring.samples_since(90_000).len(), 0);
+        assert_eq!(ring.samples_since(999_999).len(), 0);
 
         // Non-monotonic timestamp is rejected without mutating ring
         assert!(!ring.push(mk_sample(90_000, 1.0), Some(1_000)));

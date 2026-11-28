@@ -203,7 +203,7 @@ fn btop_fleet_agent_rejects_wildcard_bind_and_serves_samples_over_loopback() {
     let (_, empty_body) = raw_empty.split_once("\r\n\r\n").expect("split empty");
     let empty_resp: FleetSamplesResponse =
         serde_json::from_str(empty_body).expect("parse empty delta");
-    assert!(empty_resp.samples.is_empty());
+    assert_eq!(empty_resp.samples.len(), 0);
 
     std::thread::sleep(Duration::from_millis(1_150));
     let raw_delta = http_req(&format!(

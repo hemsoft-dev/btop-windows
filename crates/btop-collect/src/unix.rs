@@ -616,7 +616,7 @@ mod live {
     impl UnixAgentCollector {
         pub fn new() -> Result<Self, CollectError> {
             let initial_refresh = RefreshKind::nothing()
-                .with_cpu(CpuRefreshKind::nothing().with_cpu_usage())
+                .with_cpu(CpuRefreshKind::nothing().with_usage())
                 .with_memory(MemoryRefreshKind::everything());
             let sys = System::new_with_specifics(initial_refresh).map_err(|err| {
                 CollectError::Platform(format!("sysinfo agent system init failed: {err}"))
@@ -679,7 +679,7 @@ mod live {
                     >= MINIMUM_CPU_UPDATE_INTERVAL;
             let cpu_busy_pct = if cpu_ready {
                 self.sys
-                    .refresh_cpu_specifics(CpuRefreshKind::nothing().with_cpu_usage());
+                    .refresh_cpu_specifics(CpuRefreshKind::nothing().with_usage());
                 self.cpu_measured = true;
                 DataState::Available(normalize_unix_cpu_pct(self.sys.global_cpu_usage()))
             } else {
