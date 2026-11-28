@@ -5,6 +5,7 @@
 
 pub mod diagnose;
 pub mod fixtures;
+pub mod fleet;
 pub mod json_output;
 pub mod jsonl;
 pub mod proc_query;
@@ -15,6 +16,12 @@ pub use diagnose::{
     DiagnosticCategory, DiagnosticEntity, DiagnosticEvidence, DiagnosticFinding,
     DiagnosticSeverity, DiagnosticsReport, HealthStatus, SkippedCheck, diagnose_snapshot,
     diagnose_window,
+};
+pub use fleet::{
+    DEFAULT_AGENT_INTERVAL_SECS, DEFAULT_AGENT_RETENTION_MINS, DEFAULT_FLEET_PORT, DiskIoRate,
+    FLEET_SCHEMA_VERSION, FleetSamplesResponse, INCOMPATIBLE_AGENT_REASON, MAX_AGENT_INTERVAL_SECS,
+    MAX_AGENT_RETENTION_MINS, MIN_AGENT_INTERVAL_SECS, MIN_AGENT_RETENTION_MINS, NetIoRate,
+    NodeSample, NodeStatus, classify_node_status, is_compatible_fleet_schema,
 };
 
 pub use json_output::{

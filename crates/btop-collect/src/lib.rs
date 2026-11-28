@@ -1,5 +1,6 @@
 //! System telemetry collectors, waitable-timer sampler, and pure delta mathematics.
 
+pub mod agent;
 pub mod battery;
 pub mod cpu;
 pub mod disk;
@@ -16,8 +17,12 @@ pub mod unix;
 use btop_model::Snapshot;
 use thiserror::Error;
 
+pub use agent::{
+    DISK_IO_UNAVAILABLE_REASON, LiveNodeCollector, NodeSampleSource,
+    summarize_disks_for_node_sample, summarize_net_for_node_sample,
+};
 #[cfg(unix)]
-pub use unix::UnixLiveCollector;
+pub use unix::{UnixAgentCollector, UnixLiveCollector};
 
 pub use battery::{
     BATTERY_FLAG_CHARGING, BATTERY_FLAG_NO_BATTERY, BatteryCollector, decode_power_status,

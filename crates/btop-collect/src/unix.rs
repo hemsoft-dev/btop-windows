@@ -474,6 +474,249 @@ mod live {
         (Some(r_rate), Some(w_rate))
     }
 
+    fn sample_unix_disks(
+        disks: &mut Disks,
+        prev_disk_totals: &mut HashMap<String, (u64, u64)>,
+        elapsed_ms: u64,
+    ) -> Vec<btop_model::DiskSnapshot> {
+        disks.refresh_specifics(true, disk_refresh_kind());
+        let mut next_totals = HashMap::with_capacity(disks.len());
+        let mut raw = Vec::with_capacity(disks.len());
+
+        for disk in disks.iter() {
+            let mount_path = disk.mount_point();
+            let mount = mount_path.to_string_lossy().into_owned();
+            let fs_type = disk.file_system().to_string_lossy().into_owned();
+            // On macOS, `sysinfo::Disk::name()` is the volume label rather than the BSD mount
+            // device; resolve the actual `/dev/diskNsM` path via `statfs(2)` so APFS container
+            // deduplication keys on real kernel containers.
+            let device = unix_mount_device_name(mount_path)
+                .unwrap_or_else(|| disk.name().to_string_lossy().into_owned());
+            let usage = disk.usage();
+            let prev = prev_disk_totals.get(&mount).copied();
+            let (read_rate, write_rate) = disk_io_rate_bytes_per_sec(
+                prev,
+                usage.total_read_bytes,
+                usage.total_written_bytes,
+                elapsed_ms,
+            );
+            next_totals.insert(
+                mount.clone(),
+                (usage.total_read_bytes, usage.total_written_bytes),
+            );
+            raw.push(RawUnixDisk {
+                device_name: device,
+                mount_point: mount,
+                fs_type,
+                total_bytes: disk.total_space(),
+                available_bytes: disk.available_space(),
+                read_bytes_per_sec: read_rate,
+                write_bytes_per_sec: write_rate,
+            });
+        }
+
+        *prev_disk_totals = next_totals;
+        deduplicate_unix_disks(raw)
+    }
+
+    fn sample_unix_networks(
+        networks: &mut Networks,
+        prev_net_totals: &mut HashMap<String, (u64, u64)>,
+        elapsed_ms: u64,
+    ) -> Vec<NetInterfaceSnapshot> {
+        networks.refresh(true);
+        let mut next_totals = HashMap::with_capacity(networks.iter().count());
+        let mut out = Vec::new();
+
+        for (raw_name, data) in networks.iter() {
+            let name = raw_name.to_string_lossy().into_owned();
+            let rx_total = data.total_received();
+            let tx_total = data.total_transmitted();
+            next_totals.insert(name.clone(), (rx_total, tx_total));
+
+            if !should_include_unix_interface(&name) {
+                continue;
+            }
+            #[cfg(target_os = "linux")]
+            if std::path::Path::new("/sys/class/net").exists()
+                && !std::path::Path::new(&format!("/sys/class/net/{name}/device")).exists()
+            {
+                // On Linux, only hardware-backed NICs expose `/sys/class/net/<name>/device`;
+                // VLANs, bridges, veths, bonds, and tunnels live under `/sys/devices/virtual`
+                // and are excluded to avoid double-counting traffic with their physical parent.
+                continue;
+            }
+
+            let (rx_rate, tx_rate) = if let Some(&(prev_rx, prev_tx)) = prev_net_totals.get(&name) {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let rx = clamped_rate_per_sec(prev_rx, rx_total, elapsed_ms).round() as u64;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let tx = clamped_rate_per_sec(prev_tx, tx_total, elapsed_ms).round() as u64;
+                (rx, tx)
+            } else {
+                (0, 0)
+            };
+
+            let mut ipv4 = None;
+            let mut ipv6 = None;
+            for net in data.ip_networks() {
+                match net.addr {
+                    IpAddr::V4(v4) if ipv4.is_none() => ipv4 = Some(v4.to_string()),
+                    IpAddr::V6(v6) if ipv6.is_none() && !v6.is_loopback() => {
+                        ipv6 = Some(v6.to_string());
+                    }
+                    _ => {}
+                }
+            }
+
+            let is_up = match data.operational_state() {
+                InterfaceOperationalState::Up => true,
+                InterfaceOperationalState::Down => false,
+                _ => ipv4.is_some() || ipv6.is_some() || rx_total > 0 || tx_total > 0,
+            };
+            let link_speed_bps = data
+                .transmit_link_speed()
+                .or_else(|| data.receive_link_speed())
+                .filter(|&speed| speed > 0);
+
+            out.push(NetInterfaceSnapshot {
+                luid: stable_interface_luid(&name),
+                description: name.clone(),
+                name,
+                is_up,
+                ipv4,
+                ipv6,
+                rx_bytes_per_sec: rx_rate,
+                tx_bytes_per_sec: tx_rate,
+                rx_total_bytes: rx_total,
+                tx_total_bytes: tx_total,
+                link_speed_bps,
+            });
+        }
+
+        *prev_net_totals = next_totals;
+        out.sort_by(|a, b| b.is_up.cmp(&a.is_up).then_with(|| a.name.cmp(&b.name)));
+        out
+    }
+
+    /// Lightweight Linux and macOS Fleet Agent collector polling strictly CPU usage, memory,
+    /// disks, and physical network interfaces without touching processes or users.
+    #[derive(Debug)]
+    pub struct UnixAgentCollector {
+        sys: System,
+        disks: Disks,
+        networks: Networks,
+        cpu_baseline_at: Instant,
+        cpu_measured: bool,
+        last_sample_at: Instant,
+        prev_net_totals: HashMap<String, (u64, u64)>,
+        prev_disk_totals: HashMap<String, (u64, u64)>,
+    }
+
+    impl UnixAgentCollector {
+        pub fn new() -> Result<Self, CollectError> {
+            let initial_refresh = RefreshKind::nothing()
+                .with_cpu(CpuRefreshKind::nothing().with_cpu_usage())
+                .with_memory(MemoryRefreshKind::everything());
+            let sys = System::new_with_specifics(initial_refresh).map_err(|err| {
+                CollectError::Platform(format!("sysinfo agent system init failed: {err}"))
+            })?;
+            let disks =
+                Disks::new_with_refreshed_list_specifics(disk_refresh_kind()).map_err(|err| {
+                    CollectError::Platform(format!("sysinfo agent disks init failed: {err}"))
+                })?;
+            let networks = Networks::new_with_refreshed_list().map_err(|err| {
+                CollectError::Platform(format!("sysinfo agent networks init failed: {err}"))
+            })?;
+
+            let prev_net_totals = networks
+                .iter()
+                .map(|(name, data)| {
+                    (
+                        name.to_string_lossy().into_owned(),
+                        (data.total_received(), data.total_transmitted()),
+                    )
+                })
+                .collect();
+            let prev_disk_totals = disks
+                .iter()
+                .map(|disk| {
+                    let usage = disk.usage();
+                    (
+                        disk.mount_point().to_string_lossy().into_owned(),
+                        (usage.total_read_bytes, usage.total_written_bytes),
+                    )
+                })
+                .collect();
+
+            let now = Instant::now();
+            Ok(Self {
+                sys,
+                disks,
+                networks,
+                cpu_baseline_at: now,
+                cpu_measured: false,
+                last_sample_at: now,
+                prev_net_totals,
+                prev_disk_totals,
+            })
+        }
+
+        pub fn sample_node(
+            &mut self,
+            timestamp_ms: u64,
+        ) -> Result<btop_model::NodeSample, CollectError> {
+            let now = Instant::now();
+            let elapsed_ms = u64::try_from(
+                now.saturating_duration_since(self.last_sample_at)
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX);
+            self.last_sample_at = now;
+
+            let cpu_ready = self.cpu_measured
+                || now.saturating_duration_since(self.cpu_baseline_at)
+                    >= MINIMUM_CPU_UPDATE_INTERVAL;
+            let cpu_busy_pct = if cpu_ready {
+                self.sys
+                    .refresh_cpu_specifics(CpuRefreshKind::nothing().with_cpu_usage());
+                self.cpu_measured = true;
+                DataState::Available(normalize_unix_cpu_pct(self.sys.global_cpu_usage()))
+            } else {
+                DataState::WarmingUp
+            };
+
+            self.sys.refresh_memory();
+            let mem = compute_unix_mem_snapshot(
+                self.sys.total_memory(),
+                self.sys.available_memory(),
+                self.sys.free_memory(),
+                self.sys.total_swap(),
+                self.sys.used_swap(),
+                None,
+            );
+
+            let disks = sample_unix_disks(&mut self.disks, &mut self.prev_disk_totals, elapsed_ms);
+            let (disk_max_used_pct, disk_io) =
+                crate::agent::summarize_disks_for_node_sample(&disks, elapsed_ms > 0);
+
+            let ifaces =
+                sample_unix_networks(&mut self.networks, &mut self.prev_net_totals, elapsed_ms);
+            let net_io = crate::agent::summarize_net_for_node_sample(&ifaces, elapsed_ms > 0);
+
+            Ok(btop_model::NodeSample {
+                timestamp_ms,
+                cpu_busy_pct,
+                mem_used_bytes: mem.used_bytes,
+                mem_total_bytes: mem.total_bytes,
+                disk_max_used_pct,
+                disk_io,
+                net_io,
+                uptime_secs: System::uptime().unwrap_or(0),
+            })
+        }
+    }
+
     /// Live Linux and macOS telemetry collector backed by targeted single-threaded `sysinfo`
     /// refreshes, marking GPU, OS services, battery, and CPU thermal sensors `Unavailable` in v1.
     #[derive(Debug)]
@@ -662,121 +905,11 @@ mod live {
         }
 
         fn sample_disks(&mut self, elapsed_ms: u64) -> Vec<btop_model::DiskSnapshot> {
-            self.disks.refresh_specifics(true, disk_refresh_kind());
-            let mut next_totals = HashMap::with_capacity(self.disks.len());
-            let mut raw = Vec::with_capacity(self.disks.len());
-
-            for disk in &self.disks {
-                let mount_path = disk.mount_point();
-                let mount = mount_path.to_string_lossy().into_owned();
-                let fs_type = disk.file_system().to_string_lossy().into_owned();
-                // On macOS, `sysinfo::Disk::name()` is the volume label rather than the BSD mount
-                // device; resolve the actual `/dev/diskNsM` path via `statfs(2)` so APFS container
-                // deduplication keys on real kernel containers.
-                let device = unix_mount_device_name(mount_path)
-                    .unwrap_or_else(|| disk.name().to_string_lossy().into_owned());
-                let usage = disk.usage();
-                let prev = self.prev_disk_totals.get(&mount).copied();
-                let (read_rate, write_rate) = disk_io_rate_bytes_per_sec(
-                    prev,
-                    usage.total_read_bytes,
-                    usage.total_written_bytes,
-                    elapsed_ms,
-                );
-                next_totals.insert(
-                    mount.clone(),
-                    (usage.total_read_bytes, usage.total_written_bytes),
-                );
-                raw.push(RawUnixDisk {
-                    device_name: device,
-                    mount_point: mount,
-                    fs_type,
-                    total_bytes: disk.total_space(),
-                    available_bytes: disk.available_space(),
-                    read_bytes_per_sec: read_rate,
-                    write_bytes_per_sec: write_rate,
-                });
-            }
-
-            self.prev_disk_totals = next_totals;
-            deduplicate_unix_disks(raw)
+            sample_unix_disks(&mut self.disks, &mut self.prev_disk_totals, elapsed_ms)
         }
 
         fn sample_networks(&mut self, elapsed_ms: u64) -> Vec<NetInterfaceSnapshot> {
-            self.networks.refresh(true);
-            let mut next_totals = HashMap::with_capacity(self.networks.iter().count());
-            let mut out = Vec::new();
-
-            for (raw_name, data) in &self.networks {
-                let name = raw_name.to_string_lossy().into_owned();
-                let rx_total = data.total_received();
-                let tx_total = data.total_transmitted();
-                next_totals.insert(name.clone(), (rx_total, tx_total));
-
-                if !should_include_unix_interface(&name) {
-                    continue;
-                }
-                #[cfg(target_os = "linux")]
-                if std::path::Path::new("/sys/class/net").exists()
-                    && !std::path::Path::new(&format!("/sys/class/net/{name}/device")).exists()
-                {
-                    // On Linux, only hardware-backed NICs expose `/sys/class/net/<name>/device`;
-                    // VLANs, bridges, veths, bonds, and tunnels live under `/sys/devices/virtual`
-                    // and are excluded to avoid double-counting traffic with their physical parent.
-                    continue;
-                }
-
-                let (rx_rate, tx_rate) =
-                    if let Some(&(prev_rx, prev_tx)) = self.prev_net_totals.get(&name) {
-                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                        let rx = clamped_rate_per_sec(prev_rx, rx_total, elapsed_ms).round() as u64;
-                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                        let tx = clamped_rate_per_sec(prev_tx, tx_total, elapsed_ms).round() as u64;
-                        (rx, tx)
-                    } else {
-                        (0, 0)
-                    };
-
-                let mut ipv4 = None;
-                let mut ipv6 = None;
-                for net in data.ip_networks() {
-                    match net.addr {
-                        IpAddr::V4(v4) if ipv4.is_none() => ipv4 = Some(v4.to_string()),
-                        IpAddr::V6(v6) if ipv6.is_none() && !v6.is_loopback() => {
-                            ipv6 = Some(v6.to_string());
-                        }
-                        _ => {}
-                    }
-                }
-
-                let is_up = match data.operational_state() {
-                    InterfaceOperationalState::Up => true,
-                    InterfaceOperationalState::Down => false,
-                    _ => ipv4.is_some() || ipv6.is_some() || rx_total > 0 || tx_total > 0,
-                };
-                let link_speed_bps = data
-                    .transmit_link_speed()
-                    .or_else(|| data.receive_link_speed())
-                    .filter(|&speed| speed > 0);
-
-                out.push(NetInterfaceSnapshot {
-                    luid: stable_interface_luid(&name),
-                    description: name.clone(),
-                    name,
-                    is_up,
-                    ipv4,
-                    ipv6,
-                    rx_bytes_per_sec: rx_rate,
-                    tx_bytes_per_sec: tx_rate,
-                    rx_total_bytes: rx_total,
-                    tx_total_bytes: tx_total,
-                    link_speed_bps,
-                });
-            }
-
-            self.prev_net_totals = next_totals;
-            out.sort_by(|a, b| b.is_up.cmp(&a.is_up).then_with(|| a.name.cmp(&b.name)));
-            out
+            sample_unix_networks(&mut self.networks, &mut self.prev_net_totals, elapsed_ms)
         }
 
         fn sample_processes(&self, logical_cpus: usize) -> Vec<ProcessEntry> {
@@ -956,7 +1089,7 @@ mod live {
 }
 
 #[cfg(unix)]
-pub use live::UnixLiveCollector;
+pub use live::{UnixAgentCollector, UnixLiveCollector};
 
 #[cfg(test)]
 mod tests {
