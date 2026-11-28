@@ -14,8 +14,8 @@ use btop_collect::{FreqMode, LiveCollector};
 use btop_collect::{LiveNodeCollector, NodeSampleSource, ReplaySource, SnapshotSource};
 use btop_config::Config;
 use btop_fleet::{
-    AgentMetadata, AgentServer, BackoffConfig, FleetError, RingConfig, ServerConfig, SharedRing,
-    resolve_tailscale_bind_addr_with_backoff, validate_bind_addr,
+    AgentMetadata, AgentServer, BackoffConfig, FleetError, LocalInterfaceAddr, RingConfig,
+    ServerConfig, SharedRing, resolve_tailscale_bind_addr_with_backoff, validate_bind_addr,
 };
 use btop_model::{
     DEFAULT_AGENT_INTERVAL_SECS, DEFAULT_AGENT_RETENTION_MINS, DEFAULT_FLEET_PORT, HeadlessQuery,
@@ -24,7 +24,7 @@ use btop_model::{
     ServiceStateFilter, build_json_schema,
 };
 use btop_sys::{
-    BoundedStdout, TimerWake, UnbufferedStdout, WaitableWakeTimer, enumerate_local_unicast_ips,
+    BoundedStdout, TimerWake, UnbufferedStdout, WaitableWakeTimer, enumerate_local_interface_addrs,
     install_headless_ctrl_c_handler,
 };
 use btop_term::CrosstermInput;
@@ -579,7 +579,19 @@ where
         port,
         BackoffConfig::default(),
         stop_flag,
-        enumerate_local_unicast_ips,
+        || {
+            enumerate_local_interface_addrs().map(|addrs| {
+                addrs
+                    .into_iter()
+                    .map(|a| LocalInterfaceAddr {
+                        interface_name: a.interface_name,
+                        description: a.description,
+                        is_point_to_point: a.is_point_to_point,
+                        ip: a.ip,
+                    })
+                    .collect()
+            })
+        },
         waiter,
         |attempt, delay, err| {
             if attempt == 1 || attempt % 5 == 0 {
@@ -654,14 +666,7 @@ fn run_agent(bin_name: &str, args: &AgentArgs) -> ExitCode {
     let mut last_sample_mono = Instant::now();
     let warmup = Duration::from_millis(250).min(Duration::from_millis(ring_cfg.interval_ms()));
     if waiter(warmup) {
-        let ts_ms = shared.next_sample_timestamp_ms();
-        let mono_elapsed =
-            u64::try_from(last_sample_mono.elapsed().as_millis()).unwrap_or(u64::MAX);
-        if let Ok(sample) = collector.next_node_sample(ts_ms)
-            && shared.push_sample(sample, Some(mono_elapsed))
-        {
-            last_sample_mono = Instant::now();
-        }
+        collect_and_record_agent_sample(&mut collector, &shared, &mut last_sample_mono);
     }
 
     if !stop_flag.load(Ordering::SeqCst) {
@@ -678,18 +683,34 @@ fn run_agent(bin_name: &str, args: &AgentArgs) -> ExitCode {
         if !waiter(interval) {
             break;
         }
-        let ts_ms = shared.next_sample_timestamp_ms();
-        let mono_elapsed =
-            u64::try_from(last_sample_mono.elapsed().as_millis()).unwrap_or(u64::MAX);
-        if let Ok(sample) = collector.next_node_sample(ts_ms)
-            && shared.push_sample(sample, Some(mono_elapsed))
-        {
-            last_sample_mono = Instant::now();
-        }
+        collect_and_record_agent_sample(&mut collector, &shared, &mut last_sample_mono);
     }
 
     server.shutdown();
     ExitCode::SUCCESS
+}
+
+/// Samples the host first and stamps both the Agent clock and monotonic elapsed time *after*
+/// collection finishes so a host suspend occurring mid-collection is detected on the affected
+/// tick (dropping its stale rate deltas) rather than leaking into `Available` and mis-flagging
+/// the following post-resume tick.
+fn collect_and_record_agent_sample(
+    collector: &mut LiveNodeCollector,
+    shared: &SharedRing,
+    last_sample_mono: &mut Instant,
+) {
+    if let Ok(mut sample) = collector.next_node_sample(0) {
+        let post_mono = Instant::now();
+        let mono_elapsed = u64::try_from(
+            post_mono
+                .saturating_duration_since(*last_sample_mono)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        sample.timestamp_ms = shared.next_sample_timestamp_ms();
+        *last_sample_mono = post_mono;
+        shared.push_sample(sample, Some(mono_elapsed));
+    }
 }
 
 fn run_schema_output(mode_raw: &str) -> ExitCode {

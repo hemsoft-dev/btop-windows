@@ -21,30 +21,38 @@ pub struct RawUnixDisk {
 }
 
 const IGNORED_UNIX_FS_TYPES: &[&str] = &[
+    "9p",
+    "afpfs",
+    "afs",
     "autofs",
     "binfmt_misc",
     "bpf",
+    "ceph",
     "cgroup",
     "cgroup2",
+    "cifs",
     "configfs",
+    "davfs",
+    "davfs2",
     "debugfs",
     "devfs",
     "devpts",
     "devtmpfs",
     "efivarfs",
     "fdescfs",
-    "fuse.gvfsd-fuse",
-    "fuse.lxcfs",
-    "fuse.portal",
-    "fuse.snapfuse",
     "fusectl",
+    "glusterfs",
     "hugetlbfs",
     "linprocfs",
     "linsysfs",
+    "lustre",
     "mqueue",
+    "nfs",
+    "nfs4",
     "nfsd",
     "nsfs",
     "nullfs",
+    "ocfs2",
     "overlay",
     "overlayfs",
     "proc",
@@ -53,10 +61,16 @@ const IGNORED_UNIX_FS_TYPES: &[&str] = &[
     "ramfs",
     "rpc_pipefs",
     "securityfs",
+    "smb",
+    "smb2",
+    "smb3",
+    "smbfs",
     "squashfs",
+    "sshfs",
     "sysfs",
     "tmpfs",
     "tracefs",
+    "webdav",
 ];
 
 const IGNORED_UNIX_MOUNT_PREFIXES: &[&str] = &[
@@ -100,12 +114,18 @@ pub fn should_include_unix_disk(
         return false;
     }
     let fs_lower = fs_type.trim().to_ascii_lowercase();
-    if IGNORED_UNIX_FS_TYPES.contains(&fs_lower.as_str()) {
+    // Exclude virtual kernel filesystems, network filesystems, and userspace `fuse.*` mounts
+    // (such as `fuse.sshfs`, `fuse.rclone`, `fuse.gvfsd-fuse`) while preserving local block-backed
+    // `fuseblk` mounts (for example NTFS/exFAT partitions on `/dev/*`).
+    if IGNORED_UNIX_FS_TYPES.contains(&fs_lower.as_str()) || fs_lower.starts_with("fuse.") {
         return false;
     }
     if device_name.starts_with("/dev/loop")
         || device_name.starts_with("map ")
+        || device_name.starts_with("//")
         || device_name.eq_ignore_ascii_case("none")
+        || (!device_name.starts_with("/dev/")
+            && (device_name.contains(":/") || device_name.contains('@')))
     {
         return false;
     }
@@ -1120,6 +1140,37 @@ mod tests {
             "ext4",
             "/dev/sdb1",
             2_000_000_000_000
+        ));
+        assert!(should_include_unix_disk(
+            "/mnt/win_data",
+            "fuseblk",
+            "/dev/nvme1n1p1",
+            1_000_000_000_000
+        ));
+        // Remote network and userspace FUSE mounts must be excluded from local storage metrics
+        assert!(!should_include_unix_disk(
+            "/mnt/remote",
+            "fuse.sshfs",
+            "franz@nas:/srv/data",
+            1_000_000_000_000
+        ));
+        assert!(!should_include_unix_disk(
+            "/mnt/nas",
+            "nfs4",
+            "10.0.0.5:/export/media",
+            4_000_000_000_000
+        ));
+        assert!(!should_include_unix_disk(
+            "/mnt/smb",
+            "cifs",
+            "//fileserver/share",
+            2_000_000_000_000
+        ));
+        assert!(!should_include_unix_disk(
+            "/mnt/cloud",
+            "fuse.rclone",
+            "gdrive:",
+            500_000_000_000
         ));
 
         assert!(!should_include_unix_disk(

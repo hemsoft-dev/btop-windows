@@ -32,8 +32,8 @@ pub use mem::{
     query_memory_status, query_pagefile_totals, query_performance_info,
 };
 pub use net::{
-    RawNetEntry, RawNetInterface, enumerate_hardware_interfaces, enumerate_local_unicast_ips,
-    refresh_interface_entry,
+    LocalNetAddress, RawNetEntry, RawNetInterface, enumerate_hardware_interfaces,
+    enumerate_local_interface_addrs, refresh_interface_entry,
 };
 pub use nvml::{
     NVML_ERROR_NOT_SUPPORTED, NVML_SUCCESS, NvmlLibrary, NvmlPciInfo, RawNvmlDevice,

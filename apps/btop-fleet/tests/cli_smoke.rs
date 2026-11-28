@@ -111,6 +111,15 @@ fn btop_fleet_live_unix_json_diagnose_conforms_to_schema() {
     assert!(env.diagnostics.is_some());
 }
 
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[test]
 fn btop_fleet_agent_rejects_wildcard_bind_and_serves_samples_over_loopback() {
     use std::io::{BufRead as _, BufReader, Read as _, Write as _};
@@ -132,23 +141,26 @@ fn btop_fleet_agent_rejects_wildcard_bind_and_serves_samples_over_loopback() {
         "expected forbidden wildcard bind error, got: {bad_err}"
     );
 
-    // 2. Start live agent bound to 127.0.0.1:0 with 1s interval.
-    let mut child = Command::new(fleet_bin())
-        .args([
-            "agent",
-            "--bind",
-            "127.0.0.1:0",
-            "--interval",
-            "1",
-            "--retention",
-            "1",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn btop-fleet agent");
+    // 2. Start live agent bound to 127.0.0.1:0 with 2s interval inside an RAII guard so any
+    // panic always terminates and reaps the child process.
+    let mut guard = ChildGuard(
+        Command::new(fleet_bin())
+            .args([
+                "agent",
+                "--bind",
+                "127.0.0.1:0",
+                "--interval",
+                "2",
+                "--retention",
+                "1",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn btop-fleet agent"),
+    );
 
-    let stderr = child.stderr.take().expect("agent stderr");
+    let stderr = guard.0.stderr.take().expect("agent stderr");
     let mut reader = BufReader::new(stderr);
     let mut ready_line = String::new();
     reader
@@ -186,7 +198,7 @@ fn btop_fleet_agent_rejects_wildcard_bind_and_serves_samples_over_loopback() {
     }
     let full: FleetSamplesResponse = serde_json::from_str(body).expect("parse fleet samples");
     assert_eq!(full.schema_version, FLEET_SCHEMA_VERSION);
-    assert_eq!(full.interval_ms, 1_000);
+    assert_eq!(full.interval_ms, 2_000);
     assert!(
         !full.samples.is_empty(),
         "expected initial post-warmup sample"
@@ -195,17 +207,20 @@ fn btop_fleet_agent_rejects_wildcard_bind_and_serves_samples_over_loopback() {
     assert!(first.mem_total_bytes > 0);
     assert!(matches!(first.cpu_busy_pct, DataState::Available(_)));
 
-    // Incremental cursor at newest timestamp returns empty list immediately, then newer sample.
-    let last_ts = full.samples.last().expect("last sample").timestamp_ms;
-    let raw_empty = http_req(&format!(
-        "GET /v1/samples?since_ms={last_ts} HTTP/1.1\r\nHost: {addr_part}\r\n\r\n"
+    // Future cursor always returns zero samples regardless of thread scheduling.
+    let raw_future = http_req(&format!(
+        "GET /v1/samples?since_ms={} HTTP/1.1\r\nHost: {addr_part}\r\n\r\n",
+        u64::MAX
     ));
-    let (_, empty_body) = raw_empty.split_once("\r\n\r\n").expect("split empty");
-    let empty_resp: FleetSamplesResponse =
-        serde_json::from_str(empty_body).expect("parse empty delta");
-    assert_eq!(empty_resp.samples.len(), 0);
+    let (_, future_body) = raw_future.split_once("\r\n\r\n").expect("split future");
+    let future_resp: FleetSamplesResponse =
+        serde_json::from_str(future_body).expect("parse future delta");
+    assert_eq!(future_resp.samples.len(), 0);
 
-    std::thread::sleep(Duration::from_millis(1_150));
+    // Incremental cursor at newest timestamp never returns <= last_ts, and yields newer samples
+    // after the sampling interval elapses.
+    let last_ts = full.samples.last().expect("last sample").timestamp_ms;
+    std::thread::sleep(Duration::from_millis(2_200));
     let raw_delta = http_req(&format!(
         "GET /v1/samples?since_ms={last_ts} HTTP/1.1\r\nHost: {addr_part}\r\n\r\n"
     ));
@@ -213,7 +228,7 @@ fn btop_fleet_agent_rejects_wildcard_bind_and_serves_samples_over_loopback() {
     let delta_resp: FleetSamplesResponse = serde_json::from_str(delta_body).expect("parse delta");
     assert!(
         !delta_resp.samples.is_empty(),
-        "expected newer sample after 1s interval"
+        "expected newer sample after 2s interval"
     );
     assert!(delta_resp.samples.iter().all(|s| s.timestamp_ms > last_ts));
 
@@ -222,7 +237,4 @@ fn btop_fleet_agent_rejects_wildcard_bind_and_serves_samples_over_loopback() {
         "POST /v1/samples HTTP/1.1\r\nHost: {addr_part}\r\nContent-Length: 0\r\n\r\n"
     ));
     assert!(raw_post.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"));
-
-    let _ = child.kill();
-    let _ = child.wait();
 }

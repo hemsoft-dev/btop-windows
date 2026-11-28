@@ -24,6 +24,15 @@ pub struct RawNetEntry {
     pub link_speed_bps: Option<u64>,
 }
 
+/// Interface-attributed unicast address returned by [`enumerate_local_interface_addrs`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalNetAddress {
+    pub interface_name: String,
+    pub description: String,
+    pub is_point_to_point: bool,
+    pub ip: std::net::IpAddr,
+}
+
 #[cfg(windows)]
 mod win {
     use core::mem::size_of;
@@ -42,7 +51,7 @@ mod win {
         AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6,
     };
 
-    use super::{RawNetEntry, RawNetInterface};
+    use super::{LocalNetAddress, RawNetEntry, RawNetInterface};
 
     // Bit positions in `MIB_IF_ROW2.InterfaceAndOperStatusFlags._bitfield` (`netioapi.h`):
     const FLAG_HARDWARE_INTERFACE: u8 = 1 << 0;
@@ -241,9 +250,9 @@ mod win {
         (seg0 & 0xffc0) == 0xfe80
     }
 
-    /// Enumerates all unicast IPv4 and non-link-local IPv6 addresses currently assigned to
+    /// Enumerates interface-attributed unicast IPv4 and non-link-local IPv6 addresses assigned to
     /// operational (`IfOperStatusUp`) local adapters, including VPN/Tailscale tunnel adapters.
-    pub fn enumerate_local_unicast_ips() -> Result<Vec<std::net::IpAddr>, String> {
+    pub fn enumerate_local_interface_addrs() -> Result<Vec<LocalNetAddress>, String> {
         let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
         let mut buf_size = 16 * 1024u32;
         let mut raw: Vec<u64> = Vec::new();
@@ -264,7 +273,7 @@ mod win {
                 )
             };
             if status == NO_ERROR {
-                return Ok(collect_up_adapter_ips(
+                return Ok(collect_up_adapter_addrs(
                     raw.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>(),
                 ));
             }
@@ -280,14 +289,25 @@ mod win {
         ))
     }
 
-    fn collect_up_adapter_ips(mut cur: *const IP_ADAPTER_ADDRESSES_LH) -> Vec<std::net::IpAddr> {
-        let mut ips = Vec::new();
+    fn collect_up_adapter_addrs(mut cur: *const IP_ADAPTER_ADDRESSES_LH) -> Vec<LocalNetAddress> {
+        const IF_TYPE_PPP: u32 = 23;
+        const IF_TYPE_PROP_VIRTUAL: u32 = 53;
+        const IF_TYPE_TUNNEL: u32 = 131;
+
+        let mut out = Vec::new();
         let mut visited = 0usize;
         while !cur.is_null() && visited < 512 {
             visited += 1;
             // SAFETY: `cur` points to a valid node in the buffer populated by `GetAdaptersAddresses`.
             let adapter = unsafe { &*cur };
             if adapter.OperStatus == IfOperStatusUp {
+                let interface_name = decode_pwstr(adapter.FriendlyName.cast_const(), 256);
+                let description = decode_pwstr(adapter.Description.cast_const(), 256);
+                let is_point_to_point = matches!(
+                    adapter.IfType,
+                    IF_TYPE_PPP | IF_TYPE_PROP_VIRTUAL | IF_TYPE_TUNNEL
+                );
+
                 let mut uni = adapter.FirstUnicastAddress.cast_const();
                 let mut uni_count = 0usize;
                 while !uni.is_null() && uni_count < 64 {
@@ -305,7 +325,12 @@ mod win {
                             let sin = unsafe { sa.cast::<SOCKADDR_IN>().read_unaligned() };
                             // SAFETY: `S_un.S_addr` is the 4-byte IPv4 address in network byte order.
                             let bytes = unsafe { sin.sin_addr.S_un.S_addr }.to_ne_bytes();
-                            ips.push(std::net::IpAddr::V4(Ipv4Addr::from(bytes)));
+                            out.push(LocalNetAddress {
+                                interface_name: interface_name.clone(),
+                                description: description.clone(),
+                                is_point_to_point,
+                                ip: std::net::IpAddr::V4(Ipv4Addr::from(bytes)),
+                            });
                         } else if family == AF_INET6 && sa_len >= size_of::<SOCKADDR_IN6>() {
                             // SAFETY: `sa_len >= size_of::<SOCKADDR_IN6>()` and `sa_family == AF_INET6`.
                             #[allow(clippy::cast_ptr_alignment)]
@@ -313,7 +338,12 @@ mod win {
                             // SAFETY: `sin6_addr.u.Byte` is the 16-byte IPv6 address.
                             let addr = Ipv6Addr::from(unsafe { sin6.sin6_addr.u.Byte });
                             if !is_ipv6_link_local(addr) {
-                                ips.push(std::net::IpAddr::V6(addr));
+                                out.push(LocalNetAddress {
+                                    interface_name: interface_name.clone(),
+                                    description: description.clone(),
+                                    is_point_to_point,
+                                    ip: std::net::IpAddr::V6(addr),
+                                });
                             }
                         }
                     }
@@ -322,7 +352,24 @@ mod win {
             }
             cur = adapter.Next.cast_const();
         }
-        ips
+        out
+    }
+
+    fn decode_pwstr(ptr: *const u16, max_units: usize) -> String {
+        if ptr.is_null() {
+            return String::new();
+        }
+        let mut units = Vec::new();
+        for idx in 0..max_units {
+            // SAFETY: `ptr` points to a null-terminated UTF-16 string allocated by Windows; we
+            // stop at the first NUL unit or `max_units`.
+            let unit = unsafe { *ptr.add(idx) };
+            if unit == 0 {
+                break;
+            }
+            units.push(unit);
+        }
+        String::from_utf16_lossy(&units).trim().to_owned()
     }
 
     fn decode_utf16_array(buf: &[u16]) -> String {
@@ -333,10 +380,11 @@ mod win {
 
 #[cfg(unix)]
 mod unix_net {
+    use core::ffi::CStr;
     use core::ptr;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-    use super::{RawNetEntry, RawNetInterface};
+    use super::{LocalNetAddress, RawNetEntry, RawNetInterface};
 
     pub fn enumerate_hardware_interfaces() -> Result<Vec<RawNetInterface>, String> {
         Err("Windows IP Helper telemetry is only available on Windows".to_owned())
@@ -359,9 +407,9 @@ mod unix_net {
         }
     }
 
-    /// Enumerates all unicast IPv4 and non-link-local IPv6 addresses assigned to `IFF_UP`
-    /// interfaces via POSIX `getifaddrs(3)`, including `tailscale0` and macOS `utun*` tunnels.
-    pub fn enumerate_local_unicast_ips() -> Result<Vec<IpAddr>, String> {
+    /// Enumerates interface-attributed unicast IPv4 and non-link-local IPv6 addresses assigned to
+    /// `IFF_UP` interfaces via POSIX `getifaddrs(3)`, including `tailscale0` and macOS `utun*`.
+    pub fn enumerate_local_interface_addrs() -> Result<Vec<LocalNetAddress>, String> {
         let mut head: *mut libc::ifaddrs = ptr::null_mut();
         // SAFETY: `head` receives a heap-allocated `ifaddrs` chain freed by `IfAddrsGuard`.
         let rc = unsafe { libc::getifaddrs(&raw mut head) };
@@ -373,15 +421,26 @@ mod unix_net {
         }
         let _guard = IfAddrsGuard(head);
 
-        let mut ips = Vec::new();
+        let mut out = Vec::new();
         let mut cur = head.cast_const();
         let mut visited = 0usize;
+        let up_flag = u32::try_from(libc::IFF_UP).unwrap_or(0);
+        let p2p_flag = u32::try_from(libc::IFF_POINTOPOINT).unwrap_or(0);
         while !cur.is_null() && visited < 4096 {
             visited += 1;
             // SAFETY: `cur` is a valid node in the `getifaddrs` chain.
             let ifa = unsafe { &*cur };
-            let is_up = (ifa.ifa_flags & u32::try_from(libc::IFF_UP).unwrap_or(0)) != 0;
+            let is_up = (ifa.ifa_flags & up_flag) != 0;
+            let is_point_to_point = (ifa.ifa_flags & p2p_flag) != 0;
             if is_up && !ifa.ifa_addr.is_null() {
+                let interface_name = if ifa.ifa_name.is_null() {
+                    String::new()
+                } else {
+                    // SAFETY: `ifa_name` is a NUL-terminated C string from `getifaddrs`.
+                    unsafe { CStr::from_ptr(ifa.ifa_name) }
+                        .to_string_lossy()
+                        .into_owned()
+                };
                 // SAFETY: `ifa.ifa_addr` is non-null and points to a valid `sockaddr`.
                 let family = i32::from(unsafe { (*ifa.ifa_addr).sa_family });
                 if family == libc::AF_INET {
@@ -389,7 +448,12 @@ mod unix_net {
                     #[allow(clippy::cast_ptr_alignment)]
                     let sin = unsafe { ifa.ifa_addr.cast::<libc::sockaddr_in>().read_unaligned() };
                     let bytes = sin.sin_addr.s_addr.to_ne_bytes();
-                    ips.push(IpAddr::V4(Ipv4Addr::from(bytes)));
+                    out.push(LocalNetAddress {
+                        interface_name,
+                        description: String::new(),
+                        is_point_to_point,
+                        ip: IpAddr::V4(Ipv4Addr::from(bytes)),
+                    });
                 } else if family == libc::AF_INET6 {
                     // SAFETY: `sa_family == AF_INET6` guarantees a `sockaddr_in6`.
                     #[allow(clippy::cast_ptr_alignment)]
@@ -397,19 +461,24 @@ mod unix_net {
                         unsafe { ifa.ifa_addr.cast::<libc::sockaddr_in6>().read_unaligned() };
                     let addr = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
                     if (addr.segments()[0] & 0xffc0) != 0xfe80 {
-                        ips.push(IpAddr::V6(addr));
+                        out.push(LocalNetAddress {
+                            interface_name,
+                            description: String::new(),
+                            is_point_to_point,
+                            ip: IpAddr::V6(addr),
+                        });
                     }
                 }
             }
             cur = ifa.ifa_next.cast_const();
         }
-        Ok(ips)
+        Ok(out)
     }
 }
 
 #[cfg(all(not(windows), not(unix)))]
 mod stub {
-    use super::{RawNetEntry, RawNetInterface};
+    use super::{LocalNetAddress, RawNetEntry, RawNetInterface};
 
     pub fn enumerate_hardware_interfaces() -> Result<Vec<RawNetInterface>, String> {
         Err("Windows IP Helper telemetry is only available on Windows".to_owned())
@@ -419,20 +488,20 @@ mod stub {
         Err("Windows IP Helper telemetry is only available on Windows".to_owned())
     }
 
-    pub fn enumerate_local_unicast_ips() -> Result<Vec<std::net::IpAddr>, String> {
+    pub fn enumerate_local_interface_addrs() -> Result<Vec<LocalNetAddress>, String> {
         Err("local network interface enumeration is unsupported on this target".to_owned())
     }
 }
 
 #[cfg(all(not(windows), not(unix)))]
 pub use stub::{
-    enumerate_hardware_interfaces, enumerate_local_unicast_ips, refresh_interface_entry,
+    enumerate_hardware_interfaces, enumerate_local_interface_addrs, refresh_interface_entry,
 };
 #[cfg(unix)]
 pub use unix_net::{
-    enumerate_hardware_interfaces, enumerate_local_unicast_ips, refresh_interface_entry,
+    enumerate_hardware_interfaces, enumerate_local_interface_addrs, refresh_interface_entry,
 };
 #[cfg(windows)]
 pub use win::{
-    enumerate_hardware_interfaces, enumerate_local_unicast_ips, refresh_interface_entry,
+    enumerate_hardware_interfaces, enumerate_local_interface_addrs, refresh_interface_entry,
 };

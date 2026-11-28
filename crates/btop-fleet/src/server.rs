@@ -3,7 +3,7 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Read as _, Write as _};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -324,8 +324,14 @@ fn parse_since_ms_query(query: Option<&str>) -> Result<u64, HttpReject> {
 }
 
 #[derive(Debug)]
+struct QueuedConnection {
+    stream: TcpStream,
+    deadline: Instant,
+}
+
+#[derive(Debug)]
 struct ConnectionQueue {
-    items: Mutex<VecDeque<TcpStream>>,
+    items: Mutex<VecDeque<QueuedConnection>>,
     available: Condvar,
     max_queued: usize,
 }
@@ -339,7 +345,7 @@ impl ConnectionQueue {
         }
     }
 
-    fn try_push(&self, stream: TcpStream) -> bool {
+    fn try_push(&self, conn: QueuedConnection) -> bool {
         let mut guard = self
             .items
             .lock()
@@ -347,12 +353,12 @@ impl ConnectionQueue {
         if guard.len() >= self.max_queued {
             return false;
         }
-        guard.push_back(stream);
+        guard.push_back(conn);
         self.available.notify_one();
         true
     }
 
-    fn pop(&self, stop: &AtomicBool) -> Option<TcpStream> {
+    fn pop(&self, stop: &AtomicBool) -> Option<QueuedConnection> {
         let mut guard = self
             .items
             .lock()
@@ -361,8 +367,8 @@ impl ConnectionQueue {
             if stop.load(Ordering::SeqCst) {
                 return None;
             }
-            if let Some(stream) = guard.pop_front() {
-                return Some(stream);
+            if let Some(conn) = guard.pop_front() {
+                return Some(conn);
             }
             guard = self
                 .available
@@ -412,38 +418,42 @@ impl AgentServer {
 
         let queue = Arc::new(ConnectionQueue::new(config.max_queued_connections));
         let worker_count = config.worker_count.max(1);
-        let mut workers = Vec::with_capacity(worker_count);
+        // Construct `AgentServer` before spawning threads so its `Drop` automatically signals
+        // shutdown and joins any already-started workers if a later spawn fails.
+        let mut server = Self {
+            local_addr,
+            stop,
+            queue: Arc::clone(&queue),
+            accept_thread: None,
+            workers: Vec::with_capacity(worker_count),
+        };
 
         for idx in 0..worker_count {
             let worker_queue = Arc::clone(&queue);
-            let worker_stop = Arc::clone(&stop);
+            let worker_stop = Arc::clone(&server.stop);
             let worker_ring = shared.clone();
             let handle = thread::Builder::new()
                 .name(format!("btop-fleet-http-{idx}"))
                 .spawn(move || {
-                    while let Some(stream) = worker_queue.pop(&worker_stop) {
-                        handle_connection(stream, &worker_ring, config);
+                    while let Some(conn) = worker_queue.pop(&worker_stop) {
+                        handle_connection(conn, &worker_ring, config);
                     }
                 })?;
-            workers.push(handle);
+            server.workers.push(handle);
         }
 
         let accept_queue = Arc::clone(&queue);
-        let accept_stop = Arc::clone(&stop);
+        let accept_stop = Arc::clone(&server.stop);
         let bound_ip = local_addr.ip();
+        let io_timeout = config.io_timeout;
         let accept_thread = thread::Builder::new()
             .name("btop-fleet-accept".to_owned())
             .spawn(move || {
-                run_accept_loop(&listener, bound_ip, &accept_queue, &accept_stop);
+                run_accept_loop(&listener, bound_ip, io_timeout, &accept_queue, &accept_stop);
             })?;
+        server.accept_thread = Some(accept_thread);
 
-        Ok(Self {
-            local_addr,
-            stop,
-            queue,
-            accept_thread: Some(accept_thread),
-            workers,
-        })
+        Ok(server)
     }
 
     pub const fn local_addr(&self) -> SocketAddr {
@@ -477,12 +487,16 @@ impl Drop for AgentServer {
 fn run_accept_loop(
     listener: &TcpListener,
     bound_ip: IpAddr,
+    io_timeout: Duration,
     queue: &ConnectionQueue,
     stop: &AtomicBool,
 ) {
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, peer_addr)) => {
+                // Start the request deadline immediately at accept time so queued wait counts
+                // against the advertised timeout cap.
+                let deadline = Instant::now() + io_timeout;
                 if !is_allowed_peer_ip(peer_addr.ip(), bound_ip) {
                     // Fail closed without sending bytes or banners to unauthorized peers.
                     drop(stream);
@@ -492,7 +506,7 @@ fn run_accept_loop(
                     drop(stream);
                     continue;
                 }
-                if !queue.try_push(stream) {
+                if !queue.try_push(QueuedConnection { stream, deadline }) {
                     // Queue saturated; drop excess connection immediately to cap resource usage.
                 }
             }
@@ -507,18 +521,46 @@ fn run_accept_loop(
     }
 }
 
-fn handle_connection(mut stream: TcpStream, shared: &SharedRing, config: ServerConfig) {
-    let _ = stream.set_read_timeout(Some(config.io_timeout));
-    let _ = stream.set_write_timeout(Some(config.io_timeout));
+fn handle_connection(conn: QueuedConnection, shared: &SharedRing, config: ServerConfig) {
+    let QueuedConnection {
+        mut stream,
+        deadline,
+    } = conn;
 
-    let raw = match read_request_headers(&mut stream, config.max_request_bytes, config.io_timeout) {
+    let now = Instant::now();
+    if now >= deadline {
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(50)));
+        let _ = write_error_response(&mut stream, HttpReject::RequestTimeout);
+        finish_connection(&mut stream);
+        return;
+    }
+
+    let remaining = deadline.saturating_duration_since(now);
+    let _ = stream.set_read_timeout(Some(remaining));
+    let _ = stream.set_write_timeout(Some(remaining));
+
+    let raw = match read_request_headers(&mut stream, config.max_request_bytes, deadline) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => return, // Client closed connection without sending bytes.
         Err(reject) => {
+            let write_budget = deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(50));
+            let _ = stream.set_write_timeout(Some(write_budget));
             let _ = write_error_response(&mut stream, reject);
+            finish_connection(&mut stream);
             return;
         }
     };
+
+    let write_budget = deadline.saturating_duration_since(Instant::now());
+    if write_budget.is_zero() {
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(50)));
+        let _ = write_error_response(&mut stream, HttpReject::RequestTimeout);
+        finish_connection(&mut stream);
+        return;
+    }
+    let _ = stream.set_write_timeout(Some(write_budget));
 
     match parse_http_request(&raw) {
         Ok(req) => {
@@ -541,14 +583,29 @@ fn handle_connection(mut stream: TcpStream, shared: &SharedRing, config: ServerC
             let _ = write_error_response(&mut stream, reject);
         }
     }
+    finish_connection(&mut stream);
+}
+
+/// Sends TCP FIN and drains any already-buffered unread client bytes non-blockingly so Windows
+/// Winsock does not emit TCP RST (`WSAECONNRESET`) on close and truncate an HTTP error response.
+fn finish_connection(stream: &mut TcpStream) {
+    let _ = stream.shutdown(Shutdown::Write);
+    if stream.set_nonblocking(true).is_ok() {
+        let mut sink = [0u8; 512];
+        for _ in 0..8 {
+            match stream.read(&mut sink) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    }
 }
 
 fn read_request_headers(
     stream: &mut TcpStream,
     max_bytes: usize,
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<Option<Vec<u8>>, HttpReject> {
-    let deadline = Instant::now() + timeout;
     let mut buf = Vec::with_capacity(512);
     let mut chunk = [0u8; 512];
 
@@ -805,6 +862,60 @@ mod tests {
         let mut resp = String::new();
         stream.read_to_string(&mut resp).expect("read 408");
         assert!(resp.starts_with("HTTP/1.1 408 Request Timeout\r\n"));
+
+        server.shutdown();
+    }
+
+    #[test]
+    fn queued_connection_deadline_includes_time_spent_waiting_for_a_worker() {
+        let shared = SharedRing::new(RingConfig::default(), AgentMetadata::current("0.2.0-test"));
+        let stop = Arc::new(AtomicBool::new(false));
+        let cfg = ServerConfig {
+            io_timeout: Duration::from_millis(200),
+            worker_count: 1,
+            max_queued_connections: 4,
+            ..ServerConfig::default()
+        };
+        let server =
+            AgentServer::start("127.0.0.1:0".parse().expect("loopback"), &shared, stop, cfg)
+                .expect("start single-worker server");
+        let addr = server.local_addr();
+
+        let started = Instant::now();
+        // First client stalls the sole worker for the full 200ms budget.
+        let mut staller = TcpStream::connect(addr).expect("connect staller");
+        staller
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("staller timeout");
+        staller
+            .write_all(b"GET /v1/samples HTTP/1.1\r\nHost: localhost\r\n")
+            .expect("write partial");
+
+        // Second client connects immediately behind it; its accept-time 200ms deadline ticks
+        // while waiting in the queue instead of starting a fresh 200ms budget after dequeue.
+        let mut queued = TcpStream::connect(addr).expect("connect queued");
+        queued
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("queued timeout");
+        queued
+            .write_all(b"GET /v1/samples HTTP/1.1\r\nHost: localhost\r\n")
+            .expect("write partial queued request");
+
+        let mut stall_resp = String::new();
+        staller.read_to_string(&mut stall_resp).expect("read stall");
+        assert!(stall_resp.starts_with("HTTP/1.1 408 Request Timeout\r\n"));
+
+        let mut queued_resp = String::new();
+        queued
+            .read_to_string(&mut queued_resp)
+            .expect("read queued");
+        let total_elapsed = started.elapsed();
+        assert!(queued_resp.starts_with("HTTP/1.1 408 Request Timeout\r\n"));
+        // Without accept-time deadlines, queued would wait ~200ms in queue + 200ms in worker (~400ms).
+        assert!(
+            total_elapsed < Duration::from_millis(340),
+            "expected queue wait to count against 200ms deadline, took {total_elapsed:?}"
+        );
 
         server.shutdown();
     }

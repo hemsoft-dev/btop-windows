@@ -65,11 +65,12 @@ impl RingConfig {
         self.retention_mins.saturating_mul(60_000)
     }
 
-    /// Maximum number of `NodeSample` entries retained in memory (`retention / interval`, e.g.
-    /// 120 samples for the default 10m window at 5s intervals).
+    /// Maximum number of `NodeSample` entries retained in memory (`ceil(retention / interval)`,
+    /// e.g. 120 samples for the default 10m window at 5s intervals, or 2 samples for 1m at 40s so
+    /// in-window samples are never evicted prematurely).
     #[allow(clippy::cast_possible_truncation)]
     pub const fn capacity(self) -> usize {
-        let count = (self.retention_mins * 60) / self.interval_secs;
+        let count = (self.retention_mins * 60).div_ceil(self.interval_secs);
         if count == 0 { 1 } else { count as usize }
     }
 }
@@ -315,6 +316,22 @@ mod tests {
 
         let min_cfg = RingConfig::new(60, 1).expect("1m at 60s");
         assert_eq!(min_cfg.capacity(), 1);
+
+        // Non-dividing interval: 40s inside a 60s window holds two in-window samples (t=0, t=40s).
+        let non_div = RingConfig::new(40, 1).expect("1m at 40s");
+        assert_eq!(non_div.capacity(), 2);
+        let mut ring = Ring::new(non_div);
+        assert!(ring.push(mk_sample(40_000, 10.0), Some(40_000)));
+        assert!(ring.push(mk_sample(80_000, 20.0), Some(40_000)));
+        assert_eq!(ring.samples_since(0).len(), 2);
+        // At t=120s, t=40s is 80s old (> 60s retention) and evicted while t=80s stays.
+        assert!(ring.push(mk_sample(120_000, 30.0), Some(40_000)));
+        let kept: Vec<u64> = ring
+            .samples_since(0)
+            .iter()
+            .map(|s| s.timestamp_ms)
+            .collect();
+        assert_eq!(kept, vec![80_000, 120_000]);
     }
 
     #[test]

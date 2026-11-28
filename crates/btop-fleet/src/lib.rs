@@ -13,9 +13,10 @@ pub mod server;
 use thiserror::Error;
 
 pub use net::{
-    BackoffConfig, DEFAULT_BACKOFF_INITIAL_MS, DEFAULT_BACKOFF_MAX_MS, canonicalize_ip,
-    is_allowed_bind_ip, is_allowed_peer_ip, is_tailscale_ip, is_tailscale_ipv4, is_tailscale_ipv6,
-    resolve_tailscale_bind_addr_with_backoff, select_tailscale_bind_ip, validate_bind_addr,
+    BackoffConfig, DEFAULT_BACKOFF_INITIAL_MS, DEFAULT_BACKOFF_MAX_MS, LocalInterfaceAddr,
+    canonicalize_ip, is_allowed_bind_ip, is_allowed_peer_ip, is_tailscale_ip, is_tailscale_ipv4,
+    is_tailscale_ipv6, resolve_tailscale_bind_addr_with_backoff, select_tailscale_bind_ip,
+    validate_bind_addr,
 };
 pub use ring::{AgentClock, Ring, RingConfig, apply_sleep_gap_guard, is_sleep_gap};
 pub use server::{

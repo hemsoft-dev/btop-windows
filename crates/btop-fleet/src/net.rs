@@ -1,6 +1,7 @@
-//! Tailscale address detection, strict bind-address validation, peer IP filtering, and
+//! Tailscale interface detection, strict bind-address validation, peer IP filtering, and
 //! boot-time backoff retry for the Fleet Agent.
 
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -12,6 +13,15 @@ pub const DEFAULT_BACKOFF_INITIAL_MS: u64 = 1_000;
 
 /// Default maximum retry delay when waiting for Tailscale to come up at boot (`15s`).
 pub const DEFAULT_BACKOFF_MAX_MS: u64 = 15_000;
+
+/// Interface-attributed unicast address supplied by the host network enumerator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalInterfaceAddr {
+    pub interface_name: String,
+    pub description: String,
+    pub is_point_to_point: bool,
+    pub ip: IpAddr,
+}
 
 /// Backoff schedule used while waiting for a local Tailscale interface at boot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,14 +122,43 @@ pub const fn is_allowed_peer_ip(peer: IpAddr, bind_ip: IpAddr) -> bool {
     }
 }
 
+fn has_tailscale_name(addr: &LocalInterfaceAddr) -> bool {
+    addr.interface_name
+        .to_ascii_lowercase()
+        .contains("tailscale")
+        || addr.description.to_ascii_lowercase().contains("tailscale")
+}
+
 /// Deterministically picks the best Tailscale interface address from `candidates`, preferring
 /// Tailscale IPv4 (`100.64.0.0/10`) over Tailscale IPv6 (`fd7a:115c:a1e0::/48`).
-pub fn select_tailscale_bind_ip(candidates: &[IpAddr]) -> Option<IpAddr> {
+///
+/// To prevent accidentally binding to an unrelated ISP CGNAT or non-Tailscale VPN interface that
+/// happens to use `100.64.0.0/10`, an interface is only accepted as a Tailscale interface when:
+/// 1. Its name or description identifies Tailscale (`tailscale0` on Linux, `Tailscale` /
+///    `Tailscale Tunnel` on Windows), OR
+/// 2. It is a point-to-point tunnel (`utun*` on macOS) carrying a `fd7a:115c:a1e0::/48` Tailscale
+///    ULA IPv6 address on the same interface.
+pub fn select_tailscale_bind_ip(candidates: &[LocalInterfaceAddr]) -> Option<IpAddr> {
+    let p2p_with_ts_v6: HashSet<&str> = candidates
+        .iter()
+        .filter(|entry| {
+            entry.is_point_to_point
+                && !entry.interface_name.is_empty()
+                && matches!(canonicalize_ip(entry.ip), IpAddr::V6(v6) if is_tailscale_ipv6(v6))
+        })
+        .map(|entry| entry.interface_name.as_str())
+        .collect();
+
     let mut v4s: Vec<Ipv4Addr> = Vec::new();
     let mut v6s: Vec<Ipv6Addr> = Vec::new();
 
-    for &raw in candidates {
-        match canonicalize_ip(raw) {
+    for entry in candidates {
+        let verified_ts_iface = has_tailscale_name(entry)
+            || (entry.is_point_to_point && p2p_with_ts_v6.contains(entry.interface_name.as_str()));
+        if !verified_ts_iface {
+            continue;
+        }
+        match canonicalize_ip(entry.ip) {
             IpAddr::V4(v4) if is_tailscale_ipv4(v4) => v4s.push(v4),
             IpAddr::V6(v6) if is_tailscale_ipv6(v6) => v6s.push(v6),
             _ => {}
@@ -135,17 +174,17 @@ pub fn select_tailscale_bind_ip(candidates: &[IpAddr]) -> Option<IpAddr> {
 }
 
 /// Resolves the Tailscale bind address at startup, retrying with exponential backoff until a local
-/// Tailscale IP is detected or `stop` is signaled.
+/// verified Tailscale interface is detected or `stop` is signaled.
 pub fn resolve_tailscale_bind_addr_with_backoff<F, W, N>(
     port: u16,
     backoff: BackoffConfig,
     stop: &AtomicBool,
-    mut discover_local_ips: F,
+    mut discover_local_addrs: F,
     mut wait: W,
     mut on_waiting: N,
 ) -> Result<SocketAddr, FleetError>
 where
-    F: FnMut() -> Result<Vec<IpAddr>, String>,
+    F: FnMut() -> Result<Vec<LocalInterfaceAddr>, String>,
     W: FnMut(Duration) -> bool,
     N: FnMut(usize, Duration, Option<&str>),
 {
@@ -159,9 +198,9 @@ where
         }
         attempt += 1;
 
-        let err_msg = match discover_local_ips() {
-            Ok(ips) => {
-                if let Some(ts_ip) = select_tailscale_bind_ip(&ips) {
+        let err_msg = match discover_local_addrs() {
+            Ok(addrs) => {
+                if let Some(ts_ip) = select_tailscale_bind_ip(&addrs) {
                     return validate_bind_addr(SocketAddr::new(ts_ip, port));
                 }
                 None
@@ -189,9 +228,17 @@ where
 mod tests {
     use super::*;
 
+    fn mk_addr(name: &str, desc: &str, p2p: bool, ip: &str) -> LocalInterfaceAddr {
+        LocalInterfaceAddr {
+            interface_name: name.to_owned(),
+            description: desc.to_owned(),
+            is_point_to_point: p2p,
+            ip: ip.parse().expect("ip"),
+        }
+    }
+
     #[test]
     fn tailscale_ipv4_and_ipv6_ranges_match_exact_cidrs() {
-        // 100.64.0.0/10 boundaries
         assert!(!is_tailscale_ipv4(Ipv4Addr::new(100, 63, 255, 255)));
         assert!(is_tailscale_ipv4(Ipv4Addr::new(100, 64, 0, 0)));
         assert!(is_tailscale_ipv4(Ipv4Addr::new(100, 100, 100, 100)));
@@ -200,7 +247,6 @@ mod tests {
         assert!(!is_tailscale_ipv4(Ipv4Addr::new(192, 168, 1, 10)));
         assert!(!is_tailscale_ipv4(Ipv4Addr::LOCALHOST));
 
-        // fd7a:115c:a1e0::/48 boundaries
         assert!(is_tailscale_ipv6(
             "fd7a:115c:a1e0::1".parse::<Ipv6Addr>().expect("v6")
         ));
@@ -212,7 +258,6 @@ mod tests {
         ));
         assert!(!is_tailscale_ipv6(Ipv6Addr::LOCALHOST));
 
-        // IPv4-mapped IPv6 canonicalization
         let mapped_ts: IpAddr = "::ffff:100.64.10.20".parse().expect("mapped");
         assert!(is_tailscale_ip(mapped_ts));
         let mapped_lan: IpAddr = "::ffff:192.168.1.5".parse().expect("mapped lan");
@@ -269,31 +314,52 @@ mod tests {
     }
 
     #[test]
-    fn select_tailscale_ip_prefers_ipv4_deterministically() {
-        let ips: Vec<IpAddr> = vec![
-            "192.168.1.10".parse().expect("lan"),
-            "127.0.0.1".parse().expect("lo"),
-            "fd7a:115c:a1e0::42".parse().expect("ts6"),
-            "100.90.1.5".parse().expect("ts4b"),
-            "100.64.0.2".parse().expect("ts4a"),
+    fn select_tailscale_ip_rejects_non_tailscale_cgnat_and_matches_all_three_os_layouts() {
+        // Non-Tailscale ISP CGNAT on eth0 and corporate VPN on wg0 must NEVER be selected
+        let non_ts = vec![
+            mk_addr("eth0", "Realtek PCIe", false, "100.64.0.1"),
+            mk_addr("wg0", "WireGuard Corp", true, "100.64.0.2"),
+            mk_addr("utun2", "", true, "100.64.0.3"),
+        ];
+        assert_eq!(select_tailscale_bind_ip(&non_ts), None);
+
+        // Linux `tailscale0` beats lower non-Tailscale CGNAT on `eth0`
+        let linux_addrs = vec![
+            mk_addr("eth0", "", false, "100.64.0.1"),
+            mk_addr("tailscale0", "", true, "100.97.164.73"),
+            mk_addr("tailscale0", "", true, "fd7a:115c:a1e0::9e32:a44c"),
         ];
         assert_eq!(
-            select_tailscale_bind_ip(&ips),
-            Some("100.64.0.2".parse().expect("expected lowest v4"))
+            select_tailscale_bind_ip(&linux_addrs),
+            Some("100.97.164.73".parse().expect("linux ts"))
         );
 
-        let v6_only: Vec<IpAddr> = vec![
-            "192.168.1.10".parse().expect("lan"),
-            "fd7a:115c:a1e0::42".parse().expect("ts6"),
+        // Windows `Tailscale` / `Tailscale Tunnel` adapter
+        let win_addrs = vec![
+            mk_addr("Ethernet", "Intel I225-V", false, "100.64.1.1"),
+            mk_addr("Tailscale", "Tailscale Tunnel", true, "100.101.122.39"),
         ];
+        assert_eq!(
+            select_tailscale_bind_ip(&win_addrs),
+            Some("100.101.122.39".parse().expect("win ts"))
+        );
+
+        // macOS `utun4` verified via paired `fd7a:115c:a1e0::/48` Tailscale ULA on same interface
+        let mac_addrs = vec![
+            mk_addr("utun2", "", true, "100.64.0.5"), // other VPN without Tailscale ULA
+            mk_addr("utun4", "", true, "100.69.182.27"),
+            mk_addr("utun4", "", true, "fd7a:115c:a1e0::3932:b61c"),
+        ];
+        assert_eq!(
+            select_tailscale_bind_ip(&mac_addrs),
+            Some("100.69.182.27".parse().expect("mac ts"))
+        );
+
+        // IPv6-only Tailscale fallback
+        let v6_only = vec![mk_addr("tailscale0", "", true, "fd7a:115c:a1e0::42")];
         assert_eq!(
             select_tailscale_bind_ip(&v6_only),
-            Some("fd7a:115c:a1e0::42".parse().expect("expected v6"))
-        );
-
-        assert_eq!(
-            select_tailscale_bind_ip(&["192.168.1.10".parse().expect("lan")]),
-            None
+            Some("fd7a:115c:a1e0::42".parse().expect("v6 ts"))
         );
     }
 
@@ -315,11 +381,11 @@ mod tests {
             || {
                 calls += 1;
                 if calls < 5 {
-                    Ok(vec!["127.0.0.1".parse().expect("lo")])
+                    Ok(vec![mk_addr("lo", "", false, "127.0.0.1")])
                 } else {
                     Ok(vec![
-                        "127.0.0.1".parse().expect("lo"),
-                        "100.88.1.7".parse().expect("ts"),
+                        mk_addr("lo", "", false, "127.0.0.1"),
+                        mk_addr("tailscale0", "", true, "100.88.1.7"),
                     ])
                 }
             },
