@@ -41,10 +41,16 @@ pub use nvml::{
 };
 pub use pdh::{CpuPdhQuery, CpuPdhSample};
 pub use power::{RawPowerStatus, local_utc_offset_secs, query_system_power_status};
+#[cfg(unix)]
+pub use proc_actions::query_unix_process_meta;
 pub use proc_actions::{
-    PriorityClass, PriorityUpdateOutcome, ProcActionError, graceful_close_process,
-    guard_process_identity, guard_terminate_decision, query_process_priority, set_process_priority,
-    terminate_process,
+    LinuxProcStat, PriorityClass, PriorityUpdateOutcome, ProcActionError, UnixProcessMeta,
+    WINDOWS_TO_UNIX_EPOCH_100NS, graceful_close_process, guard_process_identity,
+    guard_terminate_decision, guard_unix_signal_decision, is_linux_kernel_thread,
+    is_macos_system_process, parse_linux_proc_stat_bytes, parse_linux_proc_stat_identity,
+    parse_linux_proc_statm_private_bytes, query_process_priority, set_process_priority,
+    terminate_process, unix_linux_ticks_to_identity, unix_start_time_secs_to_identity,
+    unix_timeval_to_identity,
 };
 pub use proc_info::{
     ProcFieldQuery, RawProcessMetadata, SidAccountCache, SystemProcessIdInformation,
@@ -1560,6 +1566,68 @@ pub use win::{
     query_self_private_working_set_bytes, read_cpu_model_name, read_cpu_nominal_mhz,
     system_uptime_secs, total_physical_memory_bytes,
 };
+
+/// Resolves the underlying BSD mount source device path (e.g. `"/dev/disk3s1s1"`) for a mounted
+/// filesystem path on macOS via `statfs(2)` so APFS container deduplication keys on real kernel
+/// container devices instead of volume labels.
+#[cfg(target_os = "macos")]
+pub fn unix_mount_device_name(mount_point: &std::path::Path) -> Option<String> {
+    use std::ffi::{CStr, CString};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let c_path = CString::new(mount_point.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statfs = unsafe { core::mem::zeroed() };
+    // SAFETY: Valid NUL-terminated path and aligned `statfs` output buffer.
+    if unsafe { libc::statfs(c_path.as_ptr(), &raw mut stat) } != 0 {
+        return None;
+    }
+    // SAFETY: `f_mntfromname` is guaranteed NUL-terminated by `statfs(2)`.
+    let dev = unsafe { CStr::from_ptr(stat.f_mntfromname.as_ptr()) };
+    let text = dev.to_string_lossy();
+    (!text.is_empty()).then(|| text.into_owned())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn unix_mount_device_name(_mount_point: &std::path::Path) -> Option<String> {
+    None
+}
+
+/// Rejects macOS files carrying an extended ACL (`ACL_TYPE_EXTENDED`) so owner-only `0600`
+/// recordings cannot still grant read access to another local account via an inherited ACL.
+#[cfg(target_os = "macos")]
+pub fn ensure_no_macos_acl(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd as _;
+
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+
+    unsafe extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> *mut libc::c_void;
+        fn acl_free(obj_p: *mut libc::c_void) -> libc::c_int;
+    }
+
+    // SAFETY: Valid open file descriptor and standard macOS `libSystem` ACL query.
+    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    if !acl.is_null() {
+        // SAFETY: `acl` was returned non-null by `acl_get_fd_np`.
+        unsafe {
+            let _ = acl_free(acl);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refusing to write snapshot recording to a macOS file with an extended ACL",
+        ));
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::ENOENT | libc::ENOTSUP | libc::EOPNOTSUPP) | None => Ok(()),
+        Some(_) => Err(err),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn ensure_no_macos_acl(_file: &std::fs::File) -> std::io::Result<()> {
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

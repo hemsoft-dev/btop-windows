@@ -536,6 +536,18 @@ pub fn sort_processes(
         .collect()
 }
 
+/// Returns `true` when the snapshot's Services subsystem can be opened in the TUI.
+///
+/// Only snapshots carrying [`btop_model::UNIX_SERVICES_UNAVAILABLE_REASON`] (Linux/macOS v1)
+/// disable the Services view; Windows on-demand inactive states and transient Windows SCM API
+/// errors remain visible in the Services panel so input routing and error diagnostics stay aligned.
+pub fn is_services_view_supported(services: &DataState<Vec<btop_model::ServiceEntry>>) -> bool {
+    !matches!(
+        services,
+        DataState::Unavailable(reason) if reason == btop_model::UNIX_SERVICES_UNAVAILABLE_REASON
+    )
+}
+
 /// Renders the Process box (`⁴proc`) inside `rect`.
 pub fn render_proc_box(
     grid: &mut Grid,
@@ -562,7 +574,8 @@ pub fn render_proc_box(
     let active = view.active_processes(snapshot);
     let built = active.map(|procs| build_visible_rows(procs, view));
     let total_visible = built.as_ref().map_or(0, |(rows, _)| rows.len());
-    render_proc_chrome(grid, rect, view, total_visible, theme);
+    let services_available = is_services_view_supported(&snapshot.services);
+    render_proc_chrome(grid, rect, view, total_visible, services_available, theme);
 
     let inner = Rect {
         x: rect.x.saturating_add(1),
@@ -634,11 +647,13 @@ pub fn render_proc_box(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_proc_chrome(
     grid: &mut Grid,
     rect: Rect,
     view: &ProcViewState,
     total_procs: usize,
+    services_available: bool,
     theme: &ThemePalette,
 ) {
     let max_top_x = rect.x.saturating_add(rect.width - 1);
@@ -704,9 +719,10 @@ fn render_proc_chrome(
         register_sort_tag_hits(grid, sort_rect);
     }
 
-    // Draw clickable `S:svc` tab right after `⁴proc` when there is room before the sort tag.
+    // Draw clickable `S:svc` tab right after `⁴proc` when services are available and there is room.
     let svc_tab_x = left_bound.saturating_add(1);
-    if svc_tab_x.saturating_add(8) < sort_x
+    if services_available
+        && svc_tab_x.saturating_add(8) < sort_x
         && let Some(tab_rect) = draw_border_tag(
             grid,
             svc_tab_x,

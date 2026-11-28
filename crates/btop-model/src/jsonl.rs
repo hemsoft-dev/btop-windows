@@ -104,11 +104,57 @@ impl SnapshotRecorder {
     /// separator is written before the first appended snapshot so existing JSONL records
     /// remain intact.
     pub fn open(path: &Path) -> Result<Self, JsonlError> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .create(true)
-            .append(true)
-            .open(path)?;
+        Self::open_with_descriptor_check(path, |_| Ok(()))
+    }
+
+    /// Opens `path` with the same symlink/owner/mode checks as [`Self::open`], then invokes
+    /// `check` on the already-open file descriptor (e.g. macOS extended ACL verification) before
+    /// writing any bytes.
+    pub fn open_with_descriptor_check<F>(path: &Path, check: F) -> Result<Self, JsonlError>
+    where
+        F: FnOnce(&File) -> std::io::Result<()>,
+    {
+        let mut opts = OpenOptions::new();
+        opts.read(true).create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            // Pass `O_NOFOLLOW` directly to `open(2)` so symlink replacement cannot redirect
+            // snapshot recordings (zero TOCTOU between path check and open).
+            opts.mode(0o600);
+            #[allow(clippy::cast_possible_wrap)]
+            let nofollow = rustix::fs::OFlags::NOFOLLOW.bits() as i32;
+            opts.custom_flags(nofollow);
+        }
+        let mut file = opts.open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+            // Verify the already-open file descriptor (`fstat`) is a regular file owned by our
+            // effective UID with owner-only permissions (`0600` or stricter) before writing any
+            // bytes containing process command lines.
+            let meta = file.metadata()?;
+            let current_euid = rustix::process::geteuid().as_raw();
+            if !meta.file_type().is_file() {
+                return Err(JsonlError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "refusing to write snapshot recording to a non-regular file",
+                )));
+            }
+            if meta.uid() != current_euid {
+                return Err(JsonlError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "refusing to append snapshot recording to a file owned by another user",
+                )));
+            }
+            if (meta.permissions().mode() & 0o077) != 0 {
+                return Err(JsonlError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "refusing to append snapshot recording to a group- or world-accessible file (expected mode 0600)",
+                )));
+            }
+        }
+        check(&file)?;
         let mut needs_leading_newline = false;
         if file.metadata()?.len() > 0 {
             file.seek(SeekFrom::End(-1))?;
@@ -255,9 +301,15 @@ mod tests {
         let path = std::env::temp_dir().join(unique);
         let fixtures = win11_8core_single_gpu_desktop();
 
-        // Write tick 0 without a trailing newline.
+        // Write tick 0 without a trailing newline (owner-only mode on Unix so append is permitted).
         let first_line = serde_json::to_string(&fixtures[0]).expect("serialize tick 0");
         std::fs::write(&path, first_line.as_bytes()).expect("seed file without trailing newline");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("set owner-only permissions on seeded recording");
+        }
 
         let recorder = SnapshotRecorder::open(&path).expect("open recorder on existing file");
         recorder.record(fixtures[1].clone());
@@ -269,5 +321,65 @@ mod tests {
         let loaded = parse_jsonl_file(&path).expect("reloaded stream must stay valid");
         let _ = std::fs::remove_file(&path);
         assert_eq!(loaded, fixtures);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorder_restricts_unix_file_mode_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let unique = format!(
+            "btop-windows-mode-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        );
+        let path = std::env::temp_dir().join(unique);
+        let fixtures = win11_8core_single_gpu_desktop();
+
+        // Newly created recording gets mode 0600.
+        let recorder = SnapshotRecorder::open(&path).expect("open recorder");
+        recorder.record(fixtures[0].clone());
+        let _ = recorder.finish().expect("finish recorder");
+
+        let mode = std::fs::metadata(&path)
+            .expect("stat recording")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+
+        // Appending to an already-owner-only (0600) file succeeds cleanly.
+        let append_ok = SnapshotRecorder::open(&path).expect("append to 0600 recording");
+        append_ok.record(fixtures[1].clone());
+        let _ = append_ok.finish().expect("finish append");
+
+        // Widening the file to 0644 must cause `open` to fail closed without appending.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("set 0644 permissions");
+        let len_before = std::fs::metadata(&path).expect("stat before").len();
+        let err = SnapshotRecorder::open(&path)
+            .expect_err("must refuse appending to world-readable recording");
+        assert!(matches!(
+            err,
+            JsonlError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(
+            std::fs::metadata(&path).expect("stat after").len(),
+            len_before
+        );
+
+        // Symlink target must be rejected atomically by `O_NOFOLLOW`.
+        let link_path = path.with_extension("symlink.jsonl");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("restore 0600");
+        std::os::unix::fs::symlink(&path, &link_path).expect("create symlink");
+        assert!(
+            SnapshotRecorder::open(&link_path).is_err(),
+            "O_NOFOLLOW must reject symlink recording target"
+        );
+        let _ = std::fs::remove_file(&link_path);
+        let _ = std::fs::remove_file(&path);
     }
 }

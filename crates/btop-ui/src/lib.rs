@@ -37,12 +37,12 @@ pub use mem_box::{format_mem_bytes, stacked_physical_segments};
 pub use menu::{
     HELP_BINDINGS, HelpEntry, HelpState, MainMenuChoice, MainMenuState, MessageBoxAction,
     MessageBoxKind, MessageBoxResult, MessageBoxState, OptionCategory, OptionId, OptionKind,
-    OptionsState, OverlayMenu, TextEdit,
+    OptionsState, OverlayMenu, TextEdit, UNIX_HELP_BINDINGS, help_bindings_len,
 };
 pub use menu_render::{dim_grid, help_visible_rows, options_visible_rows, render_overlay_menu};
 pub use net_box::{AUTO_SCALE_FLOOR_BPS, NetViewState, compute_net_scale_ceilings, format_bitrate};
 pub use proc_actions::{ProcActionModal, UiPriorityClass, modal_rect};
-pub use proc_box::{ProcSort, ProcViewState};
+pub use proc_box::{ProcSort, ProcViewState, is_services_view_supported};
 pub use proc_detail::{
     detail_overlay_height, format_detail_field, format_elapsed_uptime, format_parent_label,
 };
@@ -522,6 +522,43 @@ pub fn render_with_history(
     render_frame(snapshot, history, &state, config, size)
 }
 
+fn is_gpu_slot_unavailable(snapshot: &Snapshot, idx: u8) -> bool {
+    let is_unix_unsupported = |state: &DataState<GpuSnapshot>| {
+        matches!(
+            state,
+            DataState::Unavailable(reason) if reason == btop_model::UNIX_GPUS_UNAVAILABLE_REASON
+        )
+    };
+    if let Some(state) = snapshot.gpus.get(usize::from(idx)) {
+        return is_unix_unsupported(state);
+    }
+    !snapshot.gpus.is_empty() && snapshot.gpus.iter().all(is_unix_unsupported)
+}
+
+/// Filters out explicitly unavailable GPU panels (e.g. Linux/macOS v1 `DataState::Unavailable`)
+/// from configured `shown_boxes` or presets so unsupported GPU boxes never consume layout space
+/// or leave an empty screen when a GPU-only preset is selected.
+pub fn effective_layout_for_snapshot<'a>(
+    layout: &'a LayoutState,
+    snapshot: &Snapshot,
+) -> Cow<'a, LayoutState> {
+    let has_unavailable_gpu = layout
+        .shown_boxes
+        .iter()
+        .any(|&b| matches!(b, BoxId::Gpu(idx) if is_gpu_slot_unavailable(snapshot, idx)));
+    if !has_unavailable_gpu {
+        return Cow::Borrowed(layout);
+    }
+    let mut filtered = layout.clone();
+    filtered
+        .shown_boxes
+        .retain(|&b| !matches!(b, BoxId::Gpu(idx) if is_gpu_slot_unavailable(snapshot, idx)));
+    if filtered.shown_boxes.is_empty() {
+        filtered.shown_boxes = vec![BoxId::Cpu, BoxId::Mem, BoxId::Net, BoxId::Proc];
+    }
+    Cow::Owned(filtered)
+}
+
 /// Renders a complete terminal frame with history and interactive UI state into a [`Grid`].
 pub fn render_frame(
     snapshot: &Snapshot,
@@ -535,7 +572,8 @@ pub fn render_frame(
         .resolved_theme
         .unwrap_or_else(|| ThemePalette::for_name(&config.color_theme, config.theme_background));
 
-    match compute_layout(size, &state.layout) {
+    let effective_layout = effective_layout_for_snapshot(&state.layout, snapshot);
+    match compute_layout(size, &effective_layout) {
         Ok(layout) => {
             let has_dedicated_gpu_boxes = !layout.gpus().is_empty();
             if let Some(rect) = layout.cpu() {
@@ -562,7 +600,7 @@ pub fn render_frame(
             }
             if let Some(rect) = layout.proc() {
                 let cfg = box_config(config, state, BoxId::Proc);
-                if state.services.active {
+                if state.services.active && is_services_view_supported(&snapshot.services) {
                     services_view::render_services_view(
                         &mut grid,
                         rect,
@@ -598,7 +636,13 @@ pub fn render_frame(
         }
     }
     if let Some(ref menu) = state.menu {
-        render_overlay_menu(&mut grid, menu, config, &theme);
+        menu_render::render_overlay_menu_for_platform(
+            &mut grid,
+            menu,
+            !is_services_view_supported(&snapshot.services),
+            config,
+            &theme,
+        );
     }
     grid
 }
@@ -752,5 +796,56 @@ mod tests {
             hist.gpu_util_slice_for(0, &gpu_a).is_empty(),
             "departed adapter history must be pruned and never inherited by slot 0"
         );
+    }
+
+    #[test]
+    fn unix_unavailable_gpu_preset_falls_back_to_live_panels_and_unix_help_hides_windows_actions() {
+        let snap = Snapshot {
+            hostname: "mini".to_owned(),
+            cpu: DataState::Available(CpuSnapshot {
+                model_name: "Ryzen 5".to_owned(),
+                total_busy_pct: 12.0,
+                uptime_secs: 3600,
+                ..CpuSnapshot::default()
+            }),
+            services: DataState::Unavailable(
+                btop_model::UNIX_SERVICES_UNAVAILABLE_REASON.to_owned(),
+            ),
+            gpus: vec![DataState::Unavailable(
+                "GPU telemetry is unavailable on Linux and macOS in v1".to_owned(),
+            )],
+            ..Snapshot::default()
+        };
+        assert!(!is_services_view_supported(&snap.services));
+        assert!(is_services_view_supported(&DataState::Unavailable(
+            "OpenSCManagerW failed (access denied)".to_owned()
+        )));
+        let cfg = Config {
+            shown_boxes: "gpu0".to_owned(),
+            ..Config::default()
+        };
+        let size = Size {
+            width: 120,
+            height: 40,
+        };
+        let grid = render(&snap, &cfg, size);
+        let text = grid.to_plain_text();
+        assert!(
+            text.contains("Ryzen 5"),
+            "GPU-only layout with unavailable GPUs must fall back to live CPU/MEM/NET/PROC panels"
+        );
+        assert!(
+            !text.contains("GPU unavailable"),
+            "unavailable GPU panels must not claim layout space"
+        );
+
+        let mut state = UiState::from_config(&cfg);
+        let mut help = HelpState::default();
+        help.scroll_down(100, 10);
+        state.menu = Some(OverlayMenu::Help(help));
+        let help_grid = render_frame(&snap, &UiHistory::default(), &state, &cfg, size);
+        let help_text = help_grid.to_plain_text();
+        assert!(help_text.contains("SIGTERM"));
+        assert!(!help_text.contains("WM_CLOSE"));
     }
 }

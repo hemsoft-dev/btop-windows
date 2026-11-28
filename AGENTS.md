@@ -47,7 +47,7 @@ Simplicity never overrides these five invariants:
 2. **Always restore the terminal.** Normal exit, `Ctrl+C`, `CTRL_CLOSE_EVENT`, and panics must restore console modes, unhide the cursor, and leave the alternate screen. Keep `panic = "unwind"`.
 3. **Never kill the wrong or critical process.** Before terminating a local process, verify process creation/start time on the target handle/PID and reject critical system processes (`IsProcessCritical` on Windows; PID 1 and kernel threads on Unix).
 4. **Isolate `unsafe`.** Keep `#![forbid(unsafe_code)]` on `btop-model`, `btop-config`, `btop-ui`, and `btop-fleet`. Put raw Win32/NT FFI structs and compile-time layout assertions in `crates/btop-sys`. Call `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)` at startup on Windows.
-5. **Fleet mode is permanently read-only and minimal.** Never serialize `Snapshot`, usernames, process lists, or command lines from the Fleet Agent, never bind `0.0.0.0`, and never link process-action or service-control code into `btop-fleet`.
+5. **Fleet mode is permanently read-only and minimal.** Never serialize `Snapshot`, usernames, process lists, or command lines from the Fleet Agent, never bind `0.0.0.0`, and never link process-action or service-control code into the `btop-fleet` library crate (`crates/btop-fleet`) or Fleet View. (Local Unix TUI process signals in `apps/btop-fleet` follow rule 3 and remain isolated to `#[cfg(unix)]` local TUI mode.)
 
 ## 4. Quality gates and validation
 

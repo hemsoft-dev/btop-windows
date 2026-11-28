@@ -1091,6 +1091,75 @@ pub const HELP_BINDINGS: &[HelpEntry] = &[
     ),
 ];
 
+/// Accurate Linux and macOS v1 keybinding reference rendered inside the Help overlay (`F1` / `?` / `h`).
+pub const UNIX_HELP_BINDINGS: &[HelpEntry] = &[
+    HelpEntry::section("Menus & General"),
+    HelpEntry::bind("Esc / m", "Open or close the game-inspired Main menu"),
+    HelpEntry::bind("F2 / o", "Open Options menu (live editing & theme preview)"),
+    HelpEntry::bind(
+        "F1 / ? / h",
+        "Open Help keybindings reference (Shift+H when vim_keys=True)",
+    ),
+    HelpEntry::bind("q / Ctrl+C", "Quit btop-fleet and restore terminal"),
+    HelpEntry::bind("Ctrl+R", "Reload btop.conf and refresh collectors"),
+    HelpEntry::bind("Ctrl+L", "Force full screen redraw"),
+    HelpEntry::bind(
+        "+ / -",
+        "Adjust update_ms cadence (+/- 100 ms, floor 100 ms)",
+    ),
+    HelpEntry::section("Layout & Panels"),
+    HelpEntry::bind("1 / 2 / 3 / 4", "Toggle CPU, MEM, NET, and PROC panels"),
+    HelpEntry::bind("p / Shift+P", "Cycle layout presets forward / backward"),
+    HelpEntry::bind("d / i", "Toggle local disks list / Disk I/O graph mode"),
+    HelpEntry::section("Network Panel"),
+    HelpEntry::bind("b / n", "Select previous / next physical network adapter"),
+    HelpEntry::bind(
+        "a / y / z",
+        "Toggle auto-scale, sync scale, or reset session totals",
+    ),
+    HelpEntry::section("Processes & Tree"),
+    HelpEntry::bind(
+        "Up / Down / PgUp / PgDn",
+        "Navigate process list (j/k/g/G when vim_keys=True)",
+    ),
+    HelpEntry::bind(
+        "Left / Right / r",
+        "Cycle sort column (h/l if vim_keys) / reverse sort",
+    ),
+    HelpEntry::bind(
+        "e / Space / Shift+E",
+        "Toggle tree view / collapse branch / collapse all",
+    ),
+    HelpEntry::bind(
+        "f or / / Del",
+        "Edit process filter (prefix '!' for regex) / clear",
+    ),
+    HelpEntry::bind(
+        "Enter / Esc",
+        "Open or close Selected Process Detail overlay",
+    ),
+    HelpEntry::bind(
+        "u / Shift+F",
+        "Pause process list / follow selected process identity",
+    ),
+    HelpEntry::bind("c / %", "Toggle per-core CPU% / memory bytes vs percent"),
+    HelpEntry::section("Guarded Unix Process Signals"),
+    HelpEntry::bind("t", "Graceful terminate via SIGTERM (start-time guarded)"),
+    HelpEntry::bind(
+        "k (K if vim_keys)",
+        "Guarded SIGKILL (start-time + PID 1/kernel guard)",
+    ),
+];
+
+/// Returns the number of entries in the active platform's Help reference table.
+pub const fn help_bindings_len(unix_help: bool) -> usize {
+    if unix_help {
+        UNIX_HELP_BINDINGS.len()
+    } else {
+        HELP_BINDINGS.len()
+    }
+}
+
 /// Interactive scroll state for the Help keybindings overlay.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HelpState {
@@ -1099,7 +1168,11 @@ pub struct HelpState {
 
 impl HelpState {
     pub fn max_scroll(visible_rows: usize) -> usize {
-        HELP_BINDINGS.len().saturating_sub(visible_rows.max(1))
+        Self::max_scroll_for(visible_rows, HELP_BINDINGS.len())
+    }
+
+    pub fn max_scroll_for(visible_rows: usize, total_entries: usize) -> usize {
+        total_entries.saturating_sub(visible_rows.max(1))
     }
 
     pub fn scroll_up(&mut self, lines: usize) {
@@ -1107,10 +1180,14 @@ impl HelpState {
     }
 
     pub fn scroll_down(&mut self, lines: usize, visible_rows: usize) {
+        self.scroll_down_for(lines, visible_rows, HELP_BINDINGS.len());
+    }
+
+    pub fn scroll_down_for(&mut self, lines: usize, visible_rows: usize, total_entries: usize) {
         self.scroll_offset = self
             .scroll_offset
             .saturating_add(lines)
-            .min(Self::max_scroll(visible_rows));
+            .min(Self::max_scroll_for(visible_rows, total_entries));
     }
 
     pub fn home(&mut self) {
@@ -1118,11 +1195,21 @@ impl HelpState {
     }
 
     pub fn end(&mut self, visible_rows: usize) {
-        self.scroll_offset = Self::max_scroll(visible_rows);
+        self.end_for(visible_rows, HELP_BINDINGS.len());
+    }
+
+    pub fn end_for(&mut self, visible_rows: usize, total_entries: usize) {
+        self.scroll_offset = Self::max_scroll_for(visible_rows, total_entries);
     }
 
     pub fn clamp(&mut self, visible_rows: usize) {
-        self.scroll_offset = self.scroll_offset.min(Self::max_scroll(visible_rows));
+        self.clamp_for(visible_rows, HELP_BINDINGS.len());
+    }
+
+    pub fn clamp_for(&mut self, visible_rows: usize, total_entries: usize) {
+        self.scroll_offset = self
+            .scroll_offset
+            .min(Self::max_scroll_for(visible_rows, total_entries));
     }
 }
 
