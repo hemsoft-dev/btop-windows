@@ -317,7 +317,11 @@ fn parse_headless_params(
     Ok((sections, query, compiled_filter))
 }
 
-fn build_snapshot_source(cli: &Cli, config: &Config) -> Result<Box<dyn SnapshotSource>, ExitCode> {
+fn build_snapshot_source(
+    bin_name: &str,
+    cli: &Cli,
+    config: &Config,
+) -> Result<Box<dyn SnapshotSource>, ExitCode> {
     if let Some(replay_path) = cli.replay.as_deref() {
         match ReplaySource::from_path(replay_path) {
             Ok(replay) => Ok(Box::new(if cli.json {
@@ -339,6 +343,17 @@ fn build_snapshot_source(cli: &Cli, config: &Config) -> Result<Box<dyn SnapshotS
         #[cfg(unix)]
         {
             let _ = config;
+            // Per ADR-0003, live Unix monitoring runs through `btop-fleet` to avoid colliding with
+            // upstream `btop`; keep the `btop` binary replay/schema-only on Unix.
+            if bin_name != "btop-fleet" {
+                emit_error(
+                    cli.json,
+                    cli.pretty,
+                    "collector_error",
+                    "live Unix telemetry is provided by `btop-fleet`; use `btop-fleet` or pass `--replay <file>`",
+                );
+                return Err(ExitCode::FAILURE);
+            }
             match btop_collect::UnixLiveCollector::new() {
                 Ok(live) => Ok(Box::new(live)),
                 Err(err) => {
@@ -354,6 +369,7 @@ fn build_snapshot_source(cli: &Cli, config: &Config) -> Result<Box<dyn SnapshotS
         }
         #[cfg(not(unix))]
         {
+            let _ = bin_name;
             let freq_mode = FreqMode::from_config_str(&config.freq_mode);
             match LiveCollector::with_options(freq_mode, config.nvml_measure_pcie_speeds) {
                 Ok(live) => Ok(Box::new(live)),
@@ -433,7 +449,7 @@ fn run_cli_with_actions(bin_name: &'static str, live_actions: Option<LiveActionH
     };
 
     let is_replay = cli.replay.is_some();
-    let mut source = match build_snapshot_source(&cli, &config) {
+    let mut source = match build_snapshot_source(bin_name, &cli, &config) {
         Ok(src) => src,
         Err(code) => return code,
     };

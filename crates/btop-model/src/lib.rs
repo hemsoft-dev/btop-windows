@@ -47,6 +47,11 @@ use serde::{Deserialize, Serialize};
 pub const UNIX_SERVICES_UNAVAILABLE_REASON: &str =
     "OS service manager telemetry is unavailable on Linux and macOS in v1";
 
+/// Canonical `DataState::Unavailable` reason emitted by Unix collectors where bespoke GPU
+/// telemetry is intentionally unsupported in v1 (distinct from transient Windows DXGI errors).
+pub const UNIX_GPUS_UNAVAILABLE_REASON: &str =
+    "GPU telemetry is unavailable on Linux and macOS in v1";
+
 /// Explicit availability and freshness state for any optional or async subsystem.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(tag = "state", content = "data", rename_all = "snake_case")]

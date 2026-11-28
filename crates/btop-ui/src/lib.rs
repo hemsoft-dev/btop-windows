@@ -523,14 +523,16 @@ pub fn render_with_history(
 }
 
 fn is_gpu_slot_unavailable(snapshot: &Snapshot, idx: u8) -> bool {
+    let is_unix_unsupported = |state: &DataState<GpuSnapshot>| {
+        matches!(
+            state,
+            DataState::Unavailable(reason) if reason == btop_model::UNIX_GPUS_UNAVAILABLE_REASON
+        )
+    };
     if let Some(state) = snapshot.gpus.get(usize::from(idx)) {
-        return matches!(state, DataState::Unavailable(_));
+        return is_unix_unsupported(state);
     }
-    !snapshot.gpus.is_empty()
-        && snapshot
-            .gpus
-            .iter()
-            .all(|g| matches!(g, DataState::Unavailable(_)))
+    !snapshot.gpus.is_empty() && snapshot.gpus.iter().all(is_unix_unsupported)
 }
 
 /// Filters out explicitly unavailable GPU panels (e.g. Linux/macOS v1 `DataState::Unavailable`)

@@ -279,10 +279,11 @@ fn open_optional_recorder(
 ) -> Result<Option<SnapshotRecorder>, AppError> {
     record_path
         .map(|path| {
-            SnapshotRecorder::open(path).map_err(|source| AppError::RecordOpen {
-                path: path.to_path_buf(),
-                source,
-            })
+            SnapshotRecorder::open_with_descriptor_check(path, btop_sys::ensure_no_macos_acl)
+                .map_err(|source| AppError::RecordOpen {
+                    path: path.to_path_buf(),
+                    source,
+                })
         })
         .transpose()
 }
@@ -859,14 +860,16 @@ fn is_gpu_box_unavailable(snapshot: &btop_model::Snapshot, box_id: BoxId) -> boo
     let BoxId::Gpu(idx) = box_id else {
         return false;
     };
+    let is_unix_unsupported = |state: &DataState<btop_model::GpuSnapshot>| {
+        matches!(
+            state,
+            DataState::Unavailable(reason) if reason == btop_model::UNIX_GPUS_UNAVAILABLE_REASON
+        )
+    };
     if let Some(state) = snapshot.gpus.get(usize::from(idx)) {
-        return matches!(state, DataState::Unavailable(_));
+        return is_unix_unsupported(state);
     }
-    !snapshot.gpus.is_empty()
-        && snapshot
-            .gpus
-            .iter()
-            .all(|g| matches!(g, DataState::Unavailable(_)))
+    !snapshot.gpus.is_empty() && snapshot.gpus.iter().all(is_unix_unsupported)
 }
 
 fn toggle_services_view(
@@ -3607,6 +3610,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn unavailable_services_and_gpu_panels_cannot_take_over_layout() {
         let size = Size {
             width: 120,
@@ -3616,7 +3620,9 @@ mod tests {
             services: DataState::Unavailable(
                 btop_model::UNIX_SERVICES_UNAVAILABLE_REASON.to_owned(),
             ),
-            gpus: vec![DataState::Unavailable("unavailable on Unix".to_owned())],
+            gpus: vec![DataState::Unavailable(
+                btop_model::UNIX_GPUS_UNAVAILABLE_REASON.to_owned(),
+            )],
             ..btop_model::Snapshot::default()
         };
         let mut state = UiState::default();
@@ -3682,6 +3688,18 @@ mod tests {
         sanitize_layout_for_snapshot(&mut gpu_state, &snap);
         assert!(visible_proc_rows(size, &gpu_state) > 0);
         assert!(has_proc_panel(size, &gpu_state));
+
+        // Transient Windows DXGI enumeration errors must NOT strip configured GPU panels from
+        // `shown_boxes` (so diagnostics stay visible and saved layouts are not wiped on exit).
+        let win_gpu_err_snap = btop_model::Snapshot {
+            gpus: vec![DataState::Unavailable(
+                "CreateDXGIFactory1 failed".to_owned(),
+            )],
+            ..btop_model::Snapshot::default()
+        };
+        let mut win_gpu_state = UiState::from_config(&gpu_only_cfg);
+        sanitize_layout_for_snapshot(&mut win_gpu_state, &win_gpu_err_snap);
+        assert!(win_gpu_state.layout.shown_boxes.contains(&BoxId::Gpu(0)));
 
         // Unix Help `End` clamps to `UNIX_HELP_BINDINGS.len()` so a single `Up` scrolls immediately.
         let compact = Size {

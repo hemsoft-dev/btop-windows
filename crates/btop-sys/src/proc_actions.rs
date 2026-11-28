@@ -283,6 +283,26 @@ pub fn parse_linux_proc_statm_private_bytes(statm: &str, page_size: u64) -> Opti
     Some(resident.saturating_sub(shared).saturating_mul(page_size))
 }
 
+/// Parses the leading PID from a Linux `/proc/self/stat` byte slice.
+pub fn parse_linux_proc_stat_pid(stat_bytes: &[u8]) -> Option<u32> {
+    let open_idx = stat_bytes.iter().position(|&b| b == b'(')?;
+    let prefix = std::str::from_utf8(stat_bytes.get(..open_idx)?)
+        .ok()?
+        .trim();
+    prefix.parse::<u32>().ok()
+}
+
+/// Parses `Pid:\t<N>` from Linux `/proc/self/fdinfo/<pidfd>` so callers can confirm the pinned
+/// `pidfd` resolves to the exact PID verified via `/proc/<pid>/stat` in the same PID namespace.
+pub fn parse_linux_fdinfo_pid(fdinfo: &str) -> Option<u32> {
+    for line in fdinfo.lines() {
+        if let Some(rest) = line.strip_prefix("Pid:") {
+            return rest.trim().parse::<u32>().ok();
+        }
+    }
+    None
+}
+
 /// Decodes Linux `/proc/<pid>/cmdline` NUL-delimited bytes into a single displayable command line.
 pub fn parse_linux_proc_cmdline_bytes(cmdline_bytes: &[u8]) -> Option<String> {
     let parts: Vec<String> = cmdline_bytes
@@ -921,6 +941,21 @@ mod unix {
             return Err(ProcActionError::NotFound(pid));
         };
 
+        // Confirm `/proc` is mounted for our own PID namespace before cross-referencing
+        // `pidfd_open(pid)` with `/proc/<pid>/stat` (otherwise a mismatched parent `/proc` mount
+        // could validate one namespace's process while signaling another namespace's process).
+        let self_stat = std::fs::read("/proc/self/stat").map_err(|err| {
+            ProcActionError::Platform(format!("failed to read /proc/self/stat: {err}"))
+        })?;
+        let proc_self_pid = super::parse_linux_proc_stat_pid(&self_stat).ok_or_else(|| {
+            ProcActionError::Platform("malformed /proc/self/stat record".to_owned())
+        })?;
+        if proc_self_pid != std::process::id() {
+            return Err(ProcActionError::Platform(
+                "/proc mount does not match current PID namespace; refusing signal".to_owned(),
+            ));
+        }
+
         // Fail closed when the kernel lacks `pidfd_open` instead of falling back to racy bare `kill`.
         // SAFETY: Invoking Linux `SYS_pidfd_open(pid, 0)`.
         let pidfd_rc = unsafe { libc::syscall(libc::SYS_pidfd_open, raw_pid, 0 as libc::c_uint) };
@@ -934,6 +969,16 @@ mod unix {
             return Err(map_errno(pid, err, "pidfd_open"));
         }
         let pidfd = OwnedFd(i32::try_from(pidfd_rc).unwrap_or(-1));
+
+        // Verify `/proc/self/fdinfo/<pidfd>` agrees that the pinned descriptor targets `pid`
+        // in the same `/proc` namespace before inspecting `/proc/<pid>/stat`.
+        let fdinfo =
+            std::fs::read_to_string(format!("/proc/self/fdinfo/{}", pidfd.0)).map_err(|err| {
+                ProcActionError::Platform(format!("failed to read pidfd fdinfo: {err}"))
+            })?;
+        if super::parse_linux_fdinfo_pid(&fdinfo) != Some(pid) {
+            return Err(ProcActionError::IdentityMismatch { pid });
+        }
 
         let meta = query_unix_process_meta(pid)?;
         guard_unix_signal_decision(
@@ -1268,6 +1313,17 @@ mod tests {
             parse_linux_proc_statm_private_bytes("1000 100 150 0 0 0 0", 4096),
             Some(0)
         );
+
+        // Linux `/proc/self/stat` PID and `/proc/self/fdinfo/<pidfd>` PID parsing.
+        assert_eq!(
+            parse_linux_proc_stat_pid(b"4242 (btop-fleet) S 1"),
+            Some(4242)
+        );
+        assert_eq!(
+            parse_linux_fdinfo_pid("pos:\t0\nflags:\t02\nPid:\t9876\nNSpid:\t9876\n"),
+            Some(9876)
+        );
+        assert_eq!(parse_linux_fdinfo_pid("pos:\t0\n"), None);
 
         // macOS `PROC_FLAG_SYSTEM` is bit 0 (`0x1`), NOT `PROC_FLAG_PC_THROTTLE` (`0x200`).
         assert!(is_macos_system_process(0x0000_0001));

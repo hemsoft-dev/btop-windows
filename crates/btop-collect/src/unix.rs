@@ -313,28 +313,59 @@ pub fn stable_interface_luid(name: &str) -> u64 {
     hash
 }
 
+/// Parses Linux `/proc/meminfo` `Committed_AS` and `CommitLimit` (in KiB) into byte counts.
+pub fn parse_linux_meminfo_commit(meminfo: &str) -> Option<(u64, u64)> {
+    let mut committed_kib = None;
+    let mut limit_kib = None;
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("Committed_AS:") {
+            committed_kib = rest
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<u64>().ok());
+        } else if let Some(rest) = line.strip_prefix("CommitLimit:") {
+            limit_kib = rest
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<u64>().ok());
+        }
+    }
+    match (committed_kib, limit_kib) {
+        (Some(used), Some(limit)) if limit > 0 => {
+            Some((used.saturating_mul(1024), limit.saturating_mul(1024)))
+        }
+        _ => None,
+    }
+}
+
 /// Builds a consistent Unix [`MemSnapshot`] using `used = total - available` so Linux page
 /// cache and macOS reclaimable memory do not falsely inflate memory pressure.
+///
+/// `commit` carries real OS virtual-memory commit accounting (`(committed, limit)`) when exposed
+/// by the kernel (Linux `/proc/meminfo`), or `None` -> `(0, 0)` on macOS so physical RAM usage is
+/// never misreported as Windows commit charge.
 pub fn compute_unix_mem_snapshot(
     total_bytes: u64,
     available_bytes: u64,
     free_bytes: u64,
     swap_total_bytes: u64,
     swap_used_bytes: u64,
+    commit: Option<(u64, u64)>,
 ) -> MemSnapshot {
     let available = available_bytes.min(total_bytes);
     let free = free_bytes.min(available);
     let used = total_bytes.saturating_sub(available);
     let cached = available.saturating_sub(free);
     let pagefile_used = swap_used_bytes.min(swap_total_bytes);
+    let (commit_used_bytes, commit_limit_bytes) = commit.unwrap_or((0, 0));
     MemSnapshot {
         total_bytes,
         used_bytes: used,
         available_bytes: available,
         cached_bytes: cached,
         free_bytes: free,
-        commit_used_bytes: used.saturating_add(pagefile_used),
-        commit_limit_bytes: total_bytes.saturating_add(swap_total_bytes),
+        commit_used_bytes,
+        commit_limit_bytes,
         pagefile_used_bytes: pagefile_used,
         pagefile_total_bytes: swap_total_bytes,
         compressed_bytes: None,
@@ -382,7 +413,8 @@ mod live {
 
     use btop_model::{
         CoreKind, CoreSample, CpuSnapshot, DataState, LogicalCpuId, NetInterfaceSnapshot,
-        ProcessEntry, ProcessIdentity, Snapshot, UNIX_SERVICES_UNAVAILABLE_REASON,
+        ProcessEntry, ProcessIdentity, Snapshot, UNIX_GPUS_UNAVAILABLE_REASON,
+        UNIX_SERVICES_UNAVAILABLE_REASON,
     };
     use btop_sys::{ProcActionError, query_unix_process_meta, unix_mount_device_name};
     use sysinfo::{
@@ -391,12 +423,12 @@ mod live {
         ProcessesToUpdate, RefreshKind, System, Users,
     };
 
-    #[cfg(target_os = "linux")]
-    use super::parse_linux_procs_running;
     use super::{
         RawUnixDisk, compute_unix_mem_snapshot, deduplicate_unix_disks, normalize_unix_cpu_pct,
         normalize_unix_proc_cpu_pct, should_include_unix_interface, stable_interface_luid,
     };
+    #[cfg(target_os = "linux")]
+    use super::{parse_linux_meminfo_commit, parse_linux_procs_running};
     #[cfg(target_os = "linux")]
     use crate::cpu::RunQueueEwma;
     use crate::math::clamped_rate_per_sec;
@@ -878,12 +910,19 @@ mod live {
             } else {
                 DataState::WarmingUp
             };
+            #[cfg(target_os = "linux")]
+            let commit = std::fs::read_to_string("/proc/meminfo")
+                .ok()
+                .and_then(|s| parse_linux_meminfo_commit(&s));
+            #[cfg(not(target_os = "linux"))]
+            let commit = None;
             let mem = compute_unix_mem_snapshot(
                 self.sys.total_memory(),
                 self.sys.available_memory(),
                 self.sys.free_memory(),
                 self.sys.total_swap(),
                 self.sys.used_swap(),
+                commit,
             );
             let total_phys_mem_bytes = (mem.total_bytes > 0).then_some(mem.total_bytes);
             let disks = self.sample_disks(elapsed_ms);
@@ -902,7 +941,7 @@ mod live {
                 processes: DataState::Available(processes),
                 services: DataState::Unavailable(UNIX_SERVICES_UNAVAILABLE_REASON.to_owned()),
                 gpus: vec![DataState::Unavailable(
-                    "GPU telemetry is unavailable on Linux and macOS in v1".to_owned(),
+                    UNIX_GPUS_UNAVAILABLE_REASON.to_owned(),
                 )],
                 battery: DataState::Unavailable(
                     "Battery telemetry is unavailable on Linux and macOS in v1".to_owned(),
@@ -1234,14 +1273,24 @@ mod tests {
             4_000_000_000,
             8_000_000_000,
             1_000_000_000,
+            None,
         );
         assert_eq!(mem.used_bytes, 12_000_000_000);
         assert_eq!(mem.available_bytes, 20_000_000_000);
         assert_eq!(mem.free_bytes, 4_000_000_000);
         assert_eq!(mem.cached_bytes, 16_000_000_000);
         assert_eq!(mem.used_bytes + mem.available_bytes, mem.total_bytes);
+        assert_eq!(mem.commit_used_bytes, 0);
+        assert_eq!(mem.commit_limit_bytes, 0);
         assert_eq!(mem.pagefile_used_bytes, 1_000_000_000);
         assert_eq!(mem.pagefile_total_bytes, 8_000_000_000);
+
+        let meminfo = "MemTotal: 16000000 kB\nCommitLimit: 12000000 kB\nCommitted_AS: 4000000 kB\n";
+        assert_eq!(
+            parse_linux_meminfo_commit(meminfo),
+            Some((4_000_000 * 1024, 12_000_000 * 1024))
+        );
+        assert_eq!(parse_linux_meminfo_commit("MemTotal: 16000000 kB\n"), None);
 
         assert!((normalize_unix_cpu_pct(f32::NAN) - 0.0).abs() < f32::EPSILON);
         assert!((normalize_unix_cpu_pct(150.0) - 100.0).abs() < f32::EPSILON);

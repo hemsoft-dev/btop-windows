@@ -1592,6 +1592,43 @@ pub fn unix_mount_device_name(_mount_point: &std::path::Path) -> Option<String> 
     None
 }
 
+/// Rejects macOS files carrying an extended ACL (`ACL_TYPE_EXTENDED`) so owner-only `0600`
+/// recordings cannot still grant read access to another local account via an inherited ACL.
+#[cfg(target_os = "macos")]
+pub fn ensure_no_macos_acl(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd as _;
+
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+
+    unsafe extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> *mut libc::c_void;
+        fn acl_free(obj_p: *mut libc::c_void) -> libc::c_int;
+    }
+
+    // SAFETY: Valid open file descriptor and standard macOS `libSystem` ACL query.
+    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    if !acl.is_null() {
+        // SAFETY: `acl` was returned non-null by `acl_get_fd_np`.
+        unsafe {
+            let _ = acl_free(acl);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refusing to write snapshot recording to a macOS file with an extended ACL",
+        ));
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::ENOENT | libc::ENOTSUP | libc::EOPNOTSUPP) | None => Ok(()),
+        Some(_) => Err(err),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn ensure_no_macos_acl(_file: &std::fs::File) -> std::io::Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

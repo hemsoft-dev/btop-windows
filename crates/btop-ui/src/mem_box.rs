@@ -599,7 +599,7 @@ fn render_mem_footer(
         fy = fy.saturating_add(1);
     }
 
-    if fy < y_end {
+    if mem.commit_limit_bytes > 0 && fy < y_end {
         let commit_pct = ratio_percent(mem.commit_used_bytes, mem.commit_limit_bytes);
         let right = format_ratio_footer(
             mem.commit_used_bytes,

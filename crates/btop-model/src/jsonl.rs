@@ -104,6 +104,16 @@ impl SnapshotRecorder {
     /// separator is written before the first appended snapshot so existing JSONL records
     /// remain intact.
     pub fn open(path: &Path) -> Result<Self, JsonlError> {
+        Self::open_with_descriptor_check(path, |_| Ok(()))
+    }
+
+    /// Opens `path` with the same symlink/owner/mode checks as [`Self::open`], then invokes
+    /// `check` on the already-open file descriptor (e.g. macOS extended ACL verification) before
+    /// writing any bytes.
+    pub fn open_with_descriptor_check<F>(path: &Path, check: F) -> Result<Self, JsonlError>
+    where
+        F: FnOnce(&File) -> std::io::Result<()>,
+    {
         let mut opts = OpenOptions::new();
         opts.read(true).create(true).append(true);
         #[cfg(unix)]
@@ -144,6 +154,7 @@ impl SnapshotRecorder {
                 )));
             }
         }
+        check(&file)?;
         let mut needs_leading_newline = false;
         if file.metadata()?.len() > 0 {
             file.seek(SeekFrom::End(-1))?;
