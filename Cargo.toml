@@ -7,6 +7,7 @@ members = [
     "crates/btop-collect",
     "crates/btop-term",
     "crates/btop-ui",
+    "crates/btop-fleet",
     "apps/btop-windows",
     "apps/btop-fleet",
 ]
@@ -83,6 +84,7 @@ btop-config = { path = "crates/btop-config" }
 btop-collect = { path = "crates/btop-collect" }
 btop-term = { path = "crates/btop-term" }
 btop-ui = { path = "crates/btop-ui" }
+btop-fleet = { path = "crates/btop-fleet" }
 
 [profile.release]
 lto = "fat"

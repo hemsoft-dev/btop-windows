@@ -2,26 +2,34 @@
 
 use std::ffi::OsString;
 use std::io;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(not(unix))]
 use btop_collect::{FreqMode, LiveCollector};
-use btop_collect::{ReplaySource, SnapshotSource};
+use btop_collect::{LiveNodeCollector, NodeSampleSource, ReplaySource, SnapshotSource};
 use btop_config::Config;
+use btop_fleet::{
+    AgentMetadata, AgentServer, BackoffConfig, FleetError, LocalInterfaceAddr, RingConfig,
+    ServerConfig, SharedRing, resolve_tailscale_bind_addr_with_backoff, validate_bind_addr,
+};
 use btop_model::{
-    HeadlessQuery, JsonSections, JsonSnapshotEnvelope, ProcSortField, QueryFilter, SchemaMode,
+    DEFAULT_AGENT_INTERVAL_SECS, DEFAULT_AGENT_RETENTION_MINS, DEFAULT_FLEET_PORT, HeadlessQuery,
+    JsonSections, JsonSnapshotEnvelope, MAX_AGENT_INTERVAL_SECS, MAX_AGENT_RETENTION_MINS,
+    MIN_AGENT_INTERVAL_SECS, MIN_AGENT_RETENTION_MINS, ProcSortField, QueryFilter, SchemaMode,
     ServiceStateFilter, build_json_schema,
 };
 use btop_sys::{
-    BoundedStdout, TimerWake, UnbufferedStdout, WaitableWakeTimer, install_headless_ctrl_c_handler,
+    BoundedStdout, TimerWake, UnbufferedStdout, WaitableWakeTimer, enumerate_local_interface_addrs,
+    install_headless_ctrl_c_handler,
 };
 use btop_term::CrosstermInput;
 use clap::error::ErrorKind;
-use clap::{CommandFactory as _, FromArgMatches as _, Parser};
+use clap::{Args, CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 
 use crate::headless::{
     DEFAULT_INTERVAL_MS, DEFAULT_LIVE_SAMPLE_MS, HeadlessContext, HeadlessJsonOptions,
@@ -180,6 +188,48 @@ struct Cli {
         conflicts_with_all = ["json", "default_config", "record"]
     )]
     schema: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<CliSubcommand>,
+}
+
+#[derive(Debug, Subcommand)]
+enum CliSubcommand {
+    /// Run the permanently read-only Tailscale Fleet Agent HTTP ring server
+    Agent(AgentArgs),
+}
+
+#[derive(Debug, Args)]
+struct AgentArgs {
+    /// Explicit bind address (Tailscale IP or loopback 127.0.0.1:PORT; never 0.0.0.0)
+    #[arg(long = "bind", value_name = "IP:PORT", conflicts_with = "port")]
+    bind: Option<SocketAddr>,
+
+    /// TCP port used when auto-detecting the local Tailscale IP (1-65535, default 9127)
+    #[arg(
+        long = "port",
+        value_name = "PORT",
+        value_parser = clap::value_parser!(u16).range(1..=65535)
+    )]
+    port: Option<u16>,
+
+    /// Sampling interval in seconds (1-60, default 5)
+    #[arg(
+        long = "interval",
+        value_name = "SECS",
+        default_value_t = DEFAULT_AGENT_INTERVAL_SECS,
+        value_parser = clap::value_parser!(u64).range(MIN_AGENT_INTERVAL_SECS..=MAX_AGENT_INTERVAL_SECS)
+    )]
+    interval_secs: u64,
+
+    /// In-memory Ring retention window in minutes (1-60, default 10)
+    #[arg(
+        long = "retention",
+        value_name = "MINS",
+        default_value_t = DEFAULT_AGENT_RETENTION_MINS,
+        value_parser = clap::value_parser!(u64).range(MIN_AGENT_RETENTION_MINS..=MAX_AGENT_RETENTION_MINS)
+    )]
+    retention_mins: u64,
 }
 
 fn emit_error(json_mode: bool, pretty: bool, code: &str, message: &str) {
@@ -408,6 +458,14 @@ fn run_cli_with_actions(bin_name: &'static str, live_actions: Option<LiveActionH
         Err(code) => return code,
     };
 
+    if let Some(CliSubcommand::Agent(ref agent_args)) = cli.command {
+        if has_conflicting_agent_top_level_flags(&cli) {
+            eprintln!("error: top-level TUI/--json/--replay flags cannot be combined with `agent`");
+            return ExitCode::from(2);
+        }
+        return run_agent(bin_name, agent_args);
+    }
+
     if cli.default_config {
         print!("{}", Config::render_default_conf());
         return ExitCode::SUCCESS;
@@ -480,6 +538,178 @@ fn run_cli_with_actions(bin_name: &'static str, live_actions: Option<LiveActionH
             eprintln!("error: {err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn has_conflicting_agent_top_level_flags(cli: &Cli) -> bool {
+    cli.config_file.is_some()
+        || cli.debug
+        || cli.filter.is_some()
+        || cli.force_utf
+        || cli.low_color
+        || cli.preset.is_some()
+        || cli.tty
+        || cli.no_tty
+        || cli.themes_dir.is_some()
+        || cli.update_ms.is_some()
+        || cli.default_config
+        || cli.record.is_some()
+        || cli.replay.is_some()
+        || cli.json
+        || cli.schema.is_some()
+}
+
+fn resolve_agent_bind_addr<W>(
+    bin_name: &str,
+    args: &AgentArgs,
+    stop_flag: &AtomicBool,
+    waiter: &mut W,
+) -> Result<SocketAddr, ExitCode>
+where
+    W: FnMut(Duration) -> bool,
+{
+    if let Some(addr) = args.bind {
+        return validate_bind_addr(addr).map_err(|err| {
+            eprintln!("error: {err}");
+            ExitCode::from(2)
+        });
+    }
+    let port = args.port.unwrap_or(DEFAULT_FLEET_PORT);
+    resolve_tailscale_bind_addr_with_backoff(
+        port,
+        BackoffConfig::default(),
+        stop_flag,
+        || {
+            enumerate_local_interface_addrs().map(|addrs| {
+                addrs
+                    .into_iter()
+                    .map(|a| LocalInterfaceAddr {
+                        interface_name: a.interface_name,
+                        description: a.description,
+                        is_point_to_point: a.is_point_to_point,
+                        ip: a.ip,
+                    })
+                    .collect()
+            })
+        },
+        waiter,
+        |attempt, delay, err| {
+            if attempt == 1 || attempt % 5 == 0 {
+                if let Some(reason) = err {
+                    eprintln!(
+                        "{bin_name} agent: waiting for Tailscale interface ({reason}); retrying in {}s",
+                        delay.as_secs()
+                    );
+                } else {
+                    eprintln!(
+                        "{bin_name} agent: waiting for Tailscale IP (100.64.0.0/10 or fd7a:115c:a1e0::/48); retrying in {}s",
+                        delay.as_secs()
+                    );
+                }
+            }
+        },
+    )
+    .map_err(|err| match err {
+        FleetError::BindCancelled => ExitCode::SUCCESS,
+        other => {
+            eprintln!("error: {other}");
+            ExitCode::FAILURE
+        }
+    })
+}
+
+fn run_agent(bin_name: &str, args: &AgentArgs) -> ExitCode {
+    #[cfg(unix)]
+    if bin_name != "btop-fleet" {
+        eprintln!(
+            "error: live Unix Fleet Agent is provided by `btop-fleet`; run `btop-fleet agent`"
+        );
+        return ExitCode::FAILURE;
+    }
+
+    let ring_cfg = match RingConfig::new(args.interval_secs, args.retention_mins) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let (stop_flag, mut waiter) = setup_interruptible_wait();
+    let bind_addr = match resolve_agent_bind_addr(bin_name, args, &stop_flag, &mut waiter) {
+        Ok(addr) => addr,
+        Err(code) => return code,
+    };
+
+    let mut collector = match LiveNodeCollector::new() {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("error: failed to initialize fleet agent collector: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let shared = SharedRing::new(ring_cfg, AgentMetadata::current(env!("CARGO_PKG_VERSION")));
+    let server = match AgentServer::start(
+        bind_addr,
+        &shared,
+        Arc::clone(&stop_flag),
+        ServerConfig::default(),
+    ) {
+        Ok(srv) => srv,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut last_sample_mono = Instant::now();
+    let warmup = Duration::from_millis(250).min(Duration::from_millis(ring_cfg.interval_ms()));
+    if waiter(warmup) {
+        collect_and_record_agent_sample(&mut collector, &shared, &mut last_sample_mono);
+    }
+
+    if !stop_flag.load(Ordering::SeqCst) {
+        eprintln!(
+            "{bin_name} agent listening on http://{}/v1/samples (interval={}s, retention={}m)",
+            server.local_addr(),
+            ring_cfg.interval_secs(),
+            ring_cfg.retention_mins()
+        );
+    }
+
+    let interval = Duration::from_millis(ring_cfg.interval_ms());
+    while !stop_flag.load(Ordering::SeqCst) {
+        if !waiter(interval) {
+            break;
+        }
+        collect_and_record_agent_sample(&mut collector, &shared, &mut last_sample_mono);
+    }
+
+    server.shutdown();
+    ExitCode::SUCCESS
+}
+
+/// Samples the host first and stamps both the Agent clock and monotonic elapsed time *after*
+/// collection finishes so a host suspend occurring mid-collection is detected on the affected
+/// tick (dropping its stale rate deltas) rather than leaking into `Available` and mis-flagging
+/// the following post-resume tick.
+fn collect_and_record_agent_sample(
+    collector: &mut LiveNodeCollector,
+    shared: &SharedRing,
+    last_sample_mono: &mut Instant,
+) {
+    if let Ok(mut sample) = collector.next_node_sample(0) {
+        let post_mono = Instant::now();
+        let mono_elapsed = u64::try_from(
+            post_mono
+                .saturating_duration_since(*last_sample_mono)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        sample.timestamp_ms = shared.next_sample_timestamp_ms();
+        *last_sample_mono = post_mono;
+        shared.push_sample(sample, Some(mono_elapsed));
     }
 }
 

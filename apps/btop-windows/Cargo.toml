@@ -16,6 +16,7 @@ workspace = true
 [dependencies]
 btop-collect.workspace = true
 btop-config.workspace = true
+btop-fleet.workspace = true
 btop-model.workspace = true
 btop-sys.workspace = true
 btop-term.workspace = true
