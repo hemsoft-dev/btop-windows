@@ -283,9 +283,19 @@ pub fn parse_linux_proc_statm_private_bytes(statm: &str, page_size: u64) -> Opti
     Some(resident.saturating_sub(shared).saturating_mul(page_size))
 }
 
-/// Live per-process metadata queried from the Unix kernel so telemetry collection and guarded
-/// signal delivery share identical sub-second start-time identities, thread counts, and private
-/// memory accounting, and can verify identity consistency against `sysinfo` rows.
+/// Decodes Linux `/proc/<pid>/cmdline` NUL-delimited bytes into a single displayable command line.
+pub fn parse_linux_proc_cmdline_bytes(cmdline_bytes: &[u8]) -> Option<String> {
+    let parts: Vec<String> = cmdline_bytes
+        .split(|&b| b == 0)
+        .filter(|slice| !slice.is_empty())
+        .map(|slice| String::from_utf8_lossy(slice).into_owned())
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+/// Live per-process metadata queried from the Unix kernel and bracketed by identical sub-second
+/// start-time verification so every displayed identity field (`comm`, `parent_pid`, `image_path`,
+/// `command_line`, `uid`) belongs to the exact same process instance as `create_time_100ns`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnixProcessMeta {
     pub comm: String,
@@ -295,6 +305,9 @@ pub struct UnixProcessMeta {
     pub is_kernel_thread: bool,
     pub num_threads: u32,
     pub private_rss_bytes: Option<u64>,
+    pub image_path: Option<String>,
+    pub command_line: Option<String>,
+    pub uid: Option<u32>,
 }
 
 /// Pure safety gate evaluated before sending `SIGTERM` or `SIGKILL` to a Unix PID.
@@ -704,7 +717,7 @@ mod unix {
     }
 
     #[cfg(target_os = "linux")]
-    pub fn query_unix_process_meta(pid: u32) -> Result<super::UnixProcessMeta, ProcActionError> {
+    fn read_linux_proc_stat(pid: u32) -> Result<super::LinuxProcStat, ProcActionError> {
         let stat_path = format!("/proc/{pid}/stat");
         // Read raw bytes so process names containing non-UTF-8 bytes never fail parsing.
         let stat_bytes = std::fs::read(&stat_path).map_err(|err| match err.kind() {
@@ -712,9 +725,15 @@ mod unix {
             std::io::ErrorKind::PermissionDenied => ProcActionError::AccessDenied(pid),
             _ => ProcActionError::Platform(format!("failed to read {stat_path}: {err}")),
         })?;
-        let parsed = super::parse_linux_proc_stat_bytes(&stat_bytes).ok_or_else(|| {
-            ProcActionError::Platform(format!("malformed /proc/{pid}/stat record"))
-        })?;
+        super::parse_linux_proc_stat_bytes(&stat_bytes)
+            .ok_or_else(|| ProcActionError::Platform(format!("malformed /proc/{pid}/stat record")))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn query_unix_process_meta(pid: u32) -> Result<super::UnixProcessMeta, ProcActionError> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let parsed = read_linux_proc_stat(pid)?;
         let clk_tck = cached_linux_clk_tck();
         let btime = cached_linux_boot_time_secs()?;
         let start_time_secs = btime.saturating_add(parsed.starttime_ticks / clk_tck);
@@ -726,6 +745,24 @@ mod unix {
             .and_then(|s| {
                 super::parse_linux_proc_statm_private_bytes(&s, cached_linux_page_size())
             });
+        let image_path = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .map(|p| p.display().to_string());
+        let command_line = std::fs::read(format!("/proc/{pid}/cmdline"))
+            .ok()
+            .and_then(|bytes| super::parse_linux_proc_cmdline_bytes(&bytes));
+        let uid = std::fs::metadata(format!("/proc/{pid}"))
+            .ok()
+            .map(|m| m.uid());
+
+        // Bracket secondary `/proc/<pid>/*` reads by re-reading `/proc/<pid>/stat` and confirming
+        // `starttime_ticks` did not change, guaranteeing display fields and identity come from the
+        // exact same kernel process instance.
+        let confirm = read_linux_proc_stat(pid)?;
+        if confirm.starttime_ticks != parsed.starttime_ticks {
+            return Err(ProcActionError::NotFound(pid));
+        }
+
         Ok(super::UnixProcessMeta {
             comm: parsed.comm,
             parent_pid: parsed.parent_pid,
@@ -734,13 +771,14 @@ mod unix {
             is_kernel_thread,
             num_threads: parsed.num_threads,
             private_rss_bytes,
+            image_path,
+            command_line,
+            uid,
         })
     }
 
     #[cfg(target_os = "macos")]
-    pub fn query_unix_process_meta(pid: u32) -> Result<super::UnixProcessMeta, ProcActionError> {
-        use std::ffi::CStr;
-
+    fn read_macos_bsd_info(pid: u32) -> Result<libc::proc_bsdinfo, ProcActionError> {
         let Ok(c_pid) = libc::c_int::try_from(pid) else {
             return Err(ProcActionError::NotFound(pid));
         };
@@ -763,6 +801,15 @@ mod unix {
             }
             return Err(map_errno(pid, err, "proc_pidinfo"));
         }
+        Ok(info)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn query_unix_process_meta(pid: u32) -> Result<super::UnixProcessMeta, ProcActionError> {
+        use std::ffi::CStr;
+
+        let info = read_macos_bsd_info(pid)?;
+        let c_pid = libc::c_int::try_from(pid).unwrap_or(0);
 
         // SAFETY: `pbi_name` and `pbi_comm` are NUL-terminated char arrays in `proc_bsdinfo`.
         let name_str = unsafe { CStr::from_ptr(info.pbi_name.as_ptr()) }.to_string_lossy();
@@ -773,6 +820,22 @@ mod unix {
                 .into_owned()
         } else {
             name_str.into_owned()
+        };
+
+        let mut path_buf = [0u8; 4096];
+        // SAFETY: `proc_pidpath` writes a NUL-terminated UTF-8 path up to `path_buf.len()` bytes.
+        let path_len = unsafe {
+            libc::proc_pidpath(
+                c_pid,
+                path_buf.as_mut_ptr().cast::<libc::c_void>(),
+                u32::try_from(path_buf.len()).unwrap_or(4096),
+            )
+        };
+        let image_path = if path_len > 0 {
+            let end = usize::try_from(path_len).unwrap_or(0).min(path_buf.len());
+            Some(String::from_utf8_lossy(&path_buf[..end]).into_owned())
+        } else {
+            None
         };
 
         let mut num_threads = 1u32;
@@ -806,6 +869,15 @@ mod unix {
             private_rss_bytes = Some(rusage.ri_phys_footprint);
         }
 
+        // Re-verify microsecond start time after secondary queries so display metadata and
+        // `create_time_100ns` are bracketed by the exact same process instance.
+        let confirm = read_macos_bsd_info(pid)?;
+        if confirm.pbi_start_tvsec != info.pbi_start_tvsec
+            || confirm.pbi_start_tvusec != info.pbi_start_tvusec
+        {
+            return Err(ProcActionError::NotFound(pid));
+        }
+
         Ok(super::UnixProcessMeta {
             comm,
             parent_pid: info.pbi_ppid,
@@ -817,6 +889,9 @@ mod unix {
             is_kernel_thread: super::is_macos_system_process(info.pbi_flags),
             num_threads,
             private_rss_bytes,
+            image_path,
+            command_line: None,
+            uid: Some(info.pbi_uid),
         })
     }
 

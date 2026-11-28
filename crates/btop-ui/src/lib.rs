@@ -37,7 +37,7 @@ pub use mem_box::{format_mem_bytes, stacked_physical_segments};
 pub use menu::{
     HELP_BINDINGS, HelpEntry, HelpState, MainMenuChoice, MainMenuState, MessageBoxAction,
     MessageBoxKind, MessageBoxResult, MessageBoxState, OptionCategory, OptionId, OptionKind,
-    OptionsState, OverlayMenu, TextEdit,
+    OptionsState, OverlayMenu, TextEdit, UNIX_HELP_BINDINGS, help_bindings_len,
 };
 pub use menu_render::{dim_grid, help_visible_rows, options_visible_rows, render_overlay_menu};
 pub use net_box::{AUTO_SCALE_FLOOR_BPS, NetViewState, compute_net_scale_ceilings, format_bitrate};
@@ -536,7 +536,7 @@ fn is_gpu_slot_unavailable(snapshot: &Snapshot, idx: u8) -> bool {
 /// Filters out explicitly unavailable GPU panels (e.g. Linux/macOS v1 `DataState::Unavailable`)
 /// from configured `shown_boxes` or presets so unsupported GPU boxes never consume layout space
 /// or leave an empty screen when a GPU-only preset is selected.
-fn effective_layout_for_snapshot<'a>(
+pub fn effective_layout_for_snapshot<'a>(
     layout: &'a LayoutState,
     snapshot: &Snapshot,
 ) -> Cow<'a, LayoutState> {
@@ -806,12 +806,18 @@ mod tests {
                 uptime_secs: 3600,
                 ..CpuSnapshot::default()
             }),
-            services: DataState::Unavailable("unavailable on Linux and macOS in v1".to_owned()),
+            services: DataState::Unavailable(
+                btop_model::UNIX_SERVICES_UNAVAILABLE_REASON.to_owned(),
+            ),
             gpus: vec![DataState::Unavailable(
                 "GPU telemetry is unavailable on Linux and macOS in v1".to_owned(),
             )],
             ..Snapshot::default()
         };
+        assert!(!is_services_view_supported(&snap.services));
+        assert!(is_services_view_supported(&DataState::Unavailable(
+            "OpenSCManagerW failed (access denied)".to_owned()
+        )));
         let cfg = Config {
             shown_boxes: "gpu0".to_owned(),
             ..Config::default()

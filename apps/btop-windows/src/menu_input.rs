@@ -115,7 +115,13 @@ pub fn handle_menu_key(
             state,
             &mut changed_option,
         ),
-        OverlayMenu::Help(state) => handle_help_key(key.code, config.vim_keys, size, state),
+        OverlayMenu::Help(state) => handle_help_key(
+            key.code,
+            config.vim_keys,
+            size,
+            !btop_ui::is_services_view_supported(&snapshot.services),
+            state,
+        ),
         OverlayMenu::MessageBox { dialog, .. } => {
             let result = dialog.handle_key_with_vim(key.code, config.vim_keys);
             return apply_messagebox_result(
@@ -172,7 +178,13 @@ pub fn handle_menu_mouse(
     }
 
     if matches!(mouse.kind, MouseKind::ScrollUp | MouseKind::ScrollDown) {
-        return handle_menu_wheel(mouse.kind == MouseKind::ScrollUp, size, ui_state, prev_grid);
+        return handle_menu_wheel(
+            mouse.kind == MouseKind::ScrollUp,
+            size,
+            snapshot,
+            ui_state,
+            prev_grid,
+        );
     }
 
     if mouse.kind != MouseKind::Down(MouseButton::Left) {
@@ -264,6 +276,7 @@ pub fn handle_menu_mouse(
 fn handle_menu_wheel(
     up: bool,
     size: Size,
+    snapshot: &Snapshot,
     ui_state: &mut UiState,
     prev_grid: &mut Option<Grid>,
 ) -> LoopAction {
@@ -283,10 +296,13 @@ fn handle_menu_wheel(
         }
         OverlayMenu::Help(help) => {
             let vis = help_visible_rows(size);
+            let total = btop_ui::help_bindings_len(!btop_ui::is_services_view_supported(
+                &snapshot.services,
+            ));
             if up {
                 help.scroll_up(3);
             } else {
-                help.scroll_down(3, vis);
+                help.scroll_down_for(3, vis, total);
             }
             *prev_grid = None;
             LoopAction::Redraw
@@ -538,9 +554,12 @@ fn handle_help_key(
     code: KeyCode,
     vim_keys: bool,
     size: Size,
+    unix_help: bool,
     state: &mut btop_ui::HelpState,
 ) -> MenuKeyOutcome {
     let vis = help_visible_rows(size);
+    let total = btop_ui::help_bindings_len(unix_help);
+    state.clamp_for(vis, total);
     match code {
         KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('?' | 'q') => MenuKeyOutcome::Close,
         KeyCode::Char('h') if !vim_keys => MenuKeyOutcome::Close,
@@ -550,7 +569,7 @@ fn handle_help_key(
             MenuKeyOutcome::KeepOpen(true)
         }
         KeyCode::Down => {
-            state.scroll_down(1, vis);
+            state.scroll_down_for(1, vis, total);
             MenuKeyOutcome::KeepOpen(true)
         }
         KeyCode::Char('k') if vim_keys => {
@@ -558,7 +577,7 @@ fn handle_help_key(
             MenuKeyOutcome::KeepOpen(true)
         }
         KeyCode::Char('j') if vim_keys => {
-            state.scroll_down(1, vis);
+            state.scroll_down_for(1, vis, total);
             MenuKeyOutcome::KeepOpen(true)
         }
         KeyCode::PageUp => {
@@ -566,7 +585,7 @@ fn handle_help_key(
             MenuKeyOutcome::KeepOpen(true)
         }
         KeyCode::PageDown => {
-            state.scroll_down(vis, vis);
+            state.scroll_down_for(vis, vis, total);
             MenuKeyOutcome::KeepOpen(true)
         }
         KeyCode::Home => {
@@ -574,7 +593,7 @@ fn handle_help_key(
             MenuKeyOutcome::KeepOpen(true)
         }
         KeyCode::End => {
-            state.end(vis);
+            state.end_for(vis, total);
             MenuKeyOutcome::KeepOpen(true)
         }
         KeyCode::Char('g') if vim_keys => {
@@ -582,7 +601,7 @@ fn handle_help_key(
             MenuKeyOutcome::KeepOpen(true)
         }
         KeyCode::Char('G') if vim_keys => {
-            state.end(vis);
+            state.end_for(vis, total);
             MenuKeyOutcome::KeepOpen(true)
         }
         _ => MenuKeyOutcome::KeepOpen(false),

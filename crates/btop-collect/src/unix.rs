@@ -272,16 +272,29 @@ fn is_numbered_bridge_iface(lower: &str) -> bool {
         .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
 }
 
+fn is_vlan_iface(lower: &str) -> bool {
+    if lower
+        .strip_prefix("vlan")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return true;
+    }
+    lower.rsplit_once('.').is_some_and(|(parent, id)| {
+        !parent.is_empty() && !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())
+    })
+}
+
 /// Returns `true` for physical Unix network interfaces, excluding loopback (`lo`/`lo0`),
 /// Tailscale and VPN tunnels (`tailscale*`, `utun*`, `tun*`, `wg*`), Docker/VM/software bridges
-/// (`docker*`, `veth*`, `br0`, `br-*`, `vmbr*`, `virbr*`, `vnet*`), and Apple virtual peer interfaces.
+/// (`docker*`, `veth*`, `br0`, `br-*`, `vmbr*`, `virbr*`, `vnet*`), VLAN sub-interfaces
+/// (`enp2s0.100`, `vlan100`), and Apple virtual peer interfaces.
 pub fn should_include_unix_interface(name: &str) -> bool {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return false;
     }
     let lower = trimmed.to_ascii_lowercase();
-    if is_loopback_iface(&lower) || is_numbered_bridge_iface(&lower) {
+    if is_loopback_iface(&lower) || is_numbered_bridge_iface(&lower) || is_vlan_iface(&lower) {
         return false;
     }
     !IGNORED_IFACE_PREFIXES
@@ -361,29 +374,6 @@ pub fn parse_linux_procs_running(proc_stat: &str) -> Option<u32> {
     None
 }
 
-/// Verifies that live kernel metadata queried by PID still belongs to the exact process row
-/// captured by `sysinfo` (matching parent PID, start time within 1s, and kernel `comm` prefix)
-/// so PID reuse between `sysinfo` refresh and metadata lookup never mixes two processes.
-pub fn unix_meta_matches_sysinfo(
-    sysinfo_parent_pid: u32,
-    sysinfo_start_time_secs: u64,
-    sysinfo_name: &str,
-    meta: &btop_sys::UnixProcessMeta,
-) -> bool {
-    if meta.parent_pid != sysinfo_parent_pid {
-        return false;
-    }
-    if sysinfo_start_time_secs > 0 && meta.start_time_secs.abs_diff(sysinfo_start_time_secs) > 1 {
-        return false;
-    }
-    if meta.comm.is_empty() || sysinfo_name.is_empty() {
-        return false;
-    }
-    sysinfo_name == meta.comm
-        || sysinfo_name.starts_with(&meta.comm)
-        || meta.comm.starts_with(sysinfo_name)
-}
-
 #[cfg(unix)]
 mod live {
     use std::collections::HashMap;
@@ -392,13 +382,13 @@ mod live {
 
     use btop_model::{
         CoreKind, CoreSample, CpuSnapshot, DataState, LogicalCpuId, NetInterfaceSnapshot,
-        ProcessEntry, ProcessIdentity, Snapshot,
+        ProcessEntry, ProcessIdentity, Snapshot, UNIX_SERVICES_UNAVAILABLE_REASON,
     };
     use btop_sys::{ProcActionError, query_unix_process_meta, unix_mount_device_name};
     use sysinfo::{
         CpuRefreshKind, DiskRefreshKind, Disks, InterfaceOperationalState,
         MINIMUM_CPU_UPDATE_INTERVAL, MemoryRefreshKind, Networks, ProcessRefreshKind,
-        ProcessesToUpdate, RefreshKind, System, UpdateKind, Users,
+        ProcessesToUpdate, RefreshKind, System, Users,
     };
 
     #[cfg(target_os = "linux")]
@@ -406,7 +396,6 @@ mod live {
     use super::{
         RawUnixDisk, compute_unix_mem_snapshot, deduplicate_unix_disks, normalize_unix_cpu_pct,
         normalize_unix_proc_cpu_pct, should_include_unix_interface, stable_interface_luid,
-        unix_meta_matches_sysinfo,
     };
     #[cfg(target_os = "linux")]
     use crate::cpu::RunQueueEwma;
@@ -420,9 +409,6 @@ mod live {
             .with_cpu()
             .with_memory()
             .with_disk_usage()
-            .with_cmd(UpdateKind::OnlyIfNotSet)
-            .with_exe(UpdateKind::OnlyIfNotSet)
-            .with_user(UpdateKind::OnlyIfNotSet)
     }
 
     fn cpu_refresh_kind() -> CpuRefreshKind {
@@ -613,8 +599,8 @@ mod live {
                     }
                     CoreSample {
                         id: LogicalCpuId {
-                            group: 0,
-                            number: u8::try_from(idx).unwrap_or(u8::MAX),
+                            group: u16::try_from(idx / 64).unwrap_or(u16::MAX),
+                            number: u8::try_from(idx % 64).unwrap_or(0),
                         },
                         busy_pct: normalize_unix_cpu_pct(cpu.usage()),
                         kind: CoreKind::Uniform,
@@ -699,7 +685,12 @@ mod live {
                     continue;
                 }
                 #[cfg(target_os = "linux")]
-                if std::path::Path::new(&format!("/sys/class/net/{name}/bridge")).exists() {
+                if std::path::Path::new("/sys/class/net").exists()
+                    && !std::path::Path::new(&format!("/sys/class/net/{name}/device")).exists()
+                {
+                    // On Linux, only hardware-backed NICs expose `/sys/class/net/<name>/device`;
+                    // VLANs, bridges, veths, bonds, and tunnels live under `/sys/devices/virtual`
+                    // and are excluded to avoid double-counting traffic with their physical parent.
                     continue;
                 }
 
@@ -766,76 +757,79 @@ mod live {
                     continue;
                 }
                 let raw_pid = pid.as_u32();
-                let parent_pid = proc_info.parent().map_or(0, sysinfo::Pid::as_u32);
-                let name = proc_info.name().to_string_lossy().into_owned();
-                let image_path = proc_info.exe().map(|p| p.display().to_string());
-                let cmd_parts: Vec<String> = proc_info
-                    .cmd()
-                    .iter()
-                    .map(|arg| arg.to_string_lossy().into_owned())
-                    .collect();
-                let command_line = (!cmd_parts.is_empty()).then(|| cmd_parts.join(" "));
-                let user = proc_info
-                    .user_id()
-                    .and_then(|uid| self.users.get_user_by_id(uid))
-                    .map(|u| u.name().to_owned());
-                // Cross-check kernel metadata against the `sysinfo` row (parent PID, start second,
-                // and `comm`) so a recycled PID can never mix an old row's display fields with a
-                // replacement process's actionable identity.
-                let verified_meta = match query_unix_process_meta(raw_pid) {
-                    Ok(meta) => {
-                        if !unix_meta_matches_sysinfo(
-                            parent_pid,
-                            proc_info.start_time(),
-                            &name,
-                            &meta,
-                        ) {
-                            continue;
-                        }
-                        Some(meta)
-                    }
+                // Query bracketed live kernel metadata for `raw_pid` directly so `name`,
+                // `parent_pid`, `image_path`, `command_line`, `user`, and `create_time_100ns`
+                // all belong to the exact same kernel process instance (preventing mixed rows on
+                // PID reuse and preserving processes that rename themselves via `prctl`).
+                let kernel_meta = match query_unix_process_meta(raw_pid) {
+                    Ok(meta) => Some(meta),
                     Err(ProcActionError::NotFound(_)) => continue,
                     Err(_) => None,
                 };
-                // Fail closed (`create_time_100ns = 0`) if kernel metadata could not be verified
-                // (e.g. restricted permissions) so unverified rows can never be signaled.
-                let create_time_100ns = verified_meta.as_ref().map_or(0, |m| m.create_time_100ns);
-                let threads = verified_meta.as_ref().map_or_else(
-                    || {
-                        proc_info.tasks().map_or(1, |tasks| {
-                            u32::try_from(tasks.len()).unwrap_or(u32::MAX).max(1)
-                        })
-                    },
-                    |m| m.num_threads.max(1),
-                );
-                let private_bytes = verified_meta
-                    .as_ref()
-                    .and_then(|m| m.private_rss_bytes)
-                    .unwrap_or_else(|| proc_info.memory());
                 let disk_io = proc_info.disk_usage();
-                let is_kernel = verified_meta.as_ref().is_some_and(|m| m.is_kernel_thread)
-                    || proc_info
+                if let Some(meta) = kernel_meta {
+                    let user = meta.uid.and_then(|raw_uid| {
+                        self.users
+                            .iter()
+                            .find(|u| **u.id() == raw_uid)
+                            .map(|u| u.name().to_owned())
+                    });
+                    let is_kernel = meta.is_kernel_thread
+                        || proc_info
+                            .thread_kind()
+                            .is_some_and(|k| matches!(k, sysinfo::ThreadKind::Kernel));
+                    entries.push(ProcessEntry {
+                        identity: ProcessIdentity {
+                            pid: raw_pid,
+                            create_time_100ns: meta.create_time_100ns,
+                        },
+                        parent_pid: meta.parent_pid,
+                        name: meta.comm,
+                        image_path: meta.image_path,
+                        command_line: meta.command_line,
+                        command_line_denied: false,
+                        user,
+                        user_denied: false,
+                        threads: meta.num_threads.max(1),
+                        cpu_pct: normalize_unix_proc_cpu_pct(proc_info.cpu_usage(), logical_cpus),
+                        working_set_private_bytes: meta
+                            .private_rss_bytes
+                            .unwrap_or_else(|| proc_info.memory()),
+                        io_read_bytes: disk_io.total_read_bytes,
+                        io_write_bytes: disk_io.total_written_bytes,
+                        is_protected: raw_pid <= 1 || is_kernel,
+                    });
+                } else {
+                    // Fail closed (`create_time_100ns = 0`) when kernel metadata cannot be read
+                    // so unverified rows stay display-only and can never be signaled.
+                    let parent_pid = proc_info.parent().map_or(0, sysinfo::Pid::as_u32);
+                    let name = proc_info.name().to_string_lossy().into_owned();
+                    let threads = proc_info.tasks().map_or(1, |tasks| {
+                        u32::try_from(tasks.len()).unwrap_or(u32::MAX).max(1)
+                    });
+                    let is_kernel = proc_info
                         .thread_kind()
                         .is_some_and(|k| matches!(k, sysinfo::ThreadKind::Kernel));
-                entries.push(ProcessEntry {
-                    identity: ProcessIdentity {
-                        pid: raw_pid,
-                        create_time_100ns,
-                    },
-                    parent_pid,
-                    name,
-                    image_path,
-                    command_line,
-                    command_line_denied: false,
-                    user,
-                    user_denied: false,
-                    threads,
-                    cpu_pct: normalize_unix_proc_cpu_pct(proc_info.cpu_usage(), logical_cpus),
-                    working_set_private_bytes: private_bytes,
-                    io_read_bytes: disk_io.total_read_bytes,
-                    io_write_bytes: disk_io.total_written_bytes,
-                    is_protected: raw_pid <= 1 || is_kernel,
-                });
+                    entries.push(ProcessEntry {
+                        identity: ProcessIdentity {
+                            pid: raw_pid,
+                            create_time_100ns: 0,
+                        },
+                        parent_pid,
+                        name,
+                        image_path: None,
+                        command_line: None,
+                        command_line_denied: true,
+                        user: None,
+                        user_denied: true,
+                        threads,
+                        cpu_pct: normalize_unix_proc_cpu_pct(proc_info.cpu_usage(), logical_cpus),
+                        working_set_private_bytes: proc_info.memory(),
+                        io_read_bytes: disk_io.total_read_bytes,
+                        io_write_bytes: disk_io.total_written_bytes,
+                        is_protected: raw_pid <= 1 || is_kernel,
+                    });
+                }
             }
             entries
         }
@@ -906,10 +900,7 @@ mod live {
                 disks: DataState::Available(disks),
                 net: DataState::Available(net),
                 processes: DataState::Available(processes),
-                services: DataState::Unavailable(
-                    "OS service manager telemetry is unavailable on Linux and macOS in v1"
-                        .to_owned(),
-                ),
+                services: DataState::Unavailable(UNIX_SERVICES_UNAVAILABLE_REASON.to_owned()),
                 gpus: vec![DataState::Unavailable(
                     "GPU telemetry is unavailable on Linux and macOS in v1".to_owned(),
                 )],
@@ -1215,6 +1206,9 @@ mod tests {
             "br-98765432",
             "vmbr0",
             "virbr0",
+            "enp2s0.100",
+            "eth0.20",
+            "vlan100",
             "vnet0",
             "wg0",
             "awdl0",
@@ -1257,35 +1251,14 @@ mod tests {
         let proc_stat = "cpu 1 2 3 4\nbtime 1700000000\nprocs_running 5\nprocs_blocked 12\n";
         assert_eq!(parse_linux_procs_running(proc_stat), Some(5));
         assert_eq!(parse_linux_procs_running("cpu 1 2 3\n"), None);
-
-        let meta = btop_sys::UnixProcessMeta {
-            comm: "systemd-journal".to_owned(),
-            parent_pid: 1,
-            start_time_secs: 1_700_000_100,
-            create_time_100ns: btop_sys::unix_start_time_secs_to_identity(1_700_000_100),
-            is_kernel_thread: false,
-            num_threads: 2,
-            private_rss_bytes: Some(4_096_000),
-        };
-        assert!(unix_meta_matches_sysinfo(
-            1,
-            1_700_000_100,
-            "systemd-journald",
-            &meta
-        ));
-        assert!(!unix_meta_matches_sysinfo(
-            2,
-            1_700_000_100,
-            "systemd-journald",
-            &meta
-        ));
-        assert!(!unix_meta_matches_sysinfo(
-            1,
-            1_700_000_110,
-            "systemd-journald",
-            &meta
-        ));
-        assert!(!unix_meta_matches_sysinfo(1, 1_700_000_100, "bash", &meta));
+        assert_eq!(
+            btop_sys::proc_actions::parse_linux_proc_cmdline_bytes(b"/usr/bin/sleep\x0030\x00"),
+            Some("/usr/bin/sleep 30".to_owned())
+        );
+        assert_eq!(
+            btop_sys::proc_actions::parse_linux_proc_cmdline_bytes(b""),
+            None
+        );
     }
 
     #[cfg(unix)]

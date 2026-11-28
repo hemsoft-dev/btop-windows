@@ -538,17 +538,14 @@ pub fn sort_processes(
 
 /// Returns `true` when the snapshot's Services subsystem can be opened in the TUI.
 ///
-/// On Windows, the on-demand SCM collector reports `DataState::Unavailable("services view inactive")`
-/// while closed so it avoids polling SCM until requested; any other `Unavailable` reason (such as
-/// Linux/macOS v1) means OS service management is unsupported and the `S:svc` tab stays hidden.
+/// Only snapshots carrying [`btop_model::UNIX_SERVICES_UNAVAILABLE_REASON`] (Linux/macOS v1)
+/// disable the Services view; Windows on-demand inactive states and transient Windows SCM API
+/// errors remain visible in the Services panel so input routing and error diagnostics stay aligned.
 pub fn is_services_view_supported(services: &DataState<Vec<btop_model::ServiceEntry>>) -> bool {
-    match services {
-        DataState::Unavailable(reason) => reason == "services view inactive",
-        DataState::Available(_)
-        | DataState::Stale { .. }
-        | DataState::WarmingUp
-        | DataState::Denied => true,
-    }
+    !matches!(
+        services,
+        DataState::Unavailable(reason) if reason == btop_model::UNIX_SERVICES_UNAVAILABLE_REASON
+    )
 }
 
 /// Renders the Process box (`⁴proc`) inside `rect`.

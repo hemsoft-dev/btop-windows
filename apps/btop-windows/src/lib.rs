@@ -329,6 +329,7 @@ pub fn run_tui_loop(
         (sampler.generation(), sampler.telemetry_generation());
     let mut current_snapshot = sampler.latest();
     history.push_with_util_mode(&current_snapshot, is_utility_mode(&config));
+    sanitize_layout_for_snapshot(&mut ui_state, &current_snapshot);
     ui_state.net.observe_snapshot(&current_snapshot);
 
     let (svc_tx, svc_rx) = mpsc::channel::<ServiceActionOutcome>();
@@ -518,6 +519,7 @@ fn poll_sampler_updates(
         *last_telemetry_generation = telemetry_gen_now;
         ui_state.tz_offset_secs = btop_sys::local_utc_offset_secs();
         history.push_with_util_mode(current_snapshot, is_utility_mode(config));
+        sanitize_layout_for_snapshot(ui_state, current_snapshot);
         ui_state.net.observe_snapshot(current_snapshot);
     }
     true
@@ -782,6 +784,7 @@ fn handle_ctrl_r_reload(
         sampler.set_freq_mode(FreqMode::from_config_str(&config.freq_mode));
         sampler.set_nvml_measure_pcie_speeds(config.nvml_measure_pcie_speeds);
         *ui_state = build_ui_state(config, overrides);
+        sanitize_layout_for_snapshot(ui_state, snapshot);
         ui_state.net.observe_snapshot(snapshot);
         sampler.set_services_active(should_poll_services(size, ui_state));
         *prev_grid = None;
@@ -839,6 +842,17 @@ fn handle_unmodified_global_key(
         return LoopAction::Redraw;
     }
     LoopAction::None
+}
+
+fn sanitize_layout_for_snapshot(ui_state: &mut UiState, snapshot: &btop_model::Snapshot) {
+    if let std::borrow::Cow::Owned(sanitized) =
+        btop_ui::effective_layout_for_snapshot(&ui_state.layout, snapshot)
+    {
+        ui_state.layout = sanitized;
+    }
+    if ui_state.services.active && !btop_ui::is_services_view_supported(&snapshot.services) {
+        ui_state.services.active = false;
+    }
 }
 
 fn is_gpu_box_unavailable(snapshot: &btop_model::Snapshot, box_id: BoxId) -> bool {
@@ -920,6 +934,7 @@ fn handle_mouse_event(
     if is_right {
         return match hit {
             HitAction::CyclePreset if ui_state.layout.cycle_preset_prev() => {
+                sanitize_layout_for_snapshot(ui_state, snapshot);
                 if let Some(s) = sampler {
                     s.set_services_active(should_poll_services(size, ui_state));
                 }
@@ -952,6 +967,7 @@ fn handle_mouse_event(
         }
         HitAction::CyclePreset => {
             if ui_state.layout.cycle_preset_next() {
+                sanitize_layout_for_snapshot(ui_state, snapshot);
                 if let Some(s) = sampler {
                     s.set_services_active(should_poll_services(size, ui_state));
                 }
@@ -1619,7 +1635,11 @@ fn handle_layout_key_for_snapshot(
     {
         return false;
     }
-    handle_layout_key(code, ui_state, prev_grid)
+    let changed = handle_layout_key(code, ui_state, prev_grid);
+    if changed {
+        sanitize_layout_for_snapshot(ui_state, snapshot);
+    }
+    changed
 }
 
 fn handle_layout_key(code: KeyCode, ui_state: &mut UiState, prev_grid: &mut Option<Grid>) -> bool {
@@ -3593,7 +3613,9 @@ mod tests {
             height: 40,
         };
         let snap = btop_model::Snapshot {
-            services: DataState::Unavailable("unavailable on Unix".to_owned()),
+            services: DataState::Unavailable(
+                btop_model::UNIX_SERVICES_UNAVAILABLE_REASON.to_owned(),
+            ),
             gpus: vec![DataState::Unavailable("unavailable on Unix".to_owned())],
             ..btop_model::Snapshot::default()
         };
@@ -3609,28 +3631,30 @@ mod tests {
         ));
         assert!(!state.services.active);
 
-        // Windows on-demand SCM reports `Unavailable("services view inactive")` while closed
-        // and must remain toggleable via `S`.
-        let win_inactive_snap = btop_model::Snapshot {
-            services: DataState::Unavailable("services view inactive".to_owned()),
-            ..btop_model::Snapshot::default()
-        };
-        assert!(toggle_services_view(
-            size,
-            &win_inactive_snap,
-            &mut state,
-            None,
-            &mut prev_grid
-        ));
-        assert!(state.services.active);
-        assert!(toggle_services_view(
-            size,
-            &win_inactive_snap,
-            &mut state,
-            None,
-            &mut prev_grid
-        ));
-        assert!(!state.services.active);
+        // Windows on-demand SCM (`services view inactive`) AND transient Windows SCM errors
+        // must remain toggleable via `S` so error diagnostics and input routing stay aligned.
+        for reason in ["services view inactive", "OpenSCManagerW failed"] {
+            let win_snap = btop_model::Snapshot {
+                services: DataState::Unavailable(reason.to_owned()),
+                ..btop_model::Snapshot::default()
+            };
+            assert!(toggle_services_view(
+                size,
+                &win_snap,
+                &mut state,
+                None,
+                &mut prev_grid
+            ));
+            assert!(state.services.active);
+            assert!(toggle_services_view(
+                size,
+                &win_snap,
+                &mut state,
+                None,
+                &mut prev_grid
+            ));
+            assert!(!state.services.active);
+        }
 
         for ch in ['5', '6', '7', '8', '9', '0'] {
             assert!(!handle_layout_key_for_snapshot(
@@ -3647,5 +3671,50 @@ mod tests {
                 .iter()
                 .all(|b| !matches!(b, BoxId::Gpu(_)))
         );
+
+        // A GPU-only preset sanitized against a Unix snapshot exposes a live scrollable/signalable
+        // process panel (`visible_proc_rows > 0`) for both rendering and input handlers.
+        let gpu_only_cfg = Config {
+            shown_boxes: "gpu0".to_owned(),
+            ..Config::default()
+        };
+        let mut gpu_state = UiState::from_config(&gpu_only_cfg);
+        sanitize_layout_for_snapshot(&mut gpu_state, &snap);
+        assert!(visible_proc_rows(size, &gpu_state) > 0);
+        assert!(has_proc_panel(size, &gpu_state));
+
+        // Unix Help `End` clamps to `UNIX_HELP_BINDINGS.len()` so a single `Up` scrolls immediately.
+        let compact = Size {
+            width: 80,
+            height: 20,
+        };
+        let mut cfg = Config::default();
+        let mut help_state = UiState {
+            menu: Some(OverlayMenu::help()),
+            ..UiState::default()
+        };
+        let _ = handle_menu_key(
+            btop_term::KeyEvent {
+                code: KeyCode::End,
+                ctrl: false,
+                alt: false,
+                shift: false,
+            },
+            compact,
+            None,
+            &snap,
+            &mut cfg,
+            None,
+            &mut help_state,
+            &mut prev_grid,
+        );
+        let max_unix = btop_ui::HelpState::max_scroll_for(
+            btop_ui::help_visible_rows(compact),
+            btop_ui::UNIX_HELP_BINDINGS.len(),
+        );
+        assert!(matches!(
+            help_state.menu,
+            Some(OverlayMenu::Help(ref h)) if h.scroll_offset == max_unix
+        ));
     }
 }

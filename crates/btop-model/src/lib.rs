@@ -41,6 +41,12 @@ pub use summary::{
 
 use serde::{Deserialize, Serialize};
 
+/// Canonical `DataState::Unavailable` reason emitted by Unix collectors where OS service manager
+/// telemetry (`systemd`/`launchd`) is intentionally unsupported in v1 (distinct from Windows
+/// on-demand inactive state or transient Windows SCM API errors).
+pub const UNIX_SERVICES_UNAVAILABLE_REASON: &str =
+    "OS service manager telemetry is unavailable on Linux and macOS in v1";
+
 /// Explicit availability and freshness state for any optional or async subsystem.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(tag = "state", content = "data", rename_all = "snake_case")]

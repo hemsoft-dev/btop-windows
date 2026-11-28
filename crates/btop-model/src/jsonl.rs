@@ -104,44 +104,43 @@ impl SnapshotRecorder {
     /// separator is written before the first appended snapshot so existing JSONL records
     /// remain intact.
     pub fn open(path: &Path) -> Result<Self, JsonlError> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            // Refuse to follow symlinks or append sensitive command-line snapshots into any
-            // pre-existing group/world-accessible file (chmod cannot revoke already-open readers).
-            if let Ok(meta) = std::fs::symlink_metadata(path) {
-                if meta.file_type().is_symlink() || !meta.file_type().is_file() {
-                    return Err(JsonlError::Io(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        "refusing to append snapshot recording to a symlink or non-regular file",
-                    )));
-                }
-                if (meta.permissions().mode() & 0o077) != 0 {
-                    return Err(JsonlError::Io(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        "refusing to append snapshot recording to a group- or world-accessible file (expected mode 0600)",
-                    )));
-                }
-            }
-        }
         let mut opts = OpenOptions::new();
         opts.read(true).create(true).append(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
+            // Pass `O_NOFOLLOW` directly to `open(2)` so symlink replacement cannot redirect
+            // snapshot recordings (zero TOCTOU between path check and open).
             opts.mode(0o600);
+            #[allow(clippy::cast_possible_wrap)]
+            let nofollow = rustix::fs::OFlags::NOFOLLOW.bits() as i32;
+            opts.custom_flags(nofollow);
         }
         let mut file = opts.open(path)?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt as _;
-            // Re-verify the opened descriptor's mode before writing any bytes to close any
-            // race between `symlink_metadata` and `open`.
+            use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+            // Verify the already-open file descriptor (`fstat`) is a regular file owned by our
+            // effective UID with owner-only permissions (`0600` or stricter) before writing any
+            // bytes containing process command lines.
             let meta = file.metadata()?;
-            if !meta.file_type().is_file() || (meta.permissions().mode() & 0o077) != 0 {
+            let current_euid = rustix::process::geteuid().as_raw();
+            if !meta.file_type().is_file() {
                 return Err(JsonlError::Io(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
-                    "refusing to write snapshot recording to a file accessible by other users",
+                    "refusing to write snapshot recording to a non-regular file",
+                )));
+            }
+            if meta.uid() != current_euid {
+                return Err(JsonlError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "refusing to append snapshot recording to a file owned by another user",
+                )));
+            }
+            if (meta.permissions().mode() & 0o077) != 0 {
+                return Err(JsonlError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "refusing to append snapshot recording to a group- or world-accessible file (expected mode 0600)",
                 )));
             }
         }
@@ -359,6 +358,17 @@ mod tests {
             std::fs::metadata(&path).expect("stat after").len(),
             len_before
         );
+
+        // Symlink target must be rejected atomically by `O_NOFOLLOW`.
+        let link_path = path.with_extension("symlink.jsonl");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("restore 0600");
+        std::os::unix::fs::symlink(&path, &link_path).expect("create symlink");
+        assert!(
+            SnapshotRecorder::open(&link_path).is_err(),
+            "O_NOFOLLOW must reject symlink recording target"
+        );
+        let _ = std::fs::remove_file(&link_path);
         let _ = std::fs::remove_file(&path);
     }
 }

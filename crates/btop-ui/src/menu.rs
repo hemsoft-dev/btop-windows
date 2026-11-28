@@ -1151,6 +1151,15 @@ pub const UNIX_HELP_BINDINGS: &[HelpEntry] = &[
     ),
 ];
 
+/// Returns the number of entries in the active platform's Help reference table.
+pub const fn help_bindings_len(unix_help: bool) -> usize {
+    if unix_help {
+        UNIX_HELP_BINDINGS.len()
+    } else {
+        HELP_BINDINGS.len()
+    }
+}
+
 /// Interactive scroll state for the Help keybindings overlay.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HelpState {
@@ -1159,7 +1168,11 @@ pub struct HelpState {
 
 impl HelpState {
     pub fn max_scroll(visible_rows: usize) -> usize {
-        HELP_BINDINGS.len().saturating_sub(visible_rows.max(1))
+        Self::max_scroll_for(visible_rows, HELP_BINDINGS.len())
+    }
+
+    pub fn max_scroll_for(visible_rows: usize, total_entries: usize) -> usize {
+        total_entries.saturating_sub(visible_rows.max(1))
     }
 
     pub fn scroll_up(&mut self, lines: usize) {
@@ -1167,10 +1180,14 @@ impl HelpState {
     }
 
     pub fn scroll_down(&mut self, lines: usize, visible_rows: usize) {
+        self.scroll_down_for(lines, visible_rows, HELP_BINDINGS.len());
+    }
+
+    pub fn scroll_down_for(&mut self, lines: usize, visible_rows: usize, total_entries: usize) {
         self.scroll_offset = self
             .scroll_offset
             .saturating_add(lines)
-            .min(Self::max_scroll(visible_rows));
+            .min(Self::max_scroll_for(visible_rows, total_entries));
     }
 
     pub fn home(&mut self) {
@@ -1178,11 +1195,21 @@ impl HelpState {
     }
 
     pub fn end(&mut self, visible_rows: usize) {
-        self.scroll_offset = Self::max_scroll(visible_rows);
+        self.end_for(visible_rows, HELP_BINDINGS.len());
+    }
+
+    pub fn end_for(&mut self, visible_rows: usize, total_entries: usize) {
+        self.scroll_offset = Self::max_scroll_for(visible_rows, total_entries);
     }
 
     pub fn clamp(&mut self, visible_rows: usize) {
-        self.scroll_offset = self.scroll_offset.min(Self::max_scroll(visible_rows));
+        self.clamp_for(visible_rows, HELP_BINDINGS.len());
+    }
+
+    pub fn clamp_for(&mut self, visible_rows: usize, total_entries: usize) {
+        self.scroll_offset = self
+            .scroll_offset
+            .min(Self::max_scroll_for(visible_rows, total_entries));
     }
 }
 
